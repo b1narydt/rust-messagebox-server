@@ -1,0 +1,43 @@
+[package]
+name = "messagebox-server"
+version = "1.0.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.8", features = ["json", "query"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+tower-http = { version = "0.6", features = ["cors"] }
+tower = "0.5"
+reqwest = { version = "0.12", features = ["json"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dotenvy = "0.15"
+hex = "0.4"
+base64 = "0.22"
+thiserror = "2"
+parking_lot = "0.12"
+signal-hook = "0.3"
+form_urlencoded = "1"
+async-trait = "0.1"
+socketioxide = { version = "0.15", features = ["state"] }
+# BRC-31 auth middleware (axum port of b1narydt/auth-actix-middleware)
+bsv-auth-axum-middleware = { path = "../bsv-auth-axum-middleware" }
+# bsv-sdk — sole SDK for all auth and wallet operations
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main", features = ["network"] }
+getrandom = "0.4"
+http-body-util = "0.1"
+rsa = { version = "0.9", features = ["sha2"] }
+pkcs8 = { version = "0.10", features = ["pem"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+hyper = { version = "1", features = ["full"] }
+
+[profile.release]
+opt-level = 3
+lto = true
