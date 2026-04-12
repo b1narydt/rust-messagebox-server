@@ -9,7 +9,7 @@ use tower_http::cors::{Any, CorsLayer};
 use bsv::auth::peer::Peer;
 use bsv::primitives::private_key::PrivateKey;
 use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
-use bsv_auth_axum_middleware::{AuthLayer, ActixTransport};
+use bsv_auth_axum_middleware::ActixTransport;
 
 use messagebox_server::{cloneable_wallet, config, db, firebase, handlers, logger, ws};
 
@@ -85,9 +85,21 @@ async fn main() {
         let pk = PrivateKey::from_hex(&config.server_private_key).unwrap();
         cloneable_wallet::CloneableProtoWallet(Arc::new(SdkProtoWallet::new(pk)))
     };
-    let peer = Peer::new(auth_wallet, transport.clone());
+    let peer = Peer::new(auth_wallet.clone(), transport.clone());
     let peer = Arc::new(tokio::sync::Mutex::new(peer));
-    let auth_layer = AuthLayer::new(peer, transport, false);
+
+    let auth_config = bsv_auth_axum_middleware::AuthMiddlewareConfigBuilder::new()
+        .wallet(auth_wallet.clone())
+        .allow_unauthenticated(false)
+        .build()
+        .expect("auth middleware config");
+
+    let auth_layer = bsv_auth_axum_middleware::AuthLayer::from_config(
+        auth_config,
+        peer,
+        transport,
+    )
+    .await;
 
     let app_state = handlers::helpers::AppState {
         db: pool,

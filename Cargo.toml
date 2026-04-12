@@ -29,7 +29,7 @@ socketioxide = { version = "0.15", features = ["state"] }
 # BRC-31 auth middleware (axum port of b1narydt/auth-actix-middleware)
 bsv-auth-axum-middleware = { path = "../bsv-auth-axum-middleware" }
 # bsv-sdk — sole SDK for all auth and wallet operations
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main", features = ["network"] }
+bsv-sdk = { path = "../bsv-rust-sdk", features = ["network"] }
 getrandom = "0.4"
 http-body-util = "0.1"
 rsa = { version = "0.9", features = ["sha2"] }
