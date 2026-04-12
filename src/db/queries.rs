@@ -1,6 +1,26 @@
 use rusqlite::params;
+use rusqlite::OptionalExtension;
+use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use super::DbPool;
+
+static DELIVERY_FEE_CACHE: OnceLock<HashMap<String, i64>> = OnceLock::new();
+
+pub fn init_delivery_fee_cache(pool: &DbPool) {
+    let conn = pool.get().expect("failed to get connection for delivery fee cache init");
+    let mut stmt = conn
+        .prepare("SELECT message_box, delivery_fee FROM server_fees")
+        .unwrap();
+    let mut map = HashMap::new();
+    let mut rows = stmt.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let mb: String = row.get(0).unwrap();
+        let fee: i64 = row.get(1).unwrap();
+        map.insert(mb, fee);
+    }
+    let _ = DELIVERY_FEE_CACHE.set(map);
+}
 
 // ---------------------------------------------------------------------------
 // Row types
@@ -48,7 +68,7 @@ pub fn ensure_message_box(
     identity_key: &str,
     box_type: &str,
 ) -> Result<i64, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     conn.execute(
         "INSERT OR IGNORE INTO messageBox (type, identityKey) VALUES (?1, ?2)",
         params![box_type, identity_key],
@@ -66,7 +86,7 @@ pub fn get_message_box_id(
     identity_key: &str,
     box_type: &str,
 ) -> Result<Option<i64>, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     let mut stmt = conn.prepare(
         "SELECT messageBoxId FROM messageBox WHERE type = ?1 AND identityKey = ?2",
     )?;
@@ -90,7 +110,7 @@ pub fn insert_message(
     recipient: &str,
     body: &str,
 ) -> Result<bool, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     let affected = conn.execute(
         "INSERT OR IGNORE INTO messages (messageId, messageBoxId, sender, recipient, body) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -104,7 +124,7 @@ pub fn list_messages(
     recipient: &str,
     message_box_id: i64,
 ) -> Result<Vec<MessageRow>, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     let mut stmt = conn.prepare(
         "SELECT messageId, body, sender, created_at, updated_at \
          FROM messages WHERE recipient = ?1 AND messageBoxId = ?2 \
@@ -131,7 +151,7 @@ pub fn acknowledge_messages(
     if message_ids.is_empty() {
         return Ok(0);
     }
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     let placeholders: Vec<String> = (0..message_ids.len()).map(|i| format!("?{}", i + 2)).collect();
     let sql = format!(
         "DELETE FROM messages WHERE recipient = ?1 AND messageId IN ({})",
@@ -157,7 +177,17 @@ pub fn get_server_delivery_fee(
     pool: &DbPool,
     message_box: &str,
 ) -> Result<i64, rusqlite::Error> {
-    let conn = pool.lock();
+    // Check static cache first (populated at startup)
+    if let Some(cache) = DELIVERY_FEE_CACHE.get() {
+        if let Some(&fee) = cache.get(message_box) {
+            return Ok(fee);
+        }
+        // Key not in cache means no row in server_fees => default 0
+        return Ok(0);
+    }
+
+    // Fallback to DB query (cache not yet initialised)
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     let mut stmt =
         conn.prepare("SELECT delivery_fee FROM server_fees WHERE message_box = ?1")?;
     let mut rows = stmt.query(params![message_box])?;
@@ -176,8 +206,8 @@ fn smart_default_fee(message_box: &str) -> i64 {
     }
 }
 
-/// Hierarchical recipient-fee lookup:
-/// 1. Sender-specific permission
+/// Hierarchical recipient-fee lookup (single-query):
+/// 1. Sender-specific permission (non-NULL sender wins)
 /// 2. Box-wide default (sender IS NULL)
 /// 3. Auto-create box-wide default with smart_default_fee
 pub fn get_recipient_fee(
@@ -186,33 +216,25 @@ pub fn get_recipient_fee(
     sender: &str,
     message_box: &str,
 ) -> Result<i64, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
 
-    // 1. Sender-specific permission
-    {
-        let mut stmt = conn.prepare(
+    // Single query: try sender-specific first, then box-wide default
+    let result: Option<i64> = conn
+        .prepare(
             "SELECT recipient_fee FROM message_permissions \
-             WHERE recipient = ?1 AND sender = ?2 AND message_box = ?3",
-        )?;
-        let mut rows = stmt.query(params![recipient, sender, message_box])?;
-        if let Some(row) = rows.next()? {
-            return Ok(row.get(0)?);
-        }
+             WHERE recipient = ?1 AND message_box = ?3 \
+             AND (sender = ?2 OR sender IS NULL) \
+             ORDER BY sender DESC \
+             LIMIT 1",
+        )?
+        .query_row(params![recipient, sender, message_box], |row| row.get(0))
+        .optional()?;
+
+    if let Some(fee) = result {
+        return Ok(fee);
     }
 
-    // 2. Box-wide default (sender IS NULL)
-    {
-        let mut stmt = conn.prepare(
-            "SELECT recipient_fee FROM message_permissions \
-             WHERE recipient = ?1 AND sender IS NULL AND message_box = ?2",
-        )?;
-        let mut rows = stmt.query(params![recipient, message_box])?;
-        if let Some(row) = rows.next()? {
-            return Ok(row.get(0)?);
-        }
-    }
-
-    // 3. Auto-create box-wide default
+    // Auto-create box-wide default (only if nothing found at all)
     let default_fee = smart_default_fee(message_box);
     conn.execute(
         "INSERT OR IGNORE INTO message_permissions (recipient, sender, message_box, recipient_fee) \
@@ -231,7 +253,7 @@ pub fn set_message_permission(
     message_box: &str,
     recipient_fee: i64,
 ) -> Result<bool, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
 
     match sender {
         Some(s) => {
@@ -283,7 +305,7 @@ pub fn get_permission(
     sender: Option<&str>,
     message_box: &str,
 ) -> Result<Option<PermissionRow>, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     let (sql, result) = match sender {
         Some(s) => {
             let mut stmt = conn.prepare(
@@ -336,7 +358,7 @@ pub fn list_permissions(
     offset: i64,
     order: &str,
 ) -> Result<(Vec<PermissionRow>, i64), rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
 
     let order_dir = if order.eq_ignore_ascii_case("desc") {
         "DESC"
@@ -416,7 +438,7 @@ pub fn register_device(
     device_id: Option<&str>,
     platform: Option<&str>,
 ) -> Result<i64, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     conn.execute(
         "INSERT INTO device_registrations (identity_key, fcm_token, device_id, platform, last_used, active) \
          VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1) \
@@ -436,7 +458,7 @@ pub fn list_devices(
     pool: &DbPool,
     identity_key: &str,
 ) -> Result<Vec<DeviceRow>, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     let mut stmt = conn.prepare(
         "SELECT id, identity_key, fcm_token, device_id, platform, last_used, active, created_at, updated_at \
          FROM device_registrations WHERE identity_key = ?1 ORDER BY updated_at DESC",
@@ -449,7 +471,7 @@ pub fn list_active_devices(
     pool: &DbPool,
     identity_key: &str,
 ) -> Result<Vec<DeviceRow>, rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     let mut stmt = conn.prepare(
         "SELECT id, identity_key, fcm_token, device_id, platform, last_used, active, created_at, updated_at \
          FROM device_registrations WHERE identity_key = ?1 AND active = 1 ORDER BY updated_at DESC",
@@ -473,7 +495,7 @@ fn read_device_row(row: &rusqlite::Row<'_>) -> Result<DeviceRow, rusqlite::Error
 }
 
 pub fn update_device_last_used(pool: &DbPool, device_id: i64) -> Result<(), rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     conn.execute(
         "UPDATE device_registrations SET last_used = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
         params![device_id],
@@ -482,7 +504,7 @@ pub fn update_device_last_used(pool: &DbPool, device_id: i64) -> Result<(), rusq
 }
 
 pub fn deactivate_device(pool: &DbPool, device_id: i64) -> Result<(), rusqlite::Error> {
-    let conn = pool.lock();
+    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
     conn.execute(
         "UPDATE device_registrations SET active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
         params![device_id],

@@ -23,6 +23,7 @@ async fn main() {
 
     let pool = db::new(&config.db_source).expect("Failed to open database");
     db::migrate(&pool).expect("Failed to run migrations");
+    db::queries::init_delivery_fee_cache(&pool);
 
     firebase::initialize(
         config.firebase_project_id.as_deref(),

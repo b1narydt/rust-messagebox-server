@@ -3,20 +3,22 @@ pub mod queries;
 #[cfg(test)]
 mod tests;
 
-use parking_lot::Mutex;
-use rusqlite::Connection;
-use std::sync::Arc;
+pub type DbPool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
 
-pub type DbPool = Arc<Mutex<Connection>>;
-
-pub fn new(db_source: &str) -> Result<DbPool, rusqlite::Error> {
-    let conn = Connection::open(db_source)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-    Ok(Arc::new(Mutex::new(conn)))
+pub fn new(db_source: &str) -> Result<DbPool, Box<dyn std::error::Error>> {
+    let manager = r2d2_sqlite::SqliteConnectionManager::file(db_source)
+        .with_init(|conn| {
+            conn.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            )?;
+            Ok(())
+        });
+    let pool = r2d2::Pool::builder().max_size(8).build(manager)?;
+    Ok(pool)
 }
 
-pub fn migrate(pool: &DbPool) -> Result<(), rusqlite::Error> {
-    let conn = pool.lock();
+pub fn migrate(pool: &DbPool) -> Result<(), Box<dyn std::error::Error>> {
+    let conn = pool.get()?;
 
     conn.execute_batch(
         "
@@ -88,6 +90,11 @@ pub fn migrate(pool: &DbPool) -> Result<(), rusqlite::Error> {
             ON messages(recipient, messageBoxId, created_at);
         CREATE INDEX IF NOT EXISTS idx_messages_box_id
             ON messages(messageBoxId);
+
+        CREATE INDEX IF NOT EXISTS idx_messagebox_identity_type
+            ON messageBox(identityKey, type);
+        CREATE INDEX IF NOT EXISTS idx_devices_identity_active_updated
+            ON device_registrations(identity_key, active, updated_at DESC);
         ",
     )?;
 
