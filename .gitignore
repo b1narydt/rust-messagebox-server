@@ -4,4 +4,3 @@
 *.db-wal
 .DS_Store
 .env
-Cargo.lock
