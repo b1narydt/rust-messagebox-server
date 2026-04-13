@@ -8,6 +8,26 @@ use super::DbPool;
 
 static DELIVERY_FEE_CACHE: OnceLock<HashMap<String, i64>> = OnceLock::new();
 
+/// Upsert a `server_fees` row. Creates the row if it does not exist; overwrites
+/// `delivery_fee` if it does. Must be called before `init_delivery_fee_cache`
+/// so the in-memory cache reflects the operator-supplied value.
+pub async fn upsert_server_fee(
+    pool: &DbPool,
+    message_box: &str,
+    delivery_fee: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO server_fees (message_box, delivery_fee) \
+         VALUES (?, ?) \
+         ON DUPLICATE KEY UPDATE delivery_fee = VALUES(delivery_fee)",
+    )
+    .bind(message_box)
+    .bind(delivery_fee)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn init_delivery_fee_cache(pool: &DbPool) -> Result<(), sqlx::Error> {
     let rows: Vec<(String, i64)> =
         sqlx::query_as("SELECT message_box, delivery_fee FROM server_fees")

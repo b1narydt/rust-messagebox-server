@@ -31,6 +31,10 @@ pub struct Config {
     pub firebase_project_id: Option<String>,
     pub firebase_service_account_json: Option<String>,
     pub firebase_service_account_path: Option<String>,
+    /// Parsed from `MESSAGEBOX_FEES=chat=10,priority=100` — applied at boot.
+    pub message_box_fees: Vec<(String, i64)>,
+    /// Parse warnings from `MESSAGEBOX_FEES` — emitted after the logger is up.
+    pub message_box_fees_warnings: Vec<String>,
 }
 
 impl Config {
@@ -105,6 +109,13 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty());
 
+        // Parse MESSAGEBOX_FEES=chat=10,priority=100
+        // Format: comma-separated box_name=satoshis pairs. Whitespace is trimmed.
+        // Malformed or negative entries are collected as warnings and emitted
+        // after the logger is initialised in main(); the server still boots.
+        let (message_box_fees, message_box_fees_warnings) =
+            parse_message_box_fees(&env::var("MESSAGEBOX_FEES").unwrap_or_default());
+
         Ok(Config {
             node_env,
             port,
@@ -118,6 +129,8 @@ impl Config {
             firebase_project_id,
             firebase_service_account_json,
             firebase_service_account_path,
+            message_box_fees,
+            message_box_fees_warnings,
         })
     }
 
@@ -129,6 +142,64 @@ impl Config {
     pub fn is_railway(&self) -> bool {
         std::env::var("RAILWAY_ENVIRONMENT").is_ok()
     }
+}
+
+/// Parse `MESSAGEBOX_FEES` value into `(box_name, delivery_fee)` pairs.
+///
+/// Accepted format: `chat=10,priority=100 , notifications = 5`
+/// - Whitespace around names/values is trimmed.
+/// - Empty tokens (e.g. from a trailing comma) are silently skipped.
+/// - Entries without exactly one `=` separator → warning string returned, skipped.
+/// - Values that are not valid `i64` → warning string returned, skipped.
+/// - Negative values → warning string returned, skipped.
+///
+/// Returns `(valid_pairs, warnings)`. Warnings must be emitted by the caller
+/// after the tracing subscriber has been installed.
+fn parse_message_box_fees(raw: &str) -> (Vec<(String, i64)>, Vec<String>) {
+    if raw.trim().is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut warnings = Vec::new();
+    for token in raw.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        // Split on the first '=' only; a box name should never contain '='.
+        let parts: Vec<&str> = token.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            warnings.push(format!(
+                "MESSAGEBOX_FEES: malformed entry {token:?} (expected box_name=satoshis) — skipped"
+            ));
+            continue;
+        }
+        let box_name = parts[0].trim();
+        let fee_str = parts[1].trim();
+        if box_name.is_empty() {
+            warnings.push(format!(
+                "MESSAGEBOX_FEES: entry {token:?} has an empty box name — skipped"
+            ));
+            continue;
+        }
+        let fee: i64 = match fee_str.parse() {
+            Ok(v) => v,
+            Err(_) => {
+                warnings.push(format!(
+                    "MESSAGEBOX_FEES: entry {token:?} has non-integer fee {fee_str:?} — skipped"
+                ));
+                continue;
+            }
+        };
+        if fee < 0 {
+            warnings.push(format!(
+                "MESSAGEBOX_FEES: entry {token:?} has negative fee {fee} — skipped"
+            ));
+            continue;
+        }
+        out.push((box_name.to_string(), fee));
+    }
+    (out, warnings)
 }
 
 /// Redact the password portion of a `mysql://user:pass@host:port/db` URL.
@@ -176,6 +247,8 @@ impl fmt::Debug for Config {
                 "firebase_service_account_path",
                 &self.firebase_service_account_path,
             )
+            .field("message_box_fees", &self.message_box_fees)
+            // message_box_fees_warnings are transient — omitted from Debug output.
             .finish()
     }
 }

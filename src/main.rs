@@ -31,10 +31,35 @@ async fn main() {
 
     logger::init(config.is_development());
 
+    // Emit any MESSAGEBOX_FEES parse warnings now that the logger is up.
+    for warning in &config.message_box_fees_warnings {
+        tracing::warn!("{warning}");
+    }
+
     let pool = db::new(&config.db_source, config.db_max_connections)
         .await
         .expect("Failed to open database");
     db::migrate(&pool).await.expect("Failed to run migrations");
+
+    // Apply operator fee overrides from MESSAGEBOX_FEES before the in-memory
+    // cache is primed so the cache always reflects the latest values.
+    if config.message_box_fees.is_empty() {
+        tracing::info!("no env fee overrides configured (MESSAGEBOX_FEES not set)");
+    } else {
+        let mut applied: Vec<String> = Vec::new();
+        for (box_name, fee) in &config.message_box_fees {
+            match db::queries::upsert_server_fee(&pool, box_name, *fee).await {
+                Ok(()) => applied.push(format!("{box_name}={fee}")),
+                Err(e) => tracing::error!(
+                    "failed to upsert server fee for {box_name}={fee}: {e}"
+                ),
+            }
+        }
+        if !applied.is_empty() {
+            tracing::info!("applied env fee overrides: {}", applied.join(", "));
+        }
+    }
+
     db::queries::init_delivery_fee_cache(&pool)
         .await
         .expect("Failed to prime delivery-fee cache");
