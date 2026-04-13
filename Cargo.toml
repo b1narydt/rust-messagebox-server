@@ -33,6 +33,8 @@ bsv-auth-axum-middleware = "0.1"
 # two-instance trait-bound conflicts).
 bsv-sdk = { version = "0.2", features = ["network"] }
 
+bsv-wallet-toolbox = "0.2"
+
 getrandom = "0.4"
 http-body-util = "0.1"
 rsa = { version = "0.9", features = ["sha2"] }

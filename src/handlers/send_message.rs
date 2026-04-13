@@ -4,10 +4,12 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-// Payment internalization uses bsv-sdk WalletInterface but ProtoWallet
-// always returns "requires a full wallet" — payment validation is structural only.
+use bsv::primitives::public_key::PublicKey;
+use bsv::wallet::interfaces::{
+    InternalizeActionArgs, InternalizeOutput, Payment as SdkPayment, WalletInterface,
+};
 use serde_json::Value;
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::db::queries;
 use crate::firebase::send_fcm_notification::{send_fcm_notification, FcmPayload};
@@ -330,11 +332,127 @@ pub async fn send_message(
             }
         };
 
-        // Payment internalization is a no-op with ProtoWallet (requires full wallet).
-        // Structural payment validation is sufficient for self-hosted deployments.
-        // TODO: Implement full internalization when HttpWallet is available.
+        // Internalize the server's delivery-fee output so the payment is credited
+        // to the server's wallet at the remote storage backend.
         if delivery_fee > 0 {
-            warn!("ProtoWallet does not support payment internalization; structurally validated, continuing");
+            // The server's delivery-fee output is always the first output (index 0).
+            let server_output = match pay.outputs.as_deref().and_then(|o| o.first()) {
+                Some(o) => o,
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "ERR_MISSING_PAYMENT_TX",
+                        "Payment transaction data is required for payable delivery.",
+                    )
+                    .into_response();
+                }
+            };
+
+            // Extract derivation parameters from the payment remittance on the
+            // server's output. The sender must have included these for the server
+            // to verify and claim the output.
+            let remittance = match &server_output.payment_remittance {
+                Some(r) => r,
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "ERR_INVALID_PAYMENT",
+                        "Server delivery-fee output is missing payment remittance.",
+                    )
+                    .into_response();
+                }
+            };
+
+            let derivation_prefix = match &remittance.derivation_prefix {
+                Some(p) if !p.is_empty() => p.as_bytes().to_vec(),
+                _ => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "ERR_INVALID_PAYMENT",
+                        "Server delivery-fee output is missing derivationPrefix.",
+                    )
+                    .into_response();
+                }
+            };
+
+            let derivation_suffix = match &remittance.derivation_suffix {
+                Some(s) if !s.is_empty() => s.as_bytes().to_vec(),
+                _ => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "ERR_INVALID_PAYMENT",
+                        "Server delivery-fee output is missing derivationSuffix.",
+                    )
+                    .into_response();
+                }
+            };
+
+            let sender_pub_key = match &remittance.sender_identity_key {
+                Some(k) if !k.is_empty() => {
+                    match PublicKey::from_string(k) {
+                        Ok(pk) => pk,
+                        Err(_) => {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "ERR_INVALID_PAYMENT",
+                                "senderIdentityKey in payment remittance is not a valid public key.",
+                            )
+                            .into_response();
+                        }
+                    }
+                }
+                _ => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "ERR_INVALID_PAYMENT",
+                        "Server delivery-fee output is missing senderIdentityKey.",
+                    )
+                    .into_response();
+                }
+            };
+
+            let tx_bytes = pay.tx.clone().unwrap_or_default();
+
+            let internalize_args = InternalizeActionArgs {
+                tx: tx_bytes,
+                outputs: vec![InternalizeOutput::WalletPayment {
+                    output_index: server_output.output_index,
+                    payment: SdkPayment {
+                        derivation_prefix,
+                        derivation_suffix,
+                        sender_identity_key: sender_pub_key,
+                    },
+                }],
+                description: format!(
+                    "Delivery fee payment for message box: {}",
+                    box_type
+                ),
+                labels: vec![],
+                seek_permission: Some(false).into(),
+            };
+
+            match state.funded_wallet.internalize_action(internalize_args, None).await {
+                Ok(result) => {
+                    if !result.accepted {
+                        error!("internalize_action rejected delivery fee payment");
+                        return error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ERR_INTERNALIZATION_FAILED",
+                            "The server could not internalize the delivery fee payment.",
+                        )
+                        .into_response();
+                    }
+                }
+                Err(e) => {
+                    error!("internalize_action failed: {e}");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ERR_INTERNALIZATION_FAILED",
+                        "The server failed to process the delivery fee payment.",
+                    )
+                    .into_response();
+                }
+            }
         }
 
         let outputs = pay.outputs.as_deref().unwrap_or_default();

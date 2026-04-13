@@ -11,8 +11,15 @@ use tower_http::timeout::TimeoutLayer;
 
 use bsv::auth::peer::Peer;
 use bsv::primitives::private_key::PrivateKey;
+use bsv::wallet::cached_key_deriver::CachedKeyDeriver;
 use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
 use bsv_auth_axum_middleware::ActixTransport;
+use bsv_wallet_toolbox::services::Services;
+use bsv_wallet_toolbox::storage::manager::WalletStorageManager;
+use bsv_wallet_toolbox::storage::remoting::{StorageClient, WalletArc};
+use bsv_wallet_toolbox::types::Chain;
+use bsv_wallet_toolbox::wallet::wallet::Wallet;
+use bsv_wallet_toolbox::wallet::types::WalletArgs;
 
 use messagebox_server::{cloneable_wallet, config, db, firebase, handlers, logger, ws};
 
@@ -47,7 +54,46 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let sdk_wallet = Arc::new(SdkProtoWallet::new(sdk_private_key));
+    let sdk_wallet = Arc::new(SdkProtoWallet::new(sdk_private_key.clone()));
+
+    // Build the funded wallet that can internalize incoming delivery-fee payments.
+    // Uses StorageClient<WalletArc<SdkProtoWallet>> to forward all storage calls
+    // (including internalizeAction) to the remote wallet-storage backend via BRC-31
+    // authenticated JSON-RPC. The WalletArc wrapper makes SdkProtoWallet Clone-able
+    // so it satisfies StorageClient<W: Clone>'s bound.
+    let chain = if config.bsv_network == "mainnet" {
+        Chain::Main
+    } else {
+        Chain::Test
+    };
+    let key_deriver = Arc::new(CachedKeyDeriver::new(sdk_private_key.clone(), None));
+    let identity_key_hex = key_deriver.identity_key().to_der_hex();
+    let wallet_arc = WalletArc::new(SdkProtoWallet::new(sdk_private_key));
+    let storage_client = Arc::new(StorageClient::new(wallet_arc, &config.wallet_storage_url));
+    let storage_manager = WalletStorageManager::new(
+        identity_key_hex.clone(),
+        Some(storage_client as Arc<dyn bsv_wallet_toolbox::storage::traits::WalletStorageProvider>),
+        vec![],
+    );
+    let services = Arc::new(Services::from_chain(chain.clone()));
+    let wallet_args = WalletArgs {
+        chain,
+        key_deriver: key_deriver.clone(),
+        storage: storage_manager,
+        services: Some(services),
+        monitor: None,
+        privileged_key_manager: None,
+        settings_manager: None,
+        lookup_resolver: None,
+    };
+    let funded_wallet = match Wallet::new(wallet_args) {
+        Ok(w) => Arc::new(w),
+        Err(e) => {
+            tracing::error!("Failed to construct funded wallet: {e}");
+            std::process::exit(1);
+        }
+    };
+    tracing::info!("Wallet storage backend: {}", config.wallet_storage_url);
 
     // Log server identity key via bsv-sdk
     let identity_key = {
@@ -112,6 +158,7 @@ async fn main() {
         db: pool,
         config: Arc::new(config),
         wallet: sdk_wallet,
+        funded_wallet,
         ws: ws_broadcast,
     };
 

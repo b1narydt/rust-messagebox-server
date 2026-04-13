@@ -14,6 +14,9 @@ use tower::ServiceExt; // for .oneshot()
 
 use bsv::primitives::private_key::PrivateKey;
 use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
+use bsv_wallet_toolbox::types::Chain;
+use bsv_wallet_toolbox::wallet::setup::WalletBuilder;
+use bsv_wallet_toolbox::wallet::wallet::Wallet;
 
 use crate::config::Config;
 use crate::db::queries;
@@ -30,11 +33,30 @@ fn test_config() -> Config {
         db_max_connections: 4,
         bsv_network: "testnet".to_string(),
         enable_websockets: false,
-        wallet_storage_url: None,
+        wallet_storage_url: "https://storage.babbage.systems".to_string(),
         firebase_project_id: None,
         firebase_service_account_json: None,
         firebase_service_account_path: None,
     }
+}
+
+/// Build an in-memory `Wallet` for use in tests.
+///
+/// Uses in-memory SQLite storage so tests stay self-contained and don't
+/// touch any remote wallet-storage backend. The funded_wallet is not
+/// exercised by any current test (no test sets a delivery_fee > 0), but it
+/// must exist for the AppState to compile.
+async fn test_funded_wallet() -> Arc<Wallet> {
+    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
+    let setup = WalletBuilder::new()
+        .chain(Chain::Test)
+        .root_key(pk)
+        .with_sqlite_memory()
+        .with_default_services()
+        .build()
+        .await
+        .expect("failed to build test funded wallet");
+    Arc::new(setup.wallet)
 }
 
 async fn setup_app() -> Router {
@@ -42,6 +64,7 @@ async fn setup_app() -> Router {
 
     let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
     let wallet = Arc::new(SdkProtoWallet::new(pk));
+    let funded_wallet = test_funded_wallet().await;
 
     // Create a minimal WsBroadcast for tests (Socket.IO is not exercised
     // but needs a default namespace registered to avoid panics on broadcast).
@@ -53,6 +76,7 @@ async fn setup_app() -> Router {
         db: pool,
         config: Arc::new(test_config()),
         wallet,
+        funded_wallet,
         ws: ws_broadcast,
     };
 
@@ -605,6 +629,7 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
 
     let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
     let wallet = Arc::new(SdkProtoWallet::new(pk));
+    let funded_wallet = test_funded_wallet().await;
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
     let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
@@ -613,6 +638,7 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
         db: pool.clone(),
         config: Arc::new(test_config()),
         wallet,
+        funded_wallet,
         ws: ws_broadcast,
     };
     let app = Router::new()

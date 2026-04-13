@@ -27,7 +27,7 @@ pub struct Config {
     pub db_max_connections: u32,
     pub bsv_network: String,
     pub enable_websockets: bool,
-    pub wallet_storage_url: Option<String>,
+    pub wallet_storage_url: String,
     pub firebase_project_id: Option<String>,
     pub firebase_service_account_json: Option<String>,
     pub firebase_service_account_path: Option<String>,
@@ -92,7 +92,10 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
-        let wallet_storage_url = env::var("WALLET_STORAGE_URL").ok().filter(|s| !s.is_empty());
+        let wallet_storage_url = env::var("WALLET_STORAGE_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "https://storage.babbage.systems".to_string());
         let firebase_project_id =
             env::var("FIREBASE_PROJECT_ID").ok().filter(|s| !s.is_empty());
         let firebase_service_account_json = env::var("FIREBASE_SERVICE_ACCOUNT_JSON")
