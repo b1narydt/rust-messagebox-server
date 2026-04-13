@@ -60,7 +60,7 @@ pub async fn acknowledge_message(
     }
 
     // ── Acknowledge ───────────────────────────────────────────────────
-    let deleted = match queries::acknowledge_messages(&state.db, &identity_key, &message_ids) {
+    let deleted = match queries::acknowledge_messages(&state.db, &identity_key, &message_ids).await {
         Ok(n) => n,
         Err(e) => {
             error!("failed to acknowledge messages: {e}");

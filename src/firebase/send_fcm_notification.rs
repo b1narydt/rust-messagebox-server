@@ -39,7 +39,7 @@ pub async fn send_fcm_notification(
     };
 
     // Look up all active devices for the recipient.
-    let devices = match crate::db::queries::list_active_devices(pool, recipient) {
+    let devices = match crate::db::queries::list_active_devices(pool, recipient).await {
         Ok(d) => d,
         Err(e) => {
             tracing::error!("Failed to list active devices for recipient: {e}");
@@ -101,7 +101,7 @@ pub async fn send_fcm_notification(
             let status = resp.status();
             if status.is_success() {
                 tracing::debug!("FCM sent successfully to device ...{}", token_tail);
-                if let Err(e) = crate::db::queries::update_device_last_used(&pool, device.id) {
+                if let Err(e) = crate::db::queries::update_device_last_used(&pool, device.id).await {
                     tracing::warn!("Failed to update last_used for device {}: {e}", device.id);
                 }
                 return true;
@@ -121,7 +121,7 @@ pub async fn send_fcm_notification(
                     "Deactivating device ...{} due to invalid FCM token",
                     token_tail
                 );
-                if let Err(e) = crate::db::queries::deactivate_device(&pool, device.id) {
+                if let Err(e) = crate::db::queries::deactivate_device(&pool, device.id).await {
                     tracing::error!("Failed to deactivate device {}: {e}", device.id);
                 }
             }

@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
 use axum::{
+    extract::DefaultBodyLimit,
+    http::StatusCode,
     routing::{get, post},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::timeout::TimeoutLayer;
 
 use bsv::auth::peer::Peer;
 use bsv::primitives::private_key::PrivateKey;
@@ -21,9 +24,13 @@ async fn main() {
 
     logger::init(config.is_development());
 
-    let pool = db::new(&config.db_source).expect("Failed to open database");
-    db::migrate(&pool).expect("Failed to run migrations");
-    db::queries::init_delivery_fee_cache(&pool);
+    let pool = db::new(&config.db_source, config.db_max_connections)
+        .await
+        .expect("Failed to open database");
+    db::migrate(&pool).await.expect("Failed to run migrations");
+    db::queries::init_delivery_fee_cache(&pool)
+        .await
+        .expect("Failed to prime delivery-fee cache");
 
     firebase::initialize(
         config.firebase_project_id.as_deref(),
@@ -114,6 +121,30 @@ async fn main() {
         .allow_methods(Any)
         .expose_headers(Any);
 
+    // Request timeout + body size limits — applied only to API routes,
+    // NOT to the health endpoint (uptime checks stay fast, GET / avoids
+    // body-limit parsing entirely).
+    let timeout_secs: u64 = std::env::var("REQUEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(30);
+    let max_body_bytes: usize = std::env::var("MAX_BODY_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(10 * 1024 * 1024);
+
+    // Unauthenticated health endpoint — always at `/`, never under the
+    // routing prefix, never behind BRC-31 auth. Returns plain text.
+    let health_routes = Router::new().route(
+        "/",
+        get(|| async {
+            (
+                [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                "BSV MessageBox Server",
+            )
+        }),
+    );
+
     // Protected API routes — BRC-31 auth via bsv-sdk Peer middleware
     let api_routes = Router::new()
         .route("/sendMessage", post(handlers::send_message::send_message))
@@ -147,12 +178,17 @@ async fn main() {
             get(handlers::permissions::get_quote),
         )
         .layer(auth_layer)
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(timeout_secs),
+        ))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(app_state);
 
     let app = if prefix.is_empty() {
-        Router::new().merge(api_routes)
+        Router::new().merge(health_routes).merge(api_routes)
     } else {
-        Router::new().nest(&prefix, api_routes)
+        Router::new().merge(health_routes).nest(&prefix, api_routes)
     }
     .layer(sio_layer)
     .layer(cors);

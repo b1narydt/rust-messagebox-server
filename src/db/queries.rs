@@ -1,25 +1,25 @@
-use rusqlite::params;
-use rusqlite::OptionalExtension;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use sqlx::{QueryBuilder, Row};
 
 use super::DbPool;
 
 static DELIVERY_FEE_CACHE: OnceLock<HashMap<String, i64>> = OnceLock::new();
 
-pub fn init_delivery_fee_cache(pool: &DbPool) {
-    let conn = pool.get().expect("failed to get connection for delivery fee cache init");
-    let mut stmt = conn
-        .prepare("SELECT message_box, delivery_fee FROM server_fees")
-        .unwrap();
-    let mut map = HashMap::new();
-    let mut rows = stmt.query([]).unwrap();
-    while let Some(row) = rows.next().unwrap() {
-        let mb: String = row.get(0).unwrap();
-        let fee: i64 = row.get(1).unwrap();
-        map.insert(mb, fee);
-    }
+pub async fn init_delivery_fee_cache(pool: &DbPool) -> Result<(), sqlx::Error> {
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT message_box, delivery_fee FROM server_fees")
+            .fetch_all(pool)
+            .await?;
+    let map: HashMap<String, i64> = rows.into_iter().collect();
     let _ = DELIVERY_FEE_CACHE.set(map);
+    Ok(())
+}
+
+fn fmt_ts(ts: DateTime<Utc>) -> String {
+    ts.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -63,38 +63,39 @@ pub struct DeviceRow {
 // Message-box helpers
 // ---------------------------------------------------------------------------
 
-pub fn ensure_message_box(
+pub async fn ensure_message_box(
     pool: &DbPool,
     identity_key: &str,
     box_type: &str,
-) -> Result<i64, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    conn.execute(
-        "INSERT OR IGNORE INTO messageBox (type, identityKey) VALUES (?1, ?2)",
-        params![box_type, identity_key],
-    )?;
-    let id: i64 = conn.query_row(
-        "SELECT messageBoxId FROM messageBox WHERE type = ?1 AND identityKey = ?2",
-        params![box_type, identity_key],
-        |row| row.get(0),
-    )?;
+) -> Result<i64, sqlx::Error> {
+    sqlx::query("INSERT IGNORE INTO messageBox (type, identityKey) VALUES (?, ?)")
+        .bind(box_type)
+        .bind(identity_key)
+        .execute(pool)
+        .await?;
+
+    let id: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT CAST(messageBoxId AS SIGNED) FROM messageBox WHERE type = ? AND identityKey = ?",
+    )
+    .bind(box_type)
+    .bind(identity_key)
+    .fetch_one(pool)
+    .await?;
     Ok(id)
 }
 
-pub fn get_message_box_id(
+pub async fn get_message_box_id(
     pool: &DbPool,
     identity_key: &str,
     box_type: &str,
-) -> Result<Option<i64>, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    let mut stmt = conn.prepare(
-        "SELECT messageBoxId FROM messageBox WHERE type = ?1 AND identityKey = ?2",
-    )?;
-    let mut rows = stmt.query(params![box_type, identity_key])?;
-    match rows.next()? {
-        Some(row) => Ok(Some(row.get(0)?)),
-        None => Ok(None),
-    }
+) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT CAST(messageBoxId AS SIGNED) FROM messageBox WHERE type = ? AND identityKey = ?",
+    )
+    .bind(box_type)
+    .bind(identity_key)
+    .fetch_optional(pool)
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -102,99 +103,96 @@ pub fn get_message_box_id(
 // ---------------------------------------------------------------------------
 
 /// Insert a message. Returns Ok(true) on success, Ok(false) if duplicate.
-pub fn insert_message(
+pub async fn insert_message(
     pool: &DbPool,
     message_id: &str,
     message_box_id: i64,
     sender: &str,
     recipient: &str,
     body: &str,
-) -> Result<bool, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    let affected = conn.execute(
-        "INSERT OR IGNORE INTO messages (messageId, messageBoxId, sender, recipient, body) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![message_id, message_box_id, sender, recipient, body],
-    )?;
-    Ok(affected > 0)
+) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT IGNORE INTO messages (messageId, messageBoxId, sender, recipient, body) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(message_id)
+    .bind(message_box_id)
+    .bind(sender)
+    .bind(recipient)
+    .bind(body)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
 }
 
-pub fn list_messages(
+pub async fn list_messages(
     pool: &DbPool,
     recipient: &str,
     message_box_id: i64,
-) -> Result<Vec<MessageRow>, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    let mut stmt = conn.prepare(
+) -> Result<Vec<MessageRow>, sqlx::Error> {
+    let rows = sqlx::query(
         "SELECT messageId, body, sender, created_at, updated_at \
-         FROM messages WHERE recipient = ?1 AND messageBoxId = ?2 \
+         FROM messages WHERE recipient = ? AND messageBoxId = ? \
          ORDER BY created_at ASC",
-    )?;
-    let rows = stmt.query_map(params![recipient, message_box_id], |row| {
-        Ok(MessageRow {
-            message_id: row.get(0)?,
-            body: row.get(1)?,
-            sender: row.get(2)?,
-            created_at: row.get(3)?,
-            updated_at: row.get(4)?,
-        })
-    })?;
-    rows.collect()
+    )
+    .bind(recipient)
+    .bind(message_box_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(MessageRow {
+            message_id: row.try_get("messageId")?,
+            body: row.try_get("body")?,
+            sender: row.try_get("sender")?,
+            created_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("created_at")?),
+            updated_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("updated_at")?),
+        });
+    }
+    Ok(out)
 }
 
 /// Delete acknowledged messages. Returns the number of rows deleted.
-pub fn acknowledge_messages(
+pub async fn acknowledge_messages(
     pool: &DbPool,
     recipient: &str,
     message_ids: &[String],
-) -> Result<usize, rusqlite::Error> {
+) -> Result<u64, sqlx::Error> {
     if message_ids.is_empty() {
         return Ok(0);
     }
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    let placeholders: Vec<String> = (0..message_ids.len()).map(|i| format!("?{}", i + 2)).collect();
-    let sql = format!(
-        "DELETE FROM messages WHERE recipient = ?1 AND messageId IN ({})",
-        placeholders.join(", ")
-    );
-    let mut stmt = conn.prepare(&sql)?;
-
-    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    param_values.push(Box::new(recipient.to_string()));
+    let mut qb: QueryBuilder<sqlx::MySql> =
+        QueryBuilder::new("DELETE FROM messages WHERE recipient = ");
+    qb.push_bind(recipient);
+    qb.push(" AND messageId IN (");
+    let mut sep = qb.separated(", ");
     for id in message_ids {
-        param_values.push(Box::new(id.clone()));
+        sep.push_bind(id);
     }
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = param_values.iter().map(|p| p.as_ref()).collect();
-    let count = stmt.execute(param_refs.as_slice())?;
-    Ok(count)
+    qb.push(")");
+    let result = qb.build().execute(pool).await?;
+    Ok(result.rows_affected())
 }
 
 // ---------------------------------------------------------------------------
 // Fees & permissions
 // ---------------------------------------------------------------------------
 
-pub fn get_server_delivery_fee(
+pub async fn get_server_delivery_fee(
     pool: &DbPool,
     message_box: &str,
-) -> Result<i64, rusqlite::Error> {
-    // Check static cache first (populated at startup)
+) -> Result<i64, sqlx::Error> {
     if let Some(cache) = DELIVERY_FEE_CACHE.get() {
-        if let Some(&fee) = cache.get(message_box) {
-            return Ok(fee);
-        }
-        // Key not in cache means no row in server_fees => default 0
-        return Ok(0);
+        return Ok(cache.get(message_box).copied().unwrap_or(0));
     }
 
-    // Fallback to DB query (cache not yet initialised)
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    let mut stmt =
-        conn.prepare("SELECT delivery_fee FROM server_fees WHERE message_box = ?1")?;
-    let mut rows = stmt.query(params![message_box])?;
-    match rows.next()? {
-        Some(row) => Ok(row.get(0)?),
-        None => Ok(0),
-    }
+    let fee: Option<i64> =
+        sqlx::query_scalar("SELECT delivery_fee FROM server_fees WHERE message_box = ?")
+            .bind(message_box)
+            .fetch_optional(pool)
+            .await?;
+    Ok(fee.unwrap_or(0))
 }
 
 /// Smart default fee: notifications=10, everything else=0.
@@ -210,88 +208,106 @@ fn smart_default_fee(message_box: &str) -> i64 {
 /// 1. Sender-specific permission (non-NULL sender wins)
 /// 2. Box-wide default (sender IS NULL)
 /// 3. Auto-create box-wide default with smart_default_fee
-pub fn get_recipient_fee(
+pub async fn get_recipient_fee(
     pool: &DbPool,
     recipient: &str,
     sender: &str,
     message_box: &str,
-) -> Result<i64, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-
-    // Single query: try sender-specific first, then box-wide default
-    let result: Option<i64> = conn
-        .prepare(
-            "SELECT recipient_fee FROM message_permissions \
-             WHERE recipient = ?1 AND message_box = ?3 \
-             AND (sender = ?2 OR sender IS NULL) \
-             ORDER BY sender DESC \
-             LIMIT 1",
-        )?
-        .query_row(params![recipient, sender, message_box], |row| row.get(0))
-        .optional()?;
+) -> Result<i64, sqlx::Error> {
+    // Single query: prefer sender-specific over NULL sender.
+    // MySQL places NULL last on DESC, so the non-NULL row wins with LIMIT 1.
+    let result: Option<i64> = sqlx::query_scalar(
+        "SELECT recipient_fee FROM message_permissions \
+         WHERE recipient = ? AND message_box = ? \
+         AND (sender = ? OR sender IS NULL) \
+         ORDER BY sender DESC \
+         LIMIT 1",
+    )
+    .bind(recipient)
+    .bind(message_box)
+    .bind(sender)
+    .fetch_optional(pool)
+    .await?;
 
     if let Some(fee) = result {
         return Ok(fee);
     }
 
-    // Auto-create box-wide default (only if nothing found at all)
+    // Nothing found anywhere: auto-create the box-wide default.
     let default_fee = smart_default_fee(message_box);
-    conn.execute(
-        "INSERT OR IGNORE INTO message_permissions (recipient, sender, message_box, recipient_fee) \
-         VALUES (?1, NULL, ?2, ?3)",
-        params![recipient, message_box, default_fee],
-    )?;
+    sqlx::query(
+        "INSERT IGNORE INTO message_permissions (recipient, sender, message_box, recipient_fee) \
+         VALUES (?, NULL, ?, ?)",
+    )
+    .bind(recipient)
+    .bind(message_box)
+    .bind(default_fee)
+    .execute(pool)
+    .await?;
 
     Ok(default_fee)
 }
 
 /// Upsert a permission. Returns Ok(true) on success.
-pub fn set_message_permission(
+pub async fn set_message_permission(
     pool: &DbPool,
     recipient: &str,
     sender: Option<&str>,
     message_box: &str,
     recipient_fee: i64,
-) -> Result<bool, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-
+) -> Result<bool, sqlx::Error> {
     match sender {
         Some(s) => {
-            // Non-null sender: use ON CONFLICT.
-            conn.execute(
+            // Non-null sender: UNIQUE(recipient, sender, message_box) matches on
+            // concrete values, so ON DUPLICATE KEY UPDATE works directly.
+            sqlx::query(
                 "INSERT INTO message_permissions (recipient, sender, message_box, recipient_fee) \
-                 VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(recipient, sender, message_box) DO UPDATE SET \
-                 recipient_fee = excluded.recipient_fee, \
-                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-                params![recipient, s, message_box, recipient_fee],
-            )?;
+                 VALUES (?, ?, ?, ?) \
+                 ON DUPLICATE KEY UPDATE \
+                   recipient_fee = VALUES(recipient_fee), \
+                   updated_at = CURRENT_TIMESTAMP",
+            )
+            .bind(recipient)
+            .bind(s)
+            .bind(message_box)
+            .bind(recipient_fee)
+            .execute(pool)
+            .await?;
         }
         None => {
-            // NULL sender: SQLite treats NULLs as distinct in UNIQUE constraints,
-            // so we check existence manually.
-            let exists: bool = conn
-                .prepare(
-                    "SELECT COUNT(*) FROM message_permissions \
-                     WHERE recipient = ?1 AND sender IS NULL AND message_box = ?2",
-                )?
-                .query_row(params![recipient, message_box], |row| {
-                    Ok(row.get::<_, i64>(0)? > 0)
-                })?;
+            // MySQL treats NULL as distinct inside UNIQUE constraints, so
+            // ON DUPLICATE KEY UPDATE will never match a NULL-sender row.
+            // Do SELECT-then-INSERT/UPDATE explicitly.
+            let exists: Option<i64> = sqlx::query_scalar(
+                "SELECT CAST(id AS SIGNED) AS id FROM message_permissions \
+                 WHERE recipient = ? AND sender IS NULL AND message_box = ? LIMIT 1",
+            )
+            .bind(recipient)
+            .bind(message_box)
+            .fetch_optional(pool)
+            .await?;
 
-            if exists {
-                conn.execute(
+            if exists.is_some() {
+                sqlx::query(
                     "UPDATE message_permissions \
-                     SET recipient_fee = ?1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-                     WHERE recipient = ?2 AND sender IS NULL AND message_box = ?3",
-                    params![recipient_fee, recipient, message_box],
-                )?;
+                     SET recipient_fee = ?, updated_at = CURRENT_TIMESTAMP \
+                     WHERE recipient = ? AND sender IS NULL AND message_box = ?",
+                )
+                .bind(recipient_fee)
+                .bind(recipient)
+                .bind(message_box)
+                .execute(pool)
+                .await?;
             } else {
-                conn.execute(
+                sqlx::query(
                     "INSERT INTO message_permissions (recipient, sender, message_box, recipient_fee) \
-                     VALUES (?1, NULL, ?2, ?3)",
-                    params![recipient, message_box, recipient_fee],
-                )?;
+                     VALUES (?, NULL, ?, ?)",
+                )
+                .bind(recipient)
+                .bind(message_box)
+                .bind(recipient_fee)
+                .execute(pool)
+                .await?;
             }
         }
     }
@@ -299,216 +315,251 @@ pub fn set_message_permission(
     Ok(true)
 }
 
-pub fn get_permission(
+pub async fn get_permission(
     pool: &DbPool,
     recipient: &str,
     sender: Option<&str>,
     message_box: &str,
-) -> Result<Option<PermissionRow>, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    let (sql, result) = match sender {
+) -> Result<Option<PermissionRow>, sqlx::Error> {
+    let row_opt = match sender {
         Some(s) => {
-            let mut stmt = conn.prepare(
-                "SELECT id, recipient, sender, message_box, recipient_fee, created_at, updated_at \
+            sqlx::query(
+                "SELECT CAST(id AS SIGNED) AS id, recipient, sender, message_box, recipient_fee, created_at, updated_at \
                  FROM message_permissions \
-                 WHERE recipient = ?1 AND sender = ?2 AND message_box = ?3",
-            )?;
-            let mut rows = stmt.query(params![recipient, s, message_box])?;
-            let row = rows.next()?;
-            match row {
-                Some(r) => (true, Some(read_permission_row(r)?)),
-                None => (false, None),
-            }
+                 WHERE recipient = ? AND sender = ? AND message_box = ?",
+            )
+            .bind(recipient)
+            .bind(s)
+            .bind(message_box)
+            .fetch_optional(pool)
+            .await?
         }
         None => {
-            let mut stmt = conn.prepare(
-                "SELECT id, recipient, sender, message_box, recipient_fee, created_at, updated_at \
+            sqlx::query(
+                "SELECT CAST(id AS SIGNED) AS id, recipient, sender, message_box, recipient_fee, created_at, updated_at \
                  FROM message_permissions \
-                 WHERE recipient = ?1 AND sender IS NULL AND message_box = ?2",
-            )?;
-            let mut rows = stmt.query(params![recipient, message_box])?;
-            let row = rows.next()?;
-            match row {
-                Some(r) => (true, Some(read_permission_row(r)?)),
-                None => (false, None),
-            }
+                 WHERE recipient = ? AND sender IS NULL AND message_box = ?",
+            )
+            .bind(recipient)
+            .bind(message_box)
+            .fetch_optional(pool)
+            .await?
         }
     };
 
-    if sql { Ok(result) } else { Ok(None) }
+    match row_opt {
+        Some(row) => Ok(Some(PermissionRow {
+            id: row.try_get::<i64, _>("id")?,
+            recipient: row.try_get("recipient")?,
+            sender: row.try_get("sender")?,
+            message_box: row.try_get("message_box")?,
+            recipient_fee: row.try_get("recipient_fee")?,
+            created_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("created_at")?),
+            updated_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("updated_at")?),
+        })),
+        None => Ok(None),
+    }
 }
 
-fn read_permission_row(row: &rusqlite::Row<'_>) -> Result<PermissionRow, rusqlite::Error> {
-    Ok(PermissionRow {
-        id: row.get(0)?,
-        recipient: row.get(1)?,
-        sender: row.get(2)?,
-        message_box: row.get(3)?,
-        recipient_fee: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-    })
-}
-
-pub fn list_permissions(
+pub async fn list_permissions(
     pool: &DbPool,
     recipient: &str,
     message_box: Option<&str>,
     limit: i64,
     offset: i64,
     order: &str,
-) -> Result<(Vec<PermissionRow>, i64), rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-
+) -> Result<(Vec<PermissionRow>, i64), sqlx::Error> {
     let order_dir = if order.eq_ignore_ascii_case("desc") {
         "DESC"
     } else {
         "ASC"
     };
 
-    let (where_clause, count_params, query_params): (
-        String,
-        Vec<Box<dyn rusqlite::types::ToSql>>,
-        Vec<Box<dyn rusqlite::types::ToSql>>,
-    ) = match message_box {
-        Some(mb) => (
-            "WHERE recipient = ?1 AND message_box = ?2".to_string(),
-            vec![
-                Box::new(recipient.to_string()) as Box<dyn rusqlite::types::ToSql>,
-                Box::new(mb.to_string()),
-            ],
-            vec![
-                Box::new(recipient.to_string()) as Box<dyn rusqlite::types::ToSql>,
-                Box::new(mb.to_string()),
-                Box::new(limit),
-                Box::new(offset),
-            ],
-        ),
-        None => (
-            "WHERE recipient = ?1".to_string(),
-            vec![Box::new(recipient.to_string()) as Box<dyn rusqlite::types::ToSql>],
-            vec![
-                Box::new(recipient.to_string()) as Box<dyn rusqlite::types::ToSql>,
-                Box::new(limit),
-                Box::new(offset),
-            ],
-        ),
-    };
-
     // Total count
-    let count_sql = format!("SELECT COUNT(*) FROM message_permissions {where_clause}");
-    let count_refs: Vec<&dyn rusqlite::types::ToSql> =
-        count_params.iter().map(|p| p.as_ref()).collect();
-    let total_count: i64 =
-        conn.prepare(&count_sql)?.query_row(count_refs.as_slice(), |row| row.get(0))?;
-
-    // Build order-by clause.
-    let order_by = format!(
-        "ORDER BY message_box ASC, CASE WHEN sender IS NULL THEN 0 ELSE 1 END, sender ASC, created_at {order_dir}"
-    );
-
-    let (limit_placeholder, offset_placeholder) = if message_box.is_some() {
-        ("?3", "?4")
-    } else {
-        ("?2", "?3")
+    let total_count: i64 = match message_box {
+        Some(mb) => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM message_permissions WHERE recipient = ? AND message_box = ?",
+        )
+        .bind(recipient)
+        .bind(mb)
+        .fetch_one(pool)
+        .await?,
+        None => sqlx::query_scalar(
+            "SELECT COUNT(*) FROM message_permissions WHERE recipient = ?",
+        )
+        .bind(recipient)
+        .fetch_one(pool)
+        .await?,
     };
 
-    let select_sql = format!(
-        "SELECT id, recipient, sender, message_box, recipient_fee, created_at, updated_at \
-         FROM message_permissions {where_clause} {order_by} LIMIT {limit_placeholder} OFFSET {offset_placeholder}"
-    );
+    // Rows. Order: box asc, NULL-sender first, then sender asc, then created_at by order_dir.
+    let select_sql = match message_box {
+        Some(_) => format!(
+            "SELECT CAST(id AS SIGNED) AS id, recipient, sender, message_box, recipient_fee, created_at, updated_at \
+             FROM message_permissions \
+             WHERE recipient = ? AND message_box = ? \
+             ORDER BY message_box ASC, \
+                      CASE WHEN sender IS NULL THEN 0 ELSE 1 END, \
+                      sender ASC, \
+                      created_at {order_dir} \
+             LIMIT ? OFFSET ?"
+        ),
+        None => format!(
+            "SELECT CAST(id AS SIGNED) AS id, recipient, sender, message_box, recipient_fee, created_at, updated_at \
+             FROM message_permissions \
+             WHERE recipient = ? \
+             ORDER BY message_box ASC, \
+                      CASE WHEN sender IS NULL THEN 0 ELSE 1 END, \
+                      sender ASC, \
+                      created_at {order_dir} \
+             LIMIT ? OFFSET ?"
+        ),
+    };
 
-    let query_refs: Vec<&dyn rusqlite::types::ToSql> =
-        query_params.iter().map(|p| p.as_ref()).collect();
-    let mut stmt = conn.prepare(&select_sql)?;
-    let rows = stmt.query_map(query_refs.as_slice(), |row| read_permission_row(row))?;
-    let permissions: Vec<PermissionRow> = rows.collect::<Result<_, _>>()?;
+    let rows = match message_box {
+        Some(mb) => sqlx::query(&select_sql)
+            .bind(recipient)
+            .bind(mb)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?,
+        None => sqlx::query(&select_sql)
+            .bind(recipient)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(pool)
+            .await?,
+    };
 
-    Ok((permissions, total_count))
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push(PermissionRow {
+            id: row.try_get::<i64, _>("id")?,
+            recipient: row.try_get("recipient")?,
+            sender: row.try_get("sender")?,
+            message_box: row.try_get("message_box")?,
+            recipient_fee: row.try_get("recipient_fee")?,
+            created_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("created_at")?),
+            updated_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("updated_at")?),
+        });
+    }
+
+    Ok((out, total_count))
 }
 
 // ---------------------------------------------------------------------------
 // Device registrations
 // ---------------------------------------------------------------------------
 
-pub fn register_device(
+pub async fn register_device(
     pool: &DbPool,
     identity_key: &str,
     fcm_token: &str,
     device_id: Option<&str>,
     platform: Option<&str>,
-) -> Result<i64, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    conn.execute(
-        "INSERT INTO device_registrations (identity_key, fcm_token, device_id, platform, last_used, active) \
-         VALUES (?1, ?2, ?3, ?4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), 1) \
-         ON CONFLICT(fcm_token) DO UPDATE SET \
-         identity_key = excluded.identity_key, \
-         device_id = excluded.device_id, \
-         platform = excluded.platform, \
-         last_used = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
-         active = 1, \
-         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
-        params![identity_key, fcm_token, device_id, platform],
-    )?;
-    Ok(conn.last_insert_rowid())
+) -> Result<i64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO device_registrations \
+           (identity_key, fcm_token, device_id, platform, last_used, active) \
+         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1) \
+         ON DUPLICATE KEY UPDATE \
+           identity_key = VALUES(identity_key), \
+           device_id = VALUES(device_id), \
+           platform = VALUES(platform), \
+           last_used = CURRENT_TIMESTAMP, \
+           active = 1, \
+           updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(identity_key)
+    .bind(fcm_token)
+    .bind(device_id)
+    .bind(platform)
+    .execute(pool)
+    .await?;
+
+    // On an UPDATE (upsert hit an existing row) last_insert_id is the old row's id;
+    // on INSERT it is the new id. For the existing-row case, look it up.
+    let id = result.last_insert_id() as i64;
+    if id > 0 {
+        return Ok(id);
+    }
+    let found: i64 =
+        sqlx::query_scalar("SELECT CAST(id AS SIGNED) FROM device_registrations WHERE fcm_token = ?")
+            .bind(fcm_token)
+            .fetch_one(pool)
+            .await?;
+    Ok(found)
 }
 
-pub fn list_devices(
+pub async fn list_devices(
     pool: &DbPool,
     identity_key: &str,
-) -> Result<Vec<DeviceRow>, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    let mut stmt = conn.prepare(
-        "SELECT id, identity_key, fcm_token, device_id, platform, last_used, active, created_at, updated_at \
-         FROM device_registrations WHERE identity_key = ?1 ORDER BY updated_at DESC",
-    )?;
-    let rows = stmt.query_map(params![identity_key], |row| read_device_row(row))?;
-    rows.collect()
+) -> Result<Vec<DeviceRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT CAST(id AS SIGNED) AS id, identity_key, fcm_token, device_id, platform, \
+                last_used, active, created_at, updated_at \
+         FROM device_registrations WHERE identity_key = ? ORDER BY updated_at DESC",
+    )
+    .bind(identity_key)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_device).collect()
 }
 
-pub fn list_active_devices(
+pub async fn list_active_devices(
     pool: &DbPool,
     identity_key: &str,
-) -> Result<Vec<DeviceRow>, rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    let mut stmt = conn.prepare(
-        "SELECT id, identity_key, fcm_token, device_id, platform, last_used, active, created_at, updated_at \
-         FROM device_registrations WHERE identity_key = ?1 AND active = 1 ORDER BY updated_at DESC",
-    )?;
-    let rows = stmt.query_map(params![identity_key], |row| read_device_row(row))?;
-    rows.collect()
+) -> Result<Vec<DeviceRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT CAST(id AS SIGNED) AS id, identity_key, fcm_token, device_id, platform, \
+                last_used, active, created_at, updated_at \
+         FROM device_registrations WHERE identity_key = ? AND active = 1 \
+         ORDER BY updated_at DESC",
+    )
+    .bind(identity_key)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_device).collect()
 }
 
-fn read_device_row(row: &rusqlite::Row<'_>) -> Result<DeviceRow, rusqlite::Error> {
+fn row_to_device(row: sqlx::mysql::MySqlRow) -> Result<DeviceRow, sqlx::Error> {
     Ok(DeviceRow {
-        id: row.get(0)?,
-        identity_key: row.get(1)?,
-        fcm_token: row.get(2)?,
-        device_id: row.get(3)?,
-        platform: row.get(4)?,
-        last_used: row.get(5)?,
-        active: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        id: row.try_get::<i64, _>("id")?,
+        identity_key: row.try_get("identity_key")?,
+        fcm_token: row.try_get("fcm_token")?,
+        device_id: row.try_get("device_id")?,
+        platform: row.try_get("platform")?,
+        last_used: row
+            .try_get::<Option<DateTime<Utc>>, _>("last_used")?
+            .map(fmt_ts),
+        active: row.try_get::<bool, _>("active")?,
+        created_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("created_at")?),
+        updated_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("updated_at")?),
     })
 }
 
-pub fn update_device_last_used(pool: &DbPool, device_id: i64) -> Result<(), rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    conn.execute(
-        "UPDATE device_registrations SET last_used = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
-        params![device_id],
-    )?;
+pub async fn update_device_last_used(pool: &DbPool, device_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE device_registrations \
+         SET last_used = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ?",
+    )
+    .bind(device_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
-pub fn deactivate_device(pool: &DbPool, device_id: i64) -> Result<(), rusqlite::Error> {
-    let conn = pool.get().map_err(|e| rusqlite::Error::InvalidParameterName(format!("{e}")))?;
-    conn.execute(
-        "UPDATE device_registrations SET active = 0, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
-        params![device_id],
-    )?;
+pub async fn deactivate_device(pool: &DbPool, device_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE device_registrations \
+         SET active = 0, updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ?",
+    )
+    .bind(device_id)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
