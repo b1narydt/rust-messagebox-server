@@ -1,20 +1,24 @@
+//! MySQL-backed handler tests. Each test builds a fresh Router bound to its
+//! own per-test database via `crate::test_support::fresh_pool()`.
+
 use axum::{
     body::Body,
-    http::{Request, StatusCode, Method},
-    Router,
+    http::{Method, Request, StatusCode},
     routing::{get, post},
+    Router,
 };
-use tower::ServiceExt; // for oneshot
-use http_body_util::BodyExt; // for collect
+use http_body_util::BodyExt; // for .collect()
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tower::ServiceExt; // for .oneshot()
 
-use crate::db;
+use bsv::primitives::private_key::PrivateKey;
+use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
+
 use crate::config::Config;
+use crate::db::queries;
 use crate::handlers::helpers::{AppState, AuthIdentity};
-
-const TEST_KEY: &str = "028d37b941208cd6b8a4c28288eda5f2f16c2b3ab0fcb6d13c18b47fe37b971fc1";
-const RECIPIENT_KEY: &str = "0350b59e3efb8e37ba1ba2bde37c24e2bed89346ef3dc46d780e2b99f3efe50d1c";
+use crate::test_support::{fresh_pool, RECIPIENT_KEY, TEST_KEY};
 
 fn test_config() -> Config {
     Config {
@@ -22,8 +26,8 @@ fn test_config() -> Config {
         port: 8080,
         server_private_key: "a".repeat(64),
         routing_prefix: String::new(),
-        db_driver: "sqlite3".to_string(),
-        db_source: ":memory:".to_string(),
+        db_source: "mysql://unused".to_string(),
+        db_max_connections: 4,
         bsv_network: "testnet".to_string(),
         enable_websockets: false,
         wallet_storage_url: None,
@@ -33,15 +37,14 @@ fn test_config() -> Config {
     }
 }
 
-fn setup_app() -> Router {
-    let pool = db::new(":memory:").unwrap();
-    db::migrate(&pool).unwrap();
+async fn setup_app() -> Router {
+    let pool = fresh_pool().await;
 
-    let pk = bsv::primitives::private_key::PrivateKey::from_hex(&"a".repeat(64)).unwrap();
-    let wallet = Arc::new(bsv::wallet::proto_wallet::ProtoWallet::new(pk));
+    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
+    let wallet = Arc::new(SdkProtoWallet::new(pk));
 
     // Create a minimal WsBroadcast for tests (Socket.IO is not exercised
-    // but needs a default namespace registered to avoid panics on broadcast)
+    // but needs a default namespace registered to avoid panics on broadcast).
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
     let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
@@ -155,7 +158,7 @@ async fn send_valid_message(app: &Router, message_id: &str) -> (StatusCode, Valu
 
 #[tokio::test]
 async fn test_send_message_missing_message() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/sendMessage", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MESSAGE_REQUIRED");
@@ -163,7 +166,7 @@ async fn test_send_message_missing_message() {
 
 #[tokio::test]
 async fn test_send_message_missing_recipient() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/sendMessage", json!({
         "message": {
             "messageBox": "inbox",
@@ -177,7 +180,7 @@ async fn test_send_message_missing_recipient() {
 
 #[tokio::test]
 async fn test_send_message_invalid_recipient_key() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/sendMessage", json!({
         "message": {
             "recipient": "not-a-valid-key",
@@ -192,7 +195,7 @@ async fn test_send_message_invalid_recipient_key() {
 
 #[tokio::test]
 async fn test_send_message_missing_message_box() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/sendMessage", json!({
         "message": {
             "recipient": RECIPIENT_KEY,
@@ -206,7 +209,7 @@ async fn test_send_message_missing_message_box() {
 
 #[tokio::test]
 async fn test_send_message_missing_body() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/sendMessage", json!({
         "message": {
             "recipient": RECIPIENT_KEY,
@@ -220,7 +223,7 @@ async fn test_send_message_missing_body() {
 
 #[tokio::test]
 async fn test_send_message_missing_message_id() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/sendMessage", json!({
         "message": {
             "recipient": RECIPIENT_KEY,
@@ -234,7 +237,7 @@ async fn test_send_message_missing_message_id() {
 
 #[tokio::test]
 async fn test_send_message_id_count_mismatch() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/sendMessage", json!({
         "message": {
             "recipients": [RECIPIENT_KEY, TEST_KEY],
@@ -249,7 +252,7 @@ async fn test_send_message_id_count_mismatch() {
 
 #[tokio::test]
 async fn test_send_message_success() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = send_valid_message(&app, "msg-success-1").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
@@ -262,7 +265,7 @@ async fn test_send_message_success() {
 
 #[tokio::test]
 async fn test_send_message_duplicate() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, _) = send_valid_message(&app, "dup-msg-1").await;
     assert_eq!(status, StatusCode::OK);
 
@@ -274,7 +277,7 @@ async fn test_send_message_duplicate() {
 
 #[tokio::test]
 async fn test_send_message_json_body() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/sendMessage", json!({
         "message": {
             "recipient": RECIPIENT_KEY,
@@ -293,7 +296,7 @@ async fn test_send_message_json_body() {
 
 #[tokio::test]
 async fn test_list_messages_missing_box() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/listMessages", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MESSAGEBOX_REQUIRED");
@@ -301,7 +304,7 @@ async fn test_list_messages_missing_box() {
 
 #[tokio::test]
 async fn test_list_messages_empty_box() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/listMessages", json!({
         "messageBox": "inbox"
     })).await;
@@ -312,7 +315,7 @@ async fn test_list_messages_empty_box() {
 
 #[tokio::test]
 async fn test_list_messages_with_messages() {
-    let app = setup_app();
+    let app = setup_app().await;
 
     // The authenticated user is TEST_KEY. We send a message TO TEST_KEY
     // so that when TEST_KEY lists messages, it appears.
@@ -343,7 +346,7 @@ async fn test_list_messages_with_messages() {
 
 #[tokio::test]
 async fn test_acknowledge_missing_ids() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/acknowledgeMessage", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MESSAGE_ID_REQUIRED");
@@ -351,7 +354,7 @@ async fn test_acknowledge_missing_ids() {
 
 #[tokio::test]
 async fn test_acknowledge_invalid_ids_format() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/acknowledgeMessage", json!({
         "messageIds": [123, 456]
     })).await;
@@ -361,7 +364,7 @@ async fn test_acknowledge_invalid_ids_format() {
 
 #[tokio::test]
 async fn test_acknowledge_not_found() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/acknowledgeMessage", json!({
         "messageIds": ["nonexistent-id"]
     })).await;
@@ -371,7 +374,7 @@ async fn test_acknowledge_not_found() {
 
 #[tokio::test]
 async fn test_acknowledge_success() {
-    let app = setup_app();
+    let app = setup_app().await;
 
     // Send message TO self (TEST_KEY) so we can acknowledge it
     let (status, _) = post_json(&app, "/sendMessage", json!({
@@ -405,7 +408,7 @@ async fn test_acknowledge_success() {
 
 #[tokio::test]
 async fn test_register_device_missing_token() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/registerDevice", json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_INVALID_FCM_TOKEN");
@@ -413,7 +416,7 @@ async fn test_register_device_missing_token() {
 
 #[tokio::test]
 async fn test_register_device_invalid_platform() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/registerDevice", json!({
         "fcmToken": "valid-token-123",
         "platform": "windows"
@@ -424,7 +427,7 @@ async fn test_register_device_invalid_platform() {
 
 #[tokio::test]
 async fn test_register_device_success() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/registerDevice", json!({
         "fcmToken": "fcm-token-12345",
         "platform": "android"
@@ -436,7 +439,7 @@ async fn test_register_device_success() {
 
 #[tokio::test]
 async fn test_list_devices_empty() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = get_path(&app, "/devices").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
@@ -445,7 +448,7 @@ async fn test_list_devices_empty() {
 
 #[tokio::test]
 async fn test_list_devices_with_registered() {
-    let app = setup_app();
+    let app = setup_app().await;
 
     // Register a device first
     let (status, _) = post_json(&app, "/registerDevice", json!({
@@ -470,7 +473,7 @@ async fn test_list_devices_with_registered() {
 
 #[tokio::test]
 async fn test_set_permission_success() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = post_json(&app, "/permissions/set", json!({
         "messageBox": "inbox",
         "recipientFee": 50
@@ -481,7 +484,7 @@ async fn test_set_permission_success() {
 
 #[tokio::test]
 async fn test_get_permission_not_found() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = get_path(&app, "/permissions/get?messageBox=inbox").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
@@ -490,7 +493,7 @@ async fn test_get_permission_not_found() {
 
 #[tokio::test]
 async fn test_get_permission_after_set() {
-    let app = setup_app();
+    let app = setup_app().await;
 
     // Set a permission
     let (status, _) = post_json(&app, "/permissions/set", json!({
@@ -511,7 +514,7 @@ async fn test_get_permission_after_set() {
 
 #[tokio::test]
 async fn test_list_permissions() {
-    let app = setup_app();
+    let app = setup_app().await;
 
     // Set a couple permissions
     post_json(&app, "/permissions/set", json!({
@@ -533,7 +536,7 @@ async fn test_list_permissions() {
 
 #[tokio::test]
 async fn test_get_quote_single() {
-    let app = setup_app();
+    let app = setup_app().await;
     let url = format!(
         "/permissions/quote?messageBox=inbox&recipient={}",
         RECIPIENT_KEY
@@ -548,7 +551,7 @@ async fn test_get_quote_single() {
 
 #[tokio::test]
 async fn test_get_quote_missing_params() {
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, body) = get_path(&app, "/permissions/quote").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MISSING_PARAMETERS");
@@ -560,7 +563,7 @@ async fn test_get_quote_missing_params() {
 
 #[tokio::test]
 async fn test_no_auth_returns_401() {
-    let app = setup_app();
+    let app = setup_app().await;
 
     // Test POST endpoints without auth
     let (status, body) = post_json_no_auth(&app, "/sendMessage", json!({
@@ -570,19 +573,105 @@ async fn test_no_auth_returns_401() {
     assert_eq!(body["code"], "ERR_AUTH_REQUIRED");
 
     // Test another POST endpoint
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, _) = post_json_no_auth(&app, "/listMessages", json!({
         "messageBox": "inbox"
     })).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Test GET endpoint without auth
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, _) = get_path_no_auth(&app, "/devices").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Test permissions GET without auth
-    let app = setup_app();
+    let app = setup_app().await;
     let (status, _) = get_path_no_auth(&app, "/permissions/get?messageBox=inbox").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+// ===========================================================================
+// TS-parity tests (new)
+// ===========================================================================
+
+/// sendMessage.ts:318-327 — if ANY recipient in a multi-recipient batch is
+/// blocked (fee=-1), the whole batch is rejected with 403 ERR_DELIVERY_BLOCKED
+/// and the blocked recipient listed in `blockedRecipients`.
+#[tokio::test]
+async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
+    // We need direct DB access to seed the -1 permission on the SAME pool the
+    // app is using, so we build the Router inline here with a shared pool.
+    let pool = fresh_pool().await;
+
+    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
+    let wallet = Arc::new(SdkProtoWallet::new(pk));
+    let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
+    io.ns("/", |_: socketioxide::extract::SocketRef| {});
+    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
+
+    let state = AppState {
+        db: pool.clone(),
+        config: Arc::new(test_config()),
+        wallet,
+        ws: ws_broadcast,
+    };
+    let app = Router::new()
+        .route("/sendMessage", post(crate::handlers::send_message::send_message))
+        .layer(axum::middleware::from_fn(auth_middleware))
+        .with_state(state);
+
+    // RECIPIENT_KEY blocks TEST_KEY on 'inbox'.
+    queries::set_message_permission(&pool, RECIPIENT_KEY, Some(TEST_KEY), "inbox", -1)
+        .await
+        .unwrap();
+
+    // Second recipient must be a valid pub key distinct from RECIPIENT_KEY.
+    // A second valid compressed secp256k1 pubkey (66 hex chars, starts with 02/03).
+    let other_recipient = "02e876feaf6b7f73fa7d1d7e5b2c2e1a0c7c0b9e3fa5a3d4a7b8c9d0e1f2a3b4c5";
+
+    let (status, body) = post_json(&app, "/sendMessage", json!({
+        "message": {
+            "recipients": [RECIPIENT_KEY, other_recipient],
+            "messageBox": "inbox",
+            "messageId": ["mid-1", "mid-2"],
+            "body": "should be blocked for one recipient"
+        }
+    })).await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "ERR_DELIVERY_BLOCKED");
+    let blocked = body["blockedRecipients"].as_array().unwrap();
+    assert!(
+        blocked.iter().any(|v| v == RECIPIENT_KEY),
+        "blockedRecipients must include the -1 recipient: got {:?}",
+        blocked
+    );
+}
+
+/// listMessages.test.ts:129-148 — listing a messageBox that was never created
+/// for the authenticated user must return 200 with an empty `messages` array.
+#[tokio::test]
+async fn test_list_messages_returns_empty_when_box_does_not_exist() {
+    let app = setup_app().await;
+    let (status, body) = post_json(&app, "/listMessages", json!({
+        "messageBox": "never-created-box-xyz"
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
+    let msgs = body["messages"].as_array().expect("messages array");
+    assert!(msgs.is_empty(), "messages should be empty for nonexistent box");
+}
+
+/// Duplicate messageId to same recipient returns 400 ERR_DUPLICATE_MESSAGE.
+#[tokio::test]
+async fn test_send_message_duplicate_same_recipient_is_rejected() {
+    let app = setup_app().await;
+
+    let (status, _) = send_valid_message(&app, "dup-parity-1").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = send_valid_message(&app, "dup-parity-1").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_DUPLICATE_MESSAGE");
+}
+

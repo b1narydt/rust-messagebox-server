@@ -6,9 +6,8 @@ use axum::{
 };
 // Payment internalization uses bsv-sdk WalletInterface but ProtoWallet
 // always returns "requires a full wallet" — payment validation is structural only.
-use serde::Deserialize;
 use serde_json::Value;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 use crate::db::queries;
 use crate::firebase::send_fcm_notification::{send_fcm_notification, FcmPayload};
@@ -232,7 +231,7 @@ pub async fn send_message(
 
     // ── Ensure message boxes ──────────────────────────────────────────
     for recip in &recipients {
-        if let Err(e) = queries::ensure_message_box(&state.db, recip.trim(), &box_type) {
+        if let Err(e) = queries::ensure_message_box(&state.db, recip.trim(), &box_type).await {
             error!("failed to ensure messageBox: {e}");
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -244,7 +243,7 @@ pub async fn send_message(
     }
 
     // ── Fee evaluation ────────────────────────────────────────────────
-    let delivery_fee = match queries::get_server_delivery_fee(&state.db, &box_type) {
+    let delivery_fee = match queries::get_server_delivery_fee(&state.db, &box_type).await {
         Ok(f) => f,
         Err(e) => {
             error!("failed to get delivery fee: {e}");
@@ -260,7 +259,7 @@ pub async fn send_message(
     let mut fee_rows: Vec<FeeRow> = Vec::with_capacity(recipients.len());
     for recip in &recipients {
         let recip = recip.trim();
-        match queries::get_recipient_fee(&state.db, recip, &sender_key, &box_type) {
+        match queries::get_recipient_fee(&state.db, recip, &sender_key, &box_type).await {
             Ok(rf) => fee_rows.push(FeeRow {
                 recipient: recip.to_string(),
                 recipient_fee: rf,
@@ -310,8 +309,8 @@ pub async fn send_message(
     let per_recipient_outputs = if requires_payment {
         let pay = match &payment {
             Some(p)
-                if p.tx.as_ref().map_or(true, |t| t.is_empty())
-                    || p.outputs.as_ref().map_or(true, |o| o.is_empty()) =>
+                if p.tx.as_ref().is_none_or(|t| t.is_empty())
+                    || p.outputs.as_ref().is_none_or(|o| o.is_empty()) =>
             {
                 return error_response(
                     StatusCode::BAD_REQUEST,
@@ -355,7 +354,7 @@ pub async fn send_message(
     let mut results: Vec<SendMessageResult> = Vec::with_capacity(fee_rows.len());
 
     for (i, fr) in fee_rows.iter().enumerate() {
-        let mb_id = match queries::get_message_box_id(&state.db, &fr.recipient, &box_type) {
+        let mb_id = match queries::get_message_box_id(&state.db, &fr.recipient, &box_type).await {
             Ok(Some(id)) => id,
             Ok(None) => {
                 // Should not happen since we ensured above, but handle gracefully.
@@ -399,7 +398,7 @@ pub async fn send_message(
 
         let body_bytes = serde_json::to_string(&stored_body).unwrap_or_default();
 
-        match queries::insert_message(&state.db, msg_id, mb_id, &sender_key, &fr.recipient, &body_bytes) {
+        match queries::insert_message(&state.db, msg_id, mb_id, &sender_key, &fr.recipient, &body_bytes).await {
             Ok(false) => {
                 // Duplicate message – the Go code returns an error.
                 error!("duplicate message rejected: messageId={msg_id}");

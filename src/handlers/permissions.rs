@@ -89,7 +89,9 @@ pub async fn set_permission(
         sender.as_deref(),
         &message_box,
         fee,
-    ) {
+    )
+    .await
+    {
         error!("failed to set permission: {e}");
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -188,7 +190,9 @@ pub async fn get_permission(
         &identity_key,
         sender.as_deref(),
         &message_box,
-    ) {
+    )
+    .await
+    {
         Ok(p) => p,
         Err(e) => {
             error!("failed to get permission: {e}");
@@ -322,7 +326,9 @@ pub async fn list_permissions(
         limit,
         offset,
         order,
-    ) {
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             error!("failed to list permissions: {e}");
@@ -420,7 +426,7 @@ pub async fn get_quote(
     }
 
     // ── Get delivery fee ──────────────────────────────────────────────
-    let delivery_fee = match queries::get_server_delivery_fee(&state.db, &message_box) {
+    let delivery_fee = match queries::get_server_delivery_fee(&state.db, &message_box).await {
         Ok(f) => f,
         Err(e) => {
             error!("failed to get delivery fee: {e}");
@@ -440,7 +446,9 @@ pub async fn get_quote(
             &recipients[0],
             &sender_key,
             &message_box,
-        ) {
+        )
+        .await
+        {
             Ok(f) => f,
             Err(e) => {
                 error!("failed to get recipient fee: {e}");
@@ -474,7 +482,7 @@ pub async fn get_quote(
     let mut total_delivery_fees: i64 = 0;
 
     for rec in &recipients {
-        let rf = match queries::get_recipient_fee(&state.db, rec, &sender_key, &message_box) {
+        let rf = match queries::get_recipient_fee(&state.db, rec, &sender_key, &message_box).await {
             Ok(f) => f,
             Err(e) => {
                 error!("failed to get recipient fee: {e}");

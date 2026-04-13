@@ -8,28 +8,31 @@ axum = { version = "0.8", features = ["json", "query"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
-tower-http = { version = "0.6", features = ["cors"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "mysql", "chrono", "macros", "migrate"] }
+tower-http = { version = "0.6", features = ["cors", "timeout", "limit"] }
 tower = "0.5"
 reqwest = { version = "0.12", features = ["json"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 dotenvy = "0.15"
 hex = "0.4"
 base64 = "0.22"
 thiserror = "2"
 parking_lot = "0.12"
-r2d2 = "0.8"
-r2d2_sqlite = "0.25"
 signal-hook = "0.3"
 form_urlencoded = "1"
 async-trait = "0.1"
 socketioxide = { version = "0.15", features = ["state"] }
-# BRC-31 auth middleware (axum port of b1narydt/auth-actix-middleware)
-bsv-auth-axum-middleware = { path = "../bsv-auth-axum-middleware" }
-# bsv-sdk — sole SDK for all auth and wallet operations
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main", features = ["network"] }
+
+# BRC-31 auth middleware — crates.io release
+bsv-auth-axum-middleware = "0.1"
+
+# bsv-sdk — sole SDK for all auth and wallet operations. Pinned to 0.2 to match
+# the middleware's requirement so both resolve to a single copy (avoids
+# two-instance trait-bound conflicts).
+bsv-sdk = { version = "0.2", features = ["network"] }
+
 getrandom = "0.4"
 http-body-util = "0.1"
 rsa = { version = "0.9", features = ["sha2"] }
@@ -39,6 +42,9 @@ sha2 = "0.10"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1", features = ["full"] }
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["mysql"] }
+uuid = { version = "1", features = ["v4"] }
 
 [profile.release]
 opt-level = 3

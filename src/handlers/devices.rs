@@ -64,7 +64,9 @@ pub async fn register_device(
         &fcm_token,
         device_id.as_deref(),
         platform.as_deref(),
-    ) {
+    )
+    .await
+    {
         Ok(id) => id,
         Err(e) => {
             error!("failed to register device: {e}");
@@ -95,7 +97,7 @@ pub async fn list_devices(
 ) -> impl IntoResponse {
     let identity_key = auth.0;
 
-    let devices = match queries::list_devices(&state.db, &identity_key) {
+    let devices = match queries::list_devices(&state.db, &identity_key).await {
         Ok(d) => d,
         Err(e) => {
             error!("failed to list devices: {e}");

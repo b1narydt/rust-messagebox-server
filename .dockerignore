@@ -1,0 +1,21 @@
+# Build artifacts — must never enter the build context.
+target/
+
+# VCS metadata.
+.git
+.gitignore
+
+# Local env / secrets.
+.env
+.env.*
+
+# Docker files themselves.
+Dockerfile
+.dockerignore
+
+# Docs / editor cruft (README.md is intentionally allowed back in below).
+*.md
+!README.md
+.DS_Store
+.idea/
+.vscode/

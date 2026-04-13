@@ -32,7 +32,7 @@ pub async fn list_messages(
     };
 
     // ── Look up message box ───────────────────────────────────────────
-    let mb_id = match queries::get_message_box_id(&state.db, &identity_key, &message_box) {
+    let mb_id = match queries::get_message_box_id(&state.db, &identity_key, &message_box).await {
         Ok(Some(id)) => id,
         Ok(None) => {
             // Box does not exist yet — return empty list, not an error.
@@ -57,7 +57,7 @@ pub async fn list_messages(
     };
 
     // ── Fetch messages ────────────────────────────────────────────────
-    let rows = match queries::list_messages(&state.db, &identity_key, mb_id) {
+    let rows = match queries::list_messages(&state.db, &identity_key, mb_id).await {
         Ok(r) => r,
         Err(e) => {
             error!("failed to list messages: {e}");
