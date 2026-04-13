@@ -14,13 +14,21 @@ RUN mkdir -p src \
     && echo 'fn main() {}' > src/main.rs \
     && echo '// empty' > src/lib.rs \
     && cargo build --release \
-    && rm -rf src target/release/deps/messagebox_server* target/release/messagebox-server*
+    && rm -rf src \
+        target/release/deps/messagebox_server* \
+        target/release/deps/libmessagebox_server* \
+        target/release/messagebox-server* \
+        target/release/.fingerprint/messagebox-server-* \
+        target/release/.fingerprint/messagebox_server-*
 
 # Step 2: copy the real sources and embedded migrations, then build for real.
-# The `--locked` flag guarantees Cargo.lock is honored byte-for-byte.
+# `--locked` honors Cargo.lock byte-for-byte. `touch` on all .rs files
+# guards against Cargo's mtime-based staleness check preserving stale
+# dummy-build artifacts when COPY leaves older mtimes.
 COPY src ./src
 COPY migrations ./migrations
-RUN cargo build --release --locked
+RUN find src -name '*.rs' -exec touch {} + \
+    && cargo build --release --locked
 
 # ---------------------------------------------------------------------------
 # Stage 2 — runtime
