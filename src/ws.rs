@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc as StdArc;
 
 use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
 use tokio::sync::mpsc;
@@ -81,27 +81,6 @@ impl Transport for ChannelTransport {
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
-
-/// Event sent by client to authenticate after connecting.
-#[derive(Deserialize, Debug)]
-pub struct AuthenticatedData {
-    #[serde(rename = "identityKey")]
-    pub identity_key: String,
-}
-
-/// Event sent by client to join a room.
-#[derive(Deserialize, Debug)]
-pub struct JoinRoomData {
-    #[serde(rename = "roomId")]
-    pub room_id: String,
-}
-
-/// Event sent by client to leave a room.
-#[derive(Deserialize, Debug)]
-pub struct LeaveRoomData {
-    #[serde(rename = "roomId")]
-    pub room_id: String,
-}
 
 /// Message broadcast to a room when a new message is stored.
 ///
@@ -439,9 +418,6 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
         info!(sid = %sid, "new Socket.IO connection");
 
         let ws_authmsg = ws.clone();
-        let ws_auth = ws.clone();
-        let ws_join = ws.clone();
-        let ws_leave = ws.clone();
         let ws_dc = ws.clone();
 
         // --- authMessage (BRC-103 mutual auth + general message routing) ---
@@ -554,90 +530,14 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
             },
         );
 
-        // --- authenticated (simple identity announcement) ---
-        // REJECTED: simple identity announcement without cryptographic proof.
-        // All clients MUST use BRC-103 authMessage for authentication.
-        socket.on(
-            "authenticated",
-            move |socket: SocketRef, Data(_data): Data<AuthenticatedData>| {
-                let _ws = ws_auth.clone();
-                async move {
-                    let sid = socket.id.to_string();
-                    warn!(sid = %sid, "rejected simple 'authenticated' event — use BRC-103 authMessage instead");
-                    socket.emit("authenticationFailed", &serde_json::json!({
-                        "error": "Simple authentication not supported. Use BRC-103 mutual auth via authMessage."
-                    })).ok();
-                }
-            },
-        );
-
-        // --- joinRoom ---
-        // Only allowed for sockets that completed BRC-103 handshake (have a Peer).
-        // The BRC-103 path (handle_general_event) also handles joinRoom for
-        // clients that wrap everything in authMessage — this handler is for
-        // raw Socket.IO joinRoom events from authenticated sockets.
-        socket.on(
-            "joinRoom",
-            move |socket: SocketRef, Data(data): Data<JoinRoomData>| {
-                let ws = ws_join.clone();
-                async move {
-                    let sid = socket.id.to_string();
-
-                    // Require BRC-103 authenticated identity (must have completed handshake)
-                    let identity = match ws.get_identity(&sid) {
-                        Some(key) => key,
-                        None => {
-                            warn!(sid = %sid, "joinRoom rejected: no BRC-103 authenticated session");
-                            socket.emit("authenticationFailed", &serde_json::json!({
-                                "error": "Not authenticated. Complete BRC-103 handshake first."
-                            })).ok();
-                            return;
-                        }
-                    };
-
-                    // Verify the socket has a Peer (BRC-103 handshake completed)
-                    if ws.get_peer(&sid).is_none() {
-                        warn!(sid = %sid, "joinRoom rejected: no BRC-103 Peer for socket");
-                        return;
-                    }
-
-                    // Verify the client owns this room
-                    if !data.room_id.starts_with(&identity) {
-                        warn!(sid = %sid, room = %data.room_id, "room join rejected: identity mismatch");
-                        return;
-                    }
-
-                    socket.join(data.room_id.clone()).ok();
-                    ws.add_room_member(&data.room_id, &sid);
-                    debug!(sid = %sid, room = %data.room_id, "joined room");
-                    socket.emit("joinedRoom", &serde_json::json!({
-                        "roomId": data.room_id
-                    })).ok();
-                }
-            },
-        );
-
-        // --- leaveRoom ---
-        // Raw leaveRoom is only accepted from BRC-103 authenticated sockets.
-        // The primary path is via BRC-103 general messages (handle_general_event).
-        socket.on(
-            "leaveRoom",
-            move |socket: SocketRef, Data(data): Data<LeaveRoomData>| {
-                let ws = ws_leave.clone();
-                async move {
-                    let sid = socket.id.to_string();
-                    // leaveRoom is safe — worst case a socket leaves a room it wasn't in.
-                    // No auth bypass risk since room membership is additive only for the
-                    // socket's own identity prefix (enforced in joinRoom).
-                    socket.leave(data.room_id.clone()).ok();
-                    ws.remove_room_member(&data.room_id, &sid);
-                    debug!(sid = %sid, room = %data.room_id, "left room");
-                    socket.emit("leftRoom", &serde_json::json!({
-                        "roomId": data.room_id
-                    })).ok();
-                }
-            },
-        );
+        // NOTE: there are intentionally NO raw `socket.on("authenticated" |
+        // "joinRoom" | "leaveRoom" | "sendMessage")` handlers. `authMessage` is
+        // the ONLY inbound event the server acts on. Every application action
+        // (authenticate, join/leave a room, send a message) must arrive as a
+        // BRC-103-signed general message, which the Peer verifies before it
+        // reaches `handle_general_event`. Accepting raw Socket.IO events would
+        // be an authentication-bypass surface — a client could join another
+        // identity's room or send as someone else without proving its key.
 
         // --- disconnect ---
         socket.on_disconnect(move |socket: SocketRef, reason: socketioxide::socket::DisconnectReason| {
