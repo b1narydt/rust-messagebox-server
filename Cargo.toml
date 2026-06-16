@@ -43,3 +43,9 @@ hyper = { version = "1", features = ["full"] }
 [profile.release]
 opt-level = 3
 lto = true
+
+# Standalone crate: this directory lives inside the rust-mpc checkout but is NOT
+# a member of that Cargo workspace. The empty table makes `cargo build` here
+# resolve against this manifest instead of erroring "believes it's in a
+# workspace but isn't a member".
+[workspace]

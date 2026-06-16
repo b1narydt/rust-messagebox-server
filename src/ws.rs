@@ -17,14 +17,14 @@
 
 use std::sync::Arc;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc as StdArc;
 
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use bsv::auth::peer::Peer;
@@ -118,6 +118,25 @@ pub struct RoomMessage {
     pub updated_at: String,
 }
 
+/// Per-socket BRC-103 session: the bsv-sdk `Peer` plus the channel ends that
+/// bridge it to this socket's Socket.IO events.
+///
+/// - `incoming_tx`: feeds inbound `authMessage` frames to the Peer's transport.
+/// - `outgoing_rx`: drains the Peer's outbound frames (emitted as `authMessage`).
+/// - `general_rx`: decoded application events from BRC-103 general payloads.
+///
+/// Each socket owns its `SocketPeer` behind an `Arc`. Handlers clone the `Arc`
+/// out of the registry under a brief lock and then operate on the per-socket
+/// async mutexes — so concurrent sockets never serialize on a single global
+/// lock (the previous design held one `Mutex<HashMap>` across `process_pending`,
+/// which capped throughput under many high-frequency connections).
+pub struct SocketPeer {
+    peer: tokio::sync::Mutex<Peer<SdkProtoWallet>>,
+    incoming_tx: mpsc::Sender<SdkAuthMessage>,
+    outgoing_rx: tokio::sync::Mutex<mpsc::Receiver<SdkAuthMessage>>,
+    general_rx: tokio::sync::Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
+}
+
 /// Shared state for WebSocket broadcast.
 ///
 /// Held in the socketioxide layer state so HTTP handlers can access
@@ -131,19 +150,14 @@ pub struct WsBroadcast {
     server_private_key_hex: String,
     /// Database pool for WS-initiated message storage (sendMessage via BRC-103).
     db: DbPool,
-    /// Per-socket Peer + channels for BRC-103 auth and general message routing.
-    ///
-    /// Tuple: (Peer, incoming_tx, outgoing_rx, general_msg_rx)
-    /// - incoming_tx: feeds AuthMessage events to the Peer's transport
-    /// - outgoing_rx: drains Peer's transport responses (emitted as authMessage)
-    /// - general_msg_rx: decoded application messages from BRC-103 General payloads
-    #[allow(clippy::type_complexity)]
-    socket_peers: Arc<tokio::sync::Mutex<HashMap<String, (
-        tokio::sync::Mutex<Peer<SdkProtoWallet>>,
-        mpsc::Sender<SdkAuthMessage>,
-        tokio::sync::Mutex<mpsc::Receiver<SdkAuthMessage>>,
-        tokio::sync::Mutex<mpsc::Receiver<(String, Vec<u8>)>>,
-    )>>>,
+    /// Per-socket BRC-103 session, keyed by socket id. Stored as `Arc` so the
+    /// map lock is held only long enough to clone the handle out — never across
+    /// `await` on a Peer operation.
+    socket_peers: Arc<RwLock<HashMap<String, Arc<SocketPeer>>>>,
+    /// Room membership: room id (`{identityKey}-{messageBox}`) → set of socket
+    /// ids that joined it. Used to fan a signed broadcast out to exactly the
+    /// sockets subscribed to that room.
+    rooms: Arc<RwLock<HashMap<String, HashSet<String>>>>,
 }
 
 impl WsBroadcast {
@@ -153,18 +167,20 @@ impl WsBroadcast {
             socket_identities: Arc::new(RwLock::new(HashMap::new())),
             server_private_key_hex,
             db,
-            socket_peers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            socket_peers: Arc::new(RwLock::new(HashMap::new())),
+            rooms: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Get or create a Peer for a socket.
+    /// Get or create the `SocketPeer` for a socket and return a handle to it.
     ///
     /// Calls `peer.on_general_message()` to capture the receiver for decoded
     /// BRC-103 general messages (application events like sendMessage, joinRoom).
-    async fn ensure_peer(&self, socket_id: &str) -> Result<(), String> {
-        let mut peers = self.socket_peers.lock().await;
-        if peers.contains_key(socket_id) {
-            return Ok(());
+    /// Idempotent and race-safe: if two inbound frames for a fresh socket arrive
+    /// concurrently, the first insert wins and both observe the same handle.
+    fn ensure_peer(&self, socket_id: &str) -> Result<Arc<SocketPeer>, String> {
+        if let Some(existing) = self.socket_peers.read().get(socket_id) {
+            return Ok(existing.clone());
         }
 
         let wallet = self.create_sdk_wallet()?;
@@ -173,22 +189,68 @@ impl WsBroadcast {
 
         // Take the general message receiver BEFORE storing the Peer.
         // on_general_message() is take-once — must be called here.
-        let general_msg_rx = peer
+        let general_rx = peer
             .on_general_message()
             .expect("on_general_message must succeed on fresh Peer");
 
-        peers.insert(socket_id.to_string(), (
-            tokio::sync::Mutex::new(peer),
+        let socket_peer = Arc::new(SocketPeer {
+            peer: tokio::sync::Mutex::new(peer),
             incoming_tx,
-            tokio::sync::Mutex::new(outgoing_rx),
-            tokio::sync::Mutex::new(general_msg_rx),
-        ));
-        Ok(())
+            outgoing_rx: tokio::sync::Mutex::new(outgoing_rx),
+            general_rx: tokio::sync::Mutex::new(general_rx),
+        });
+
+        let mut peers = self.socket_peers.write();
+        Ok(peers.entry(socket_id.to_string()).or_insert(socket_peer).clone())
     }
 
-    /// Remove a socket's Peer on disconnect.
-    async fn remove_peer(&self, socket_id: &str) {
-        self.socket_peers.lock().await.remove(socket_id);
+    /// Look up an existing `SocketPeer` handle without creating one.
+    fn get_peer(&self, socket_id: &str) -> Option<Arc<SocketPeer>> {
+        self.socket_peers.read().get(socket_id).cloned()
+    }
+
+    /// Remove a socket's Peer and all its room memberships on disconnect.
+    fn remove_peer(&self, socket_id: &str) {
+        self.socket_peers.write().remove(socket_id);
+        self.remove_socket_from_all_rooms(socket_id);
+    }
+
+    /// Record that `socket_id` joined `room_id`.
+    fn add_room_member(&self, room_id: &str, socket_id: &str) {
+        self.rooms
+            .write()
+            .entry(room_id.to_string())
+            .or_default()
+            .insert(socket_id.to_string());
+    }
+
+    /// Remove `socket_id` from `room_id`, dropping the room if it empties.
+    fn remove_room_member(&self, room_id: &str, socket_id: &str) {
+        let mut rooms = self.rooms.write();
+        if let Some(members) = rooms.get_mut(room_id) {
+            members.remove(socket_id);
+            if members.is_empty() {
+                rooms.remove(room_id);
+            }
+        }
+    }
+
+    /// Remove `socket_id` from every room (used on disconnect).
+    fn remove_socket_from_all_rooms(&self, socket_id: &str) {
+        let mut rooms = self.rooms.write();
+        for members in rooms.values_mut() {
+            members.remove(socket_id);
+        }
+        rooms.retain(|_, members| !members.is_empty());
+    }
+
+    /// Socket ids currently joined to `room_id`.
+    fn room_members(&self, room_id: &str) -> Vec<String> {
+        self.rooms
+            .read()
+            .get(room_id)
+            .map(|m| m.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     /// Create a bsv-sdk ProtoWallet for BRC-103 auth.
@@ -213,47 +275,76 @@ impl WsBroadcast {
         self.socket_identities.write().remove(socket_id);
     }
 
-    /// Broadcast a message to a specific room.
+    /// Broadcast a message to a specific room over the **authenticated** channel.
     ///
-    /// Called from the HTTP `send_message` handler after a message is
-    /// persisted to the database. The room name follows the convention
-    /// `{recipientIdentityKey}-{messageBox}`.
+    /// Called from the HTTP `send_message` handler (and the BRC-103 WS
+    /// `sendMessage` path) after a message is persisted. The room name follows
+    /// the convention `{recipientIdentityKey}-{messageBox}`.
     ///
-    /// Uses both room-based broadcast AND direct socket delivery for
-    /// reliability: room broadcast goes through socketioxide's room
-    /// mechanism, while direct delivery finds matching sockets by
-    /// identity key and emits to each one.
-    pub fn broadcast_to_room(&self, room_id: &str, event: &str, msg: &RoomMessage) {
-        let json = match serde_json::to_value(msg) {
+    /// For every socket joined to the room that has completed the BRC-103
+    /// handshake, this signs `{eventName, data}` as a BRC-103 **general
+    /// message** through that socket's authenticated `Peer` session and emits it
+    /// as an `authMessage` Socket.IO event. That lands on the client's
+    /// authenticated *primary* receive path (`general_msg_dispatcher`) —
+    /// instant **and** verified — instead of the old raw `io.to(room).emit`,
+    /// which only reached the client's defensive `on_any` fallback and left real
+    /// delivery to a ~2s HTTP poll.
+    ///
+    /// A socket that has not authenticated (no session) is skipped; the message
+    /// is already persisted and that client will pick it up on (re)subscribe.
+    pub async fn broadcast_to_room(&self, room_id: &str, event: &str, msg: &RoomMessage) {
+        let data = match serde_json::to_value(msg) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "failed to serialize room message");
                 return;
             }
         };
+        let payload = encode_ws_event(event, data);
 
-        // Primary: room-based broadcast
-        let room_owned = room_id.to_string();
-        let event_owned = event.to_string();
-        self.io.to(room_owned).emit(&event_owned, &json).ok();
+        let members = self.room_members(room_id);
+        let mut delivered = 0usize;
+        for sid in members {
+            let identity = match self.get_identity(&sid) {
+                Some(k) => k,
+                None => continue, // not authenticated — nothing to sign against
+            };
+            let socket_peer = match self.get_peer(&sid) {
+                Some(p) => p,
+                None => continue,
+            };
 
-        // Fallback: direct socket delivery by recipient identity key.
-        // Some socketioxide configurations may not deliver room broadcasts
-        // reliably. This ensures the recipient gets the message.
-        let recipient_key = &msg.recipient;
-        let identities = self.socket_identities.read();
-        for (sid, key) in identities.iter() {
-            if key == recipient_key {
-                if let Some(ns) = self.io.of("/") {
-                    if let Some(socket) = ns.get_socket(sid.parse().unwrap_or_default()) {
-                        socket.emit(&event_owned, &json).ok();
-                        debug!(sid = %sid, event = %event_owned, "direct delivery to recipient socket");
+            // Sign a general message for this recipient's session. Uses the
+            // non-mutating `create_general_message`, which REQUIRES an existing
+            // authenticated session and never initiates a handshake — so a
+            // broadcast can only ever reach an already-authenticated socket.
+            let signed = {
+                let peer = socket_peer.peer.lock().await;
+                match peer.create_general_message(&identity, payload.clone()).await {
+                    Ok(m) => m,
+                    Err(e) => {
+                        debug!(sid = %sid, error = %e, "broadcast: no authenticated session, skipping");
+                        continue;
                     }
+                }
+            };
+
+            let json = match serde_json::to_value(&signed) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(sid = %sid, error = %e, "broadcast: failed to serialize signed authMessage");
+                    continue;
+                }
+            };
+            if let Some(ns) = self.io.of("/") {
+                if let Some(socket) = ns.get_socket(sid.parse().unwrap_or_default()) {
+                    socket.emit("authMessage", &json).ok();
+                    delivered += 1;
                 }
             }
         }
 
-        debug!(room = room_id, event = event, "broadcast to room");
+        debug!(room = room_id, event = event, delivered, "signed broadcast to room");
     }
 }
 
@@ -272,6 +363,7 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
         let ws_authmsg = ws.clone();
         let ws_auth = ws.clone();
         let ws_join = ws.clone();
+        let ws_leave = ws.clone();
         let ws_dc = ws.clone();
 
         // --- authMessage (BRC-103 mutual auth + general message routing) ---
@@ -301,68 +393,71 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                     // Hold identity_key from envelope — only trust it AFTER Peer verifies
                     let claimed_identity = incoming.identity_key.clone();
 
-                    // Ensure a Peer exists for this socket
-                    if let Err(e) = ws.ensure_peer(&sid).await {
-                        warn!(sid = %sid, error = %e, "failed to create Peer");
+                    // Ensure a Peer exists for this socket and grab its handle.
+                    // The registry lock is released immediately — all Peer work
+                    // below runs on this socket's own mutexes, so other sockets'
+                    // auth/broadcast traffic proceeds concurrently.
+                    let socket_peer = match ws.ensure_peer(&sid) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            warn!(sid = %sid, error = %e, "failed to create Peer");
+                            return;
+                        }
+                    };
+
+                    // Send the incoming message to the Peer's transport
+                    if let Err(e) = socket_peer.incoming_tx.send(incoming).await {
+                        warn!(sid = %sid, error = %e, "failed to feed authMessage to Peer");
                         return;
                     }
 
-                    // Feed message to Peer and collect responses
-                    let peers = ws.socket_peers.lock().await;
-                    if let Some((peer_mutex, incoming_tx, outgoing_rx_mutex, general_rx_mutex)) = peers.get(&sid) {
-                        // Send the incoming message to the Peer's transport
-                        if let Err(e) = incoming_tx.send(incoming).await {
-                            warn!(sid = %sid, error = %e, "failed to feed authMessage to Peer");
-                            return;
-                        }
-
-                        // Let the Peer process — this verifies the signature
-                        let mut peer = peer_mutex.lock().await;
+                    // Let the Peer process — this verifies the signature
+                    {
+                        let mut peer = socket_peer.peer.lock().await;
                         if let Err(e) = peer.process_pending().await {
                             warn!(sid = %sid, error = %e, "Peer process_pending failed (signature verification may have failed)");
                             // Don't return — there might still be outgoing/general messages
                         }
-                        drop(peer);
-
-                        // Only set identity AFTER Peer has processed (verified) the message
-                        if is_valid_pub_key(&claimed_identity) {
-                            ws.set_identity(&sid, claimed_identity.clone());
-                        }
-
-                        // Drain all outgoing messages and emit as authMessage events
-                        {
-                            let mut outgoing_rx = outgoing_rx_mutex.lock().await;
-                            while let Ok(response) = outgoing_rx.try_recv() {
-                                let resp_json = serde_json::to_value(&response).unwrap_or_default();
-                                socket.emit("authMessage", &resp_json).ok();
-                                debug!(sid = %sid, "emitted authMessage response");
-                            }
-                        }
-
-                        // Drain decoded general messages (application events from BRC-103).
-                        // This is the critical path: the client wraps sendMessage, joinRoom,
-                        // leaveRoom in BRC-103 General messages. The Peer decodes them and
-                        // puts the payload here. Without draining this channel, those events
-                        // are silently dropped and the client times out.
-                        {
-                            let mut general_rx = general_rx_mutex.lock().await;
-                            while let Ok((_sender_key, payload_bytes)) = general_rx.try_recv() {
-                                if let Some((event_name, data)) = decode_ws_event(&payload_bytes) {
-                                    debug!(sid = %sid, event = %event_name, "BRC-103 general message decoded");
-                                    handle_general_event(&socket, &ws, &sid, &event_name, data).await;
-                                }
-                            }
-                        }
-
-                        // Emit authenticationSuccess — the client waits for this to
-                        // confirm the handshake. Harmless as a no-op on subsequent messages
-                        // (client's oneshot fires once, ignores duplicates).
-                        socket.emit("authenticationSuccess", &serde_json::json!({
-                            "identityKey": claimed_identity
-                        })).ok();
-
-                        debug!(sid = %sid, key = %claimed_identity, "BRC-103 authMessage processed");
                     }
+
+                    // Only set identity AFTER Peer has processed (verified) the message
+                    if is_valid_pub_key(&claimed_identity) {
+                        ws.set_identity(&sid, claimed_identity.clone());
+                    }
+
+                    // Drain all outgoing messages and emit as authMessage events
+                    {
+                        let mut outgoing_rx = socket_peer.outgoing_rx.lock().await;
+                        while let Ok(response) = outgoing_rx.try_recv() {
+                            let resp_json = serde_json::to_value(&response).unwrap_or_default();
+                            socket.emit("authMessage", &resp_json).ok();
+                            debug!(sid = %sid, "emitted authMessage response");
+                        }
+                    }
+
+                    // Drain decoded general messages (application events from BRC-103).
+                    // This is the critical path: the client wraps sendMessage, joinRoom,
+                    // leaveRoom in BRC-103 General messages. The Peer decodes them and
+                    // puts the payload here. Without draining this channel, those events
+                    // are silently dropped and the client times out.
+                    {
+                        let mut general_rx = socket_peer.general_rx.lock().await;
+                        while let Ok((_sender_key, payload_bytes)) = general_rx.try_recv() {
+                            if let Some((event_name, data)) = decode_ws_event(&payload_bytes) {
+                                debug!(sid = %sid, event = %event_name, "BRC-103 general message decoded");
+                                handle_general_event(&socket, &ws, &sid, &event_name, data).await;
+                            }
+                        }
+                    }
+
+                    // Emit authenticationSuccess — the client waits for this to
+                    // confirm the handshake. Harmless as a no-op on subsequent messages
+                    // (client's oneshot fires once, ignores duplicates).
+                    socket.emit("authenticationSuccess", &serde_json::json!({
+                        "identityKey": claimed_identity
+                    })).ok();
+
+                    debug!(sid = %sid, key = %claimed_identity, "BRC-103 authMessage processed");
                 }
             },
         );
@@ -409,12 +504,9 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                     };
 
                     // Verify the socket has a Peer (BRC-103 handshake completed)
-                    {
-                        let peers = ws.socket_peers.lock().await;
-                        if !peers.contains_key(&sid) {
-                            warn!(sid = %sid, "joinRoom rejected: no BRC-103 Peer for socket");
-                            return;
-                        }
+                    if ws.get_peer(&sid).is_none() {
+                        warn!(sid = %sid, "joinRoom rejected: no BRC-103 Peer for socket");
+                        return;
                     }
 
                     // Verify the client owns this room
@@ -424,6 +516,7 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                     }
 
                     socket.join(data.room_id.clone()).ok();
+                    ws.add_room_member(&data.room_id, &sid);
                     debug!(sid = %sid, room = %data.room_id, "joined room");
                     socket.emit("joinedRoom", &serde_json::json!({
                         "roomId": data.room_id
@@ -438,12 +531,14 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
         socket.on(
             "leaveRoom",
             move |socket: SocketRef, Data(data): Data<LeaveRoomData>| {
+                let ws = ws_leave.clone();
                 async move {
                     let sid = socket.id.to_string();
                     // leaveRoom is safe — worst case a socket leaves a room it wasn't in.
                     // No auth bypass risk since room membership is additive only for the
                     // socket's own identity prefix (enforced in joinRoom).
                     socket.leave(data.room_id.clone()).ok();
+                    ws.remove_room_member(&data.room_id, &sid);
                     debug!(sid = %sid, room = %data.room_id, "left room");
                     socket.emit("leftRoom", &serde_json::json!({
                         "roomId": data.room_id
@@ -458,7 +553,7 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
             async move {
                 let sid = socket.id.to_string();
                 ws.remove_identity(&sid);
-                ws.remove_peer(&sid).await;
+                ws.remove_peer(&sid);
                 info!(sid = %sid, reason = ?reason, "client disconnected");
             }
         });
@@ -497,8 +592,9 @@ fn decode_ws_event(payload: &[u8]) -> Option<(String, serde_json::Value)> {
 /// Encode an application event as a BRC-103 general message payload.
 ///
 /// Produces `{"eventName": "...", "data": ...}` serialized to bytes.
-/// Used for sending responses back through the BRC-103 Peer channel.
-#[allow(dead_code)]
+/// Used to sign room broadcasts as BRC-103 general messages (see
+/// [`WsBroadcast::broadcast_to_room`]) and to send responses back through the
+/// Peer channel.
 fn encode_ws_event(event_name: &str, data: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "eventName": event_name,
@@ -560,6 +656,7 @@ async fn handle_general_event(
             }
 
             socket.join(room_id_str.clone()).ok();
+            ws.add_room_member(&room_id_str, sid);
             debug!(sid = %sid, room = %room_id_str, "BRC-103 joinRoom: joined room");
             // Emit joinedRoom as raw event (client's on_any handles it)
             socket.emit("joinedRoom", &serde_json::json!({
@@ -570,6 +667,7 @@ async fn handle_general_event(
             let room_id_str = data.as_str().unwrap_or("").to_string();
             if !room_id_str.is_empty() {
                 socket.leave(room_id_str.clone()).ok();
+                ws.remove_room_member(&room_id_str, sid);
                 debug!(sid = %sid, room = %room_id_str, "BRC-103 leaveRoom: left room");
                 socket.emit("leftRoom", &serde_json::json!({
                     "roomId": room_id_str
@@ -722,9 +820,151 @@ async fn handle_ws_send_message(
             created_at: now.clone(),
             updated_at: now,
         },
-    );
+    ).await;
 
     // Emit ack to the sender socket
     socket.emit(&ack_event, &serde_json::json!({"status": "success"})).ok();
     debug!(sid = %sid, ack = %ack_event, "BRC-103 sendMessage: ack emitted");
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// secp256k1 scalar `1` — a valid private key for the server identity.
+    const TEST_SERVER_KEY: &str =
+        "0000000000000000000000000000000000000000000000000000000000000001";
+
+    fn test_ws() -> WsBroadcast {
+        let (_layer, io) = socketioxide::SocketIo::new_layer();
+        // In-memory DB; membership/broadcast paths never touch it, but the
+        // struct requires a pool.
+        let manager = r2d2_sqlite::SqliteConnectionManager::memory();
+        let pool = r2d2::Pool::builder().max_size(1).build(manager).unwrap();
+        WsBroadcast::new(io, TEST_SERVER_KEY.to_string(), pool)
+    }
+
+    #[test]
+    fn room_membership_add_and_query() {
+        let ws = test_ws();
+        ws.add_room_member("keyA-inbox", "sock1");
+        ws.add_room_member("keyA-inbox", "sock2");
+        ws.add_room_member("keyB-inbox", "sock3");
+
+        let mut a = ws.room_members("keyA-inbox");
+        a.sort();
+        assert_eq!(a, vec!["sock1".to_string(), "sock2".to_string()]);
+        assert_eq!(ws.room_members("keyB-inbox"), vec!["sock3".to_string()]);
+        assert!(ws.room_members("nonexistent").is_empty());
+    }
+
+    #[test]
+    fn room_membership_is_idempotent() {
+        let ws = test_ws();
+        ws.add_room_member("room", "sock1");
+        ws.add_room_member("room", "sock1");
+        assert_eq!(ws.room_members("room").len(), 1);
+    }
+
+    #[test]
+    fn remove_room_member_drops_empty_room() {
+        let ws = test_ws();
+        ws.add_room_member("room", "sock1");
+        ws.remove_room_member("room", "sock1");
+        assert!(ws.room_members("room").is_empty());
+        // Room key itself is dropped once empty.
+        assert!(ws.rooms.read().get("room").is_none());
+    }
+
+    #[test]
+    fn disconnect_removes_socket_from_all_rooms() {
+        let ws = test_ws();
+        ws.add_room_member("room1", "sock1");
+        ws.add_room_member("room2", "sock1");
+        ws.add_room_member("room1", "sock2");
+
+        ws.remove_socket_from_all_rooms("sock1");
+
+        assert_eq!(ws.room_members("room1"), vec!["sock2".to_string()]);
+        assert!(ws.room_members("room2").is_empty());
+    }
+
+    #[test]
+    fn ensure_peer_is_idempotent_returns_same_handle() {
+        let ws = test_ws();
+        let a = ws.ensure_peer("sock1").expect("peer");
+        let b = ws.ensure_peer("sock1").expect("peer");
+        assert!(Arc::ptr_eq(&a, &b), "second ensure_peer must reuse the handle");
+    }
+
+    #[test]
+    fn remove_peer_clears_peer_and_room_membership() {
+        let ws = test_ws();
+        ws.ensure_peer("sock1").expect("peer");
+        ws.add_room_member("room", "sock1");
+        ws.remove_peer("sock1");
+        assert!(ws.get_peer("sock1").is_none());
+        assert!(ws.room_members("room").is_empty());
+    }
+
+    #[test]
+    fn ws_event_codec_round_trips() {
+        let data = serde_json::json!({"messageId": "m1", "body": "hello"});
+        let bytes = encode_ws_event("sendMessage-room1", data.clone());
+        let (event, decoded) = decode_ws_event(&bytes).expect("decodes");
+        assert_eq!(event, "sendMessage-room1");
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn broadcast_to_empty_room_is_noop() {
+        let ws = test_ws();
+        // No members, no panic, nothing delivered.
+        ws.broadcast_to_room(
+            "ghost-room",
+            "sendMessage-ghost-room",
+            &RoomMessage {
+                message_id: "m1".into(),
+                sender: "s".into(),
+                recipient: "r".into(),
+                message_box: "inbox".into(),
+                body: "{}".into(),
+                created_at: "t".into(),
+                updated_at: "t".into(),
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn broadcast_skips_member_without_authenticated_session() {
+        // A socket can be a room member with a Peer but no completed handshake.
+        // `create_general_message` must fail closed (no session) and broadcast
+        // must skip it gracefully rather than panic or initiate a handshake.
+        let ws = test_ws();
+        ws.ensure_peer("sock1").expect("peer");
+        ws.set_identity("sock1", "02".to_string() + &"ab".repeat(32)); // 66-hex-ish
+        ws.add_room_member("keyA-inbox", "sock1");
+
+        ws.broadcast_to_room(
+            "keyA-inbox",
+            "sendMessage-keyA-inbox",
+            &RoomMessage {
+                message_id: "m1".into(),
+                sender: "s".into(),
+                recipient: "r".into(),
+                message_box: "inbox".into(),
+                body: "{}".into(),
+                created_at: "t".into(),
+                updated_at: "t".into(),
+            },
+        )
+        .await;
+        // Reaching here without panic + with the peer still intact is the assertion.
+        assert!(ws.get_peer("sock1").is_some());
+    }
 }

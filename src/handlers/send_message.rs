@@ -6,9 +6,8 @@ use axum::{
 };
 // Payment internalization uses bsv-sdk WalletInterface but ProtoWallet
 // always returns "requires a full wallet" — payment validation is structural only.
-use serde::Deserialize;
 use serde_json::Value;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 use crate::db::queries;
 use crate::firebase::send_fcm_notification::{send_fcm_notification, FcmPayload};
@@ -426,7 +425,7 @@ pub async fn send_message(
                         created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
                         updated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
                     },
-                );
+                ).await;
             }
             Err(e) => {
                 error!("failed to insert message: {e}");
