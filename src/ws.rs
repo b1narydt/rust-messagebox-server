@@ -278,6 +278,56 @@ impl WsBroadcast {
         self.socket_identities.write().remove(socket_id);
     }
 
+    /// Sign one server→client application event as a BRC-103 **general message**
+    /// for `sid`'s authenticated session and emit it as `authMessage`.
+    ///
+    /// This is the `@bsv/authsocket` contract for *every* server→client event
+    /// (`AuthSocket.emit` → `peer.toPeer`): acks, room confirmations, and
+    /// `authenticationSuccess` all travel as signed, verifiable general messages
+    /// — never raw Socket.IO events. A strict authsocket client only dispatches
+    /// verified general messages, so a raw emit would be invisible to it.
+    ///
+    /// Returns `false` if the socket has no authenticated session yet (the
+    /// caller simply skips — there is nothing to sign against).
+    async fn emit_signed(
+        &self,
+        socket: &SocketRef,
+        sid: &str,
+        event_name: &str,
+        data: serde_json::Value,
+    ) -> bool {
+        let identity = match self.get_identity(sid) {
+            Some(k) => k,
+            None => return false,
+        };
+        let socket_peer = match self.get_peer(sid) {
+            Some(p) => p,
+            None => return false,
+        };
+        let payload = encode_ws_event(event_name, data);
+        let signed = {
+            let peer = socket_peer.peer.lock().await;
+            match peer.create_general_message(&identity, payload).await {
+                Ok(m) => m,
+                Err(e) => {
+                    debug!(sid = %sid, event = %event_name, error = %e,
+                        "emit_signed: no authenticated session, skipping");
+                    return false;
+                }
+            }
+        };
+        match serde_json::to_value(&signed) {
+            Ok(json) => {
+                socket.emit("authMessage", &json).ok();
+                true
+            }
+            Err(e) => {
+                warn!(sid = %sid, event = %event_name, error = %e, "emit_signed: serialize failed");
+                false
+            }
+        }
+    }
+
     /// Broadcast a message to a specific room over the **authenticated** channel.
     ///
     /// Called from the HTTP `send_message` handler (and the BRC-103 WS
@@ -495,14 +545,11 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                         }
                     }
 
-                    // Emit authenticationSuccess — the client waits for this to
-                    // confirm the handshake. Harmless as a no-op on subsequent messages
-                    // (client's oneshot fires once, ignores duplicates).
-                    socket.emit("authenticationSuccess", &serde_json::json!({
-                        "identityKey": claimed_identity
-                    })).ok();
-
-                    debug!(sid = %sid, key = %claimed_identity, "BRC-103 authMessage processed");
+                    // authenticationSuccess is NOT emitted here as a raw event.
+                    // Per the authsocket contract it is a signed general message,
+                    // sent from the `authenticated` general-event handler once the
+                    // verified identity is known (see handle_general_event).
+                    debug!(sid = %sid, claimed = %claimed_identity, "BRC-103 authMessage processed");
                 }
             },
         );
@@ -667,11 +714,14 @@ fn split_room_id(room_id: &str) -> Option<(String, String)> {
 
 /// Handle a decoded BRC-103 general message (application event).
 ///
-/// Routes events to the appropriate handler:
-/// - `authenticated`: identity already captured from AuthMessage envelope
-/// - `joinRoom`: join the socket to the requested room
-/// - `leaveRoom`: remove socket from the room
-/// - `sendMessage`: store message in DB, broadcast to room, emit ack
+/// Routes events to the appropriate handler. Every server→client confirmation
+/// is returned as a **signed** general message (`emit_signed`), matching the
+/// `@bsv/authsocket` contract — never a raw Socket.IO event.
+/// - `authenticated`: identity is already set from the verified sender; confirm
+///   with a signed `authenticationSuccess`.
+/// - `joinRoom`: join the socket to the requested room; signed `joinedRoom`.
+/// - `leaveRoom`: remove socket from the room; signed `leftRoom`.
+/// - `sendMessage`: store message in DB, broadcast to room, signed ack.
 async fn handle_general_event(
     socket: &SocketRef,
     ws: &WsBroadcast,
@@ -681,8 +731,18 @@ async fn handle_general_event(
 ) {
     match event_name {
         "authenticated" => {
-            // Identity already extracted from AuthMessage envelope — no-op.
-            debug!(sid = %sid, "BRC-103 authenticated event (identity already set)");
+            // Identity was set from the verified general-message sender before
+            // dispatch. Confirm the handshake with a signed authenticationSuccess
+            // (authsocket sends this via AuthSocket.emit, not a raw event).
+            let identity = ws.get_identity(sid).unwrap_or_default();
+            ws.emit_signed(
+                socket,
+                sid,
+                "authenticationSuccess",
+                serde_json::json!({ "status": "success", "identityKey": identity }),
+            )
+            .await;
+            debug!(sid = %sid, "BRC-103 authenticated event: signed authenticationSuccess sent");
         }
         "joinRoom" => {
             // Data is the room ID string (e.g., "{identityKey}-{messageBox}")
@@ -703,10 +763,8 @@ async fn handle_general_event(
             socket.join(room_id_str.clone()).ok();
             ws.add_room_member(&room_id_str, sid);
             debug!(sid = %sid, room = %room_id_str, "BRC-103 joinRoom: joined room");
-            // Emit joinedRoom as raw event (client's on_any handles it)
-            socket.emit("joinedRoom", &serde_json::json!({
-                "roomId": room_id_str
-            })).ok();
+            ws.emit_signed(socket, sid, "joinedRoom", serde_json::json!({ "roomId": room_id_str }))
+                .await;
         }
         "leaveRoom" => {
             let room_id_str = data.as_str().unwrap_or("").to_string();
@@ -714,9 +772,8 @@ async fn handle_general_event(
                 socket.leave(room_id_str.clone()).ok();
                 ws.remove_room_member(&room_id_str, sid);
                 debug!(sid = %sid, room = %room_id_str, "BRC-103 leaveRoom: left room");
-                socket.emit("leftRoom", &serde_json::json!({
-                    "roomId": room_id_str
-                })).ok();
+                ws.emit_signed(socket, sid, "leftRoom", serde_json::json!({ "roomId": room_id_str }))
+                    .await;
             }
         }
         "sendMessage" => {
@@ -845,7 +902,13 @@ async fn handle_ws_send_message(
         }
         Err(e) => {
             warn!(sid = %sid, error = %e, "BRC-103 sendMessage: DB error");
-            socket.emit(&ack_event, &serde_json::json!({"status": "error", "description": e})).ok();
+            ws.emit_signed(
+                socket,
+                sid,
+                &ack_event,
+                serde_json::json!({"status": "error", "messageId": message_id, "description": e}),
+            )
+            .await;
             return;
         }
     }
@@ -867,9 +930,16 @@ async fn handle_ws_send_message(
         },
     ).await;
 
-    // Emit ack to the sender socket
-    socket.emit(&ack_event, &serde_json::json!({"status": "success"})).ok();
-    debug!(sid = %sid, ack = %ack_event, "BRC-103 sendMessage: ack emitted");
+    // Emit a signed ack to the sender socket. Payload shape matches the
+    // reference message-box-server: { status, messageId }.
+    ws.emit_signed(
+        socket,
+        sid,
+        &ack_event,
+        serde_json::json!({"status": "success", "messageId": message_id}),
+    )
+    .await;
+    debug!(sid = %sid, ack = %ack_event, "BRC-103 sendMessage: signed ack emitted");
 }
 
 // ---------------------------------------------------------------------------
