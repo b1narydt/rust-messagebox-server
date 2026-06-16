@@ -543,7 +543,7 @@ pub async fn send_message(
                         created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
                         updated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
                     },
-                );
+                ).await;
             }
             Err(e) => {
                 error!("failed to insert message: {e}");
