@@ -295,17 +295,24 @@ impl WsBroadcast {
     ///
     /// A socket that has not authenticated (no session) is skipped; the message
     /// is already persisted and that client will pick it up on (re)subscribe.
-    pub async fn broadcast_to_room(&self, room_id: &str, event: &str, msg: &RoomMessage) {
+    ///
+    /// Returns the number of room members the signed frame was successfully
+    /// emitted to. Broadcast is best-effort — the message is already persisted,
+    /// so failures never propagate to the HTTP caller — but a non-empty room
+    /// that delivers to zero members is logged at `warn` as a degradation
+    /// signal (live push broken → recipients fall back to the HTTP poll).
+    pub async fn broadcast_to_room(&self, room_id: &str, event: &str, msg: &RoomMessage) -> usize {
         let data = match serde_json::to_value(msg) {
             Ok(v) => v,
             Err(e) => {
                 warn!(error = %e, "failed to serialize room message");
-                return;
+                return 0;
             }
         };
         let payload = encode_ws_event(event, data);
 
         let members = self.room_members(room_id);
+        let member_count = members.len();
         let mut delivered = 0usize;
         for sid in members {
             let identity = match self.get_identity(&sid) {
@@ -321,12 +328,15 @@ impl WsBroadcast {
             // non-mutating `create_general_message`, which REQUIRES an existing
             // authenticated session and never initiates a handshake — so a
             // broadcast can only ever reach an already-authenticated socket.
+            // The common skip is "socket not authenticated yet" (benign); a
+            // sign failure on an authenticated session is a real defect, so this
+            // is logged loudly enough to notice via the zero-delivered warn below.
             let signed = {
                 let peer = socket_peer.peer.lock().await;
                 match peer.create_general_message(&identity, payload.clone()).await {
                     Ok(m) => m,
                     Err(e) => {
-                        debug!(sid = %sid, error = %e, "broadcast: no authenticated session, skipping");
+                        debug!(sid = %sid, error = %e, "broadcast: could not sign for socket (likely not yet authenticated), skipping");
                         continue;
                     }
                 }
@@ -339,15 +349,30 @@ impl WsBroadcast {
                     continue;
                 }
             };
-            if let Some(ns) = self.io.of("/") {
-                if let Some(socket) = ns.get_socket(sid.parse().unwrap_or_default()) {
-                    socket.emit("authMessage", &json).ok();
-                    delivered += 1;
+            let socket = match sid.parse() {
+                Ok(id) => self.io.of("/").and_then(|ns| ns.get_socket(id)),
+                Err(e) => {
+                    warn!(sid = %sid, error = %e, "broadcast: unparseable socket id in room registry");
+                    None
+                }
+            };
+            if let Some(socket) = socket {
+                // Count only successful emits — a full send buffer / mid-teardown
+                // socket must not be reported as delivered.
+                match socket.emit("authMessage", &json) {
+                    Ok(()) => delivered += 1,
+                    Err(e) => warn!(sid = %sid, room = %room_id, error = %e,
+                        "broadcast: emit failed — recipient falls back to HTTP poll"),
                 }
             }
         }
 
+        if member_count > 0 && delivered == 0 {
+            warn!(room = %room_id, members = member_count,
+                "signed broadcast reached 0 of {member_count} room members — live push may be broken; recipients depend on the HTTP poll");
+        }
         debug!(room = room_id, event = event, delivered, "signed broadcast to room");
+        delivered
     }
 }
 
@@ -926,21 +951,46 @@ mod tests {
     #[tokio::test]
     async fn broadcast_to_empty_room_is_noop() {
         let ws = test_ws();
-        // No members, no panic, nothing delivered.
-        ws.broadcast_to_room(
-            "ghost-room",
-            "sendMessage-ghost-room",
-            &RoomMessage {
-                message_id: "m1".into(),
-                sender: "s".into(),
-                recipient: "r".into(),
-                message_box: "inbox".into(),
-                body: "{}".into(),
-                created_at: "t".into(),
-                updated_at: "t".into(),
-            },
-        )
-        .await;
+        // No members → zero delivered, no panic.
+        let delivered = ws
+            .broadcast_to_room(
+                "ghost-room",
+                "sendMessage-ghost-room",
+                &RoomMessage {
+                    message_id: "m1".into(),
+                    sender: "s".into(),
+                    recipient: "r".into(),
+                    message_box: "inbox".into(),
+                    body: "{}".into(),
+                    created_at: "t".into(),
+                    updated_at: "t".into(),
+                },
+            )
+            .await;
+        assert_eq!(delivered, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ensure_peer_is_race_safe_under_concurrency() {
+        // The refactor's explicit claim: concurrent first-touch of a fresh
+        // socket yields ONE shared handle (entry().or_insert()). Hammer it.
+        let ws = Arc::new(test_ws());
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let ws = ws.clone();
+            handles.push(tokio::spawn(async move {
+                let p = ws.ensure_peer("sock1").expect("peer");
+                Arc::as_ptr(&p) as usize
+            }));
+        }
+        let mut ptrs = Vec::new();
+        for h in handles {
+            ptrs.push(h.await.unwrap());
+        }
+        assert!(
+            ptrs.iter().all(|p| *p == ptrs[0]),
+            "all concurrent ensure_peer calls must observe the same handle"
+        );
     }
 
     #[tokio::test]
@@ -950,24 +1000,27 @@ mod tests {
         // must skip it gracefully rather than panic or initiate a handshake.
         let ws = test_ws();
         ws.ensure_peer("sock1").expect("peer");
-        ws.set_identity("sock1", "02".to_string() + &"ab".repeat(32)); // 66-hex-ish
+        ws.set_identity("sock1", "02".to_string() + &"ab".repeat(32)); // 66-char compressed-pubkey shape
         ws.add_room_member("keyA-inbox", "sock1");
 
-        ws.broadcast_to_room(
-            "keyA-inbox",
-            "sendMessage-keyA-inbox",
-            &RoomMessage {
-                message_id: "m1".into(),
-                sender: "s".into(),
-                recipient: "r".into(),
-                message_box: "inbox".into(),
-                body: "{}".into(),
-                created_at: "t".into(),
-                updated_at: "t".into(),
-            },
-        )
-        .await;
-        // Reaching here without panic + with the peer still intact is the assertion.
+        let delivered = ws
+            .broadcast_to_room(
+                "keyA-inbox",
+                "sendMessage-keyA-inbox",
+                &RoomMessage {
+                    message_id: "m1".into(),
+                    sender: "s".into(),
+                    recipient: "r".into(),
+                    message_box: "inbox".into(),
+                    body: "{}".into(),
+                    created_at: "t".into(),
+                    updated_at: "t".into(),
+                },
+            )
+            .await;
+        // No authenticated session → create_general_message fails closed → 0
+        // delivered, peer untouched.
+        assert_eq!(delivered, 0);
         assert!(ws.get_peer("sock1").is_some());
     }
 }
