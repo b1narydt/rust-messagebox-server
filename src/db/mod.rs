@@ -8,12 +8,23 @@ pub type DbPool = r2d2::Pool<r2d2_sqlite::SqliteConnectionManager>;
 pub fn new(db_source: &str) -> Result<DbPool, Box<dyn std::error::Error>> {
     let manager = r2d2_sqlite::SqliteConnectionManager::file(db_source)
         .with_init(|conn| {
+            // WAL + synchronous=NORMAL is the standard high-throughput SQLite
+            // profile: writers don't fsync on every commit (only at checkpoint),
+            // which is what lets a write-heavy relay sustain many concurrent
+            // sendMessage stores without serializing on fsync. NORMAL is durable
+            // against crashes under WAL (only a power-loss can drop the last
+            // few committed txns — acceptable for a re-deliverable message box).
             conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+                "PRAGMA journal_mode=WAL; \
+                 PRAGMA synchronous=NORMAL; \
+                 PRAGMA foreign_keys=ON; \
+                 PRAGMA busy_timeout=5000;",
             )?;
             Ok(())
         });
-    let pool = r2d2::Pool::builder().max_size(8).build(manager)?;
+    // Sized for concurrent reads (listMessages / poll backstop) alongside the
+    // single SQLite writer; writes still serialize in SQLite, reads do not.
+    let pool = r2d2::Pool::builder().max_size(16).build(manager)?;
     Ok(pool)
 }
 

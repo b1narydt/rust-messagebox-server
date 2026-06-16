@@ -51,8 +51,11 @@ pub struct ChannelTransport {
 
 impl ChannelTransport {
     pub fn new() -> (Self, mpsc::Sender<SdkAuthMessage>, mpsc::Receiver<SdkAuthMessage>) {
-        let (in_tx, in_rx) = mpsc::channel(16);
-        let (out_tx, out_rx) = mpsc::channel(16);
+        // Sized for handshake/auth bursts under many concurrent connections;
+        // room broadcasts bypass this channel (emitted directly), so this only
+        // buffers per-socket handshake + reply frames.
+        let (in_tx, in_rx) = mpsc::channel(64);
+        let (out_tx, out_rx) = mpsc::channel(64);
         let transport = Self {
             outgoing_tx: out_tx,
             incoming_rx: std::sync::Mutex::new(Some(in_rx)),
