@@ -418,7 +418,11 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                         }
                     };
 
-                    // Hold identity_key from envelope — only trust it AFTER Peer verifies
+                    // The envelope's identity_key is a CLAIM, not yet verified.
+                    // It is used only to echo back in `authenticationSuccess`
+                    // (a handshake-progress signal) — never to establish trust.
+                    // The trusted identity is taken from the Peer's verified
+                    // general-message sender below (see the general_rx drain).
                     let claimed_identity = incoming.identity_key.clone();
 
                     // Ensure a Peer exists for this socket and grab its handle.
@@ -439,18 +443,17 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                         return;
                     }
 
-                    // Let the Peer process — this verifies the signature
+                    // Let the Peer process — this runs the handshake and verifies
+                    // signatures. A failure here means verification did not
+                    // complete; we must NOT trust any claimed identity as a
+                    // result (the identity is only ever set from a verified
+                    // general-message sender below).
                     {
                         let mut peer = socket_peer.peer.lock().await;
                         if let Err(e) = peer.process_pending().await {
-                            warn!(sid = %sid, error = %e, "Peer process_pending failed (signature verification may have failed)");
+                            warn!(sid = %sid, error = %e, "Peer process_pending failed (verification did not complete; identity NOT trusted)");
                             // Don't return — there might still be outgoing/general messages
                         }
-                    }
-
-                    // Only set identity AFTER Peer has processed (verified) the message
-                    if is_valid_pub_key(&claimed_identity) {
-                        ws.set_identity(&sid, claimed_identity.clone());
                     }
 
                     // Drain all outgoing messages and emit as authMessage events
@@ -468,11 +471,25 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                     // leaveRoom in BRC-103 General messages. The Peer decodes them and
                     // puts the payload here. Without draining this channel, those events
                     // are silently dropped and the client times out.
+                    //
+                    // SECURITY / @bsv parity: the bsv-sdk Peer pushes to this channel
+                    // ONLY after it has verified the nonce, session, and signature
+                    // (handle_general_message). So `sender_key` here is the
+                    // CRYPTOGRAPHICALLY VERIFIED identity — the only value we trust
+                    // for this socket. This mirrors @bsv/authsocket's
+                    // `listenForGeneralMessages((senderPublicKey, _) => onIdentityKeyDiscovered(...))`.
+                    // A forged authMessage with a bad signature never reaches here,
+                    // so it can never set an identity. We set the identity BEFORE
+                    // dispatching the event so room-ownership / sender checks in
+                    // handle_general_event see the verified identity.
                     {
                         let mut general_rx = socket_peer.general_rx.lock().await;
-                        while let Ok((_sender_key, payload_bytes)) = general_rx.try_recv() {
+                        while let Ok((sender_key, payload_bytes)) = general_rx.try_recv() {
+                            if is_valid_pub_key(&sender_key) {
+                                ws.set_identity(&sid, sender_key.clone());
+                            }
                             if let Some((event_name, data)) = decode_ws_event(&payload_bytes) {
-                                debug!(sid = %sid, event = %event_name, "BRC-103 general message decoded");
+                                debug!(sid = %sid, event = %event_name, "BRC-103 general message decoded (verified sender)");
                                 handle_general_event(&socket, &ws, &sid, &event_name, data).await;
                             }
                         }
