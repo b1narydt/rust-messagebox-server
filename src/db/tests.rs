@@ -117,7 +117,7 @@ async fn test_acknowledge_messages_not_found() {
 async fn test_get_server_delivery_fee_default() {
     let pool = fresh_pool().await;
     let fee = get_server_delivery_fee(&pool, "notifications").await.unwrap();
-    assert_eq!(fee, 10, "notifications box default delivery fee should be 10");
+    assert_eq!(fee, 0, "notifications default delivery fee should be 0 (zeroed by the zero_default_fees migration; opt-in via MESSAGEBOX_FEES)");
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
     assert_eq!(fee, 0, "inbox box default delivery fee should be 0");
@@ -323,9 +323,11 @@ async fn test_should_use_fcm_delivery() {
 #[tokio::test]
 async fn test_delivery_fee_cache() {
     let pool = fresh_pool().await;
-    // After init_delivery_fee_cache (called in fresh_pool), fees should come from cache
+    // After init_delivery_fee_cache (called in fresh_pool), fees should come from cache.
+    // The zero_default_fees migration zeroes every seeded fee (incl. notifications),
+    // so the cached value is 0 unless an operator opts in via MESSAGEBOX_FEES.
     let fee = get_server_delivery_fee(&pool, "notifications").await.unwrap();
-    assert_eq!(fee, 10, "notifications delivery fee should be 10");
+    assert_eq!(fee, 0, "notifications delivery fee should be 0 after zero_default_fees");
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
     assert_eq!(fee, 0, "inbox delivery fee should be 0");
