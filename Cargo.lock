@@ -290,9 +290,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-sdk"
-version = "0.2.7"
+version = "0.2.85"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b0bc815d6d386772b2877403ed54c8f2843b744d53bc19e4bc57231af53e720"
+checksum = "4cd567088515a2e8a4a5eb3679cee3ecf7f30bb907d22e64871b3c578583c3f9"
 dependencies = [
  "async-trait",
  "futures-util",

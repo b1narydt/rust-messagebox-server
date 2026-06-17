@@ -28,10 +28,11 @@ socketioxide = { version = "0.15", features = ["state"] }
 # BRC-31 auth middleware — crates.io release
 bsv-auth-axum-middleware = "0.1"
 
-# bsv-sdk — sole SDK for all auth and wallet operations. Pinned to 0.2 to match
-# the middleware's requirement so both resolve to a single copy (avoids
-# two-instance trait-bound conflicts).
-bsv-sdk = { version = "0.2", features = ["network"] }
+# bsv-sdk — sole SDK for all auth and wallet operations. Bumped to 0.2.85
+# (latest). bsv-auth-axum-middleware and bsv-wallet-toolbox both depend on
+# bsv-sdk ^0.2, so all three still resolve to a single copy (avoids the
+# two-instance trait-bound conflict). Cargo.lock pins the exact build.
+bsv-sdk = { version = "0.2.85", features = ["network"] }
 
 bsv-wallet-toolbox = "0.2"
 
