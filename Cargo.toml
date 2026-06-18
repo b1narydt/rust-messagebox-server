@@ -28,13 +28,21 @@ socketioxide = { version = "0.15", features = ["state"] }
 # BRC-31 auth middleware — crates.io release
 bsv-auth-axum-middleware = "0.1"
 
-# bsv-sdk — sole SDK for all auth and wallet operations. Bumped to 0.2.85
-# (latest). bsv-auth-axum-middleware and bsv-wallet-toolbox both depend on
-# bsv-sdk ^0.2, so all three still resolve to a single copy (avoids the
-# two-instance trait-bound conflict). Cargo.lock pins the exact build.
-bsv-sdk = { version = "0.2.85", features = ["network"] }
+# bsv-sdk — sole SDK for all auth and wallet operations. Requirement relaxed to
+# "0.2" so the local [patch.crates-io] path crate (bsv-sdk 0.2.82, the
+# concurrency-safe Arc<Peer> fix on fix/brc103-concurrent-sessions) SATISFIES it
+# and the patch actually applies. A "=0.2.85" pin would reject the 0.2.82 patch
+# (semver: patch crate must satisfy the dep req) and silently fall back to the
+# registry copy. bsv-auth-axum-middleware and bsv-wallet-toolbox both depend on
+# bsv-sdk ^0.2, so all three still resolve to the single local copy.
+bsv-sdk = { version = "0.2", features = ["network"] }
 
-bsv-wallet-toolbox = "0.2"
+# Bumped to 0.2.24 (latest 0.2.x). Older 0.2.16 was written against a pre-0.2.82
+# SDK where CertificateResult.keyring was a bare HashMap; 0.2.82 made it
+# Option<HashMap>, so 0.2.16 failed to compile against the local patched SDK.
+# 0.2.24 targets the newer SDK shape and still requires bsv-sdk "0.2" (satisfied
+# by the local 0.2.82 patch).
+bsv-wallet-toolbox = "0.2.24"
 
 getrandom = "0.4"
 http-body-util = "0.1"
@@ -52,3 +60,17 @@ uuid = { version = "1", features = ["v4"] }
 [profile.release]
 opt-level = 3
 lto = true
+
+# Standalone package — not a member of the parent rust-mpc workspace.
+# Without this, cargo walks up to rust-mpc/Cargo.toml and refuses to build.
+[workspace]
+
+# FIXED build (BRC-103 concurrency fix, TDD green step). This server is the
+# build root, so its [patch] applies graph-wide — pulling in BOTH local fixes:
+#   - bsv-sdk: the Arc<Peer>-shareable, all-&self concurrency-safe SDK
+#     (fix/brc103-concurrent-sessions working tree).
+#   - bsv-auth-axum-middleware: lock-free verify/create, cert-gate TOCTOU fix,
+#     SessionNotFound -> 401. Itself path-patches bsv-sdk to the same local crate.
+[patch.crates-io]
+bsv-sdk = { path = "../../bsv-rust-sdk" }
+bsv-auth-axum-middleware = { path = "../bsv-auth-axum-middleware" }

@@ -4,6 +4,7 @@ pub mod db;
 pub mod firebase;
 pub mod handlers;
 pub mod logger;
+pub mod persist;
 pub mod ws;
 
 #[cfg(test)]

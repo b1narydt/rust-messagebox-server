@@ -121,6 +121,28 @@ async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value)
     (status, body)
 }
 
+/// Poll `listMessages` for `message_box` until at least `expected` messages are
+/// visible, or the timeout elapses. Persistence is now asynchronous (push-live
+/// first, persist in a background worker), so a read immediately after a
+/// `sendMessage` 200 may race the worker. Live recipients get the message over
+/// WebSocket instantly; the HTTP fallback becomes consistent within a worker
+/// tick. This helper makes that read-after-write deterministic in tests without
+/// weakening the production durability guarantee.
+async fn list_messages_until(app: &Router, message_box: &str, expected: usize) -> Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (status, body) = post_json(app, "/listMessages", json!({
+            "messageBox": message_box
+        })).await;
+        assert_eq!(status, StatusCode::OK);
+        let len = body["messages"].as_array().map(|a| a.len()).unwrap_or(0);
+        if len >= expected || std::time::Instant::now() >= deadline {
+            return body;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 async fn get_path(app: &Router, path: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(Method::GET)
@@ -295,10 +317,14 @@ async fn test_send_message_duplicate() {
     let (status, _) = send_valid_message(&app, "dup-msg-1").await;
     assert_eq!(status, StatusCode::OK);
 
-    // Send same messageId again
+    // Send the same messageId again. Persistence is now asynchronous (push-live
+    // first), so the duplicate is no longer rejected synchronously at the HTTP
+    // layer — it is caught by the unique messageId constraint (INSERT IGNORE) in
+    // the background persist worker and treated as idempotent success. The
+    // response is therefore 200, and no second row is ever written.
     let (status, body) = send_valid_message(&app, "dup-msg-1").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "ERR_DUPLICATE_MESSAGE");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
 }
 
 #[tokio::test]
@@ -356,11 +382,9 @@ async fn test_list_messages_with_messages() {
     })).await;
     assert_eq!(status, StatusCode::OK);
 
-    // Now list messages for the authenticated user (TEST_KEY)
-    let (status, body) = post_json(&app, "/listMessages", json!({
-        "messageBox": "inbox"
-    })).await;
-    assert_eq!(status, StatusCode::OK);
+    // Now list messages for the authenticated user (TEST_KEY). Persistence is
+    // asynchronous, so poll until the background worker has committed the row.
+    let body = list_messages_until(&app, "inbox", 1).await;
     let messages = body["messages"].as_array().unwrap();
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["messageId"], "list-test-1");
@@ -412,6 +436,10 @@ async fn test_acknowledge_success() {
         }
     })).await;
     assert_eq!(status, StatusCode::OK);
+
+    // Wait for the async persist worker to commit before acknowledging — the
+    // HTTP ack path operates on the persisted row.
+    list_messages_until(&app, "inbox", 1).await;
 
     // Acknowledge it
     let (status, body) = post_json(&app, "/acknowledgeMessage", json!({
@@ -690,16 +718,19 @@ async fn test_list_messages_returns_empty_when_box_does_not_exist() {
     assert!(msgs.is_empty(), "messages should be empty for nonexistent box");
 }
 
-/// Duplicate messageId to same recipient returns 400 ERR_DUPLICATE_MESSAGE.
+/// Duplicate messageId to the same recipient is idempotent: with async
+/// persistence the unique messageId constraint (INSERT IGNORE in the persist
+/// worker) dedupes at persist time, so the second send returns 200 success and
+/// no second row is written. The client treats the duplicate as idempotent.
 #[tokio::test]
-async fn test_send_message_duplicate_same_recipient_is_rejected() {
+async fn test_send_message_duplicate_same_recipient_is_idempotent() {
     let app = setup_app().await;
 
     let (status, _) = send_valid_message(&app, "dup-parity-1").await;
     assert_eq!(status, StatusCode::OK);
 
     let (status, body) = send_valid_message(&app, "dup-parity-1").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "ERR_DUPLICATE_MESSAGE");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
 }
 

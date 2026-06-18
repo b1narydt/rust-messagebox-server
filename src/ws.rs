@@ -34,7 +34,7 @@ use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
 
 use bsv::auth::error::AuthError;
 
-use crate::db::{self, DbPool};
+use crate::db::DbPool;
 use crate::handlers::helpers::is_valid_pub_key;
 
 // ---------------------------------------------------------------------------
@@ -130,8 +130,6 @@ pub struct WsBroadcast {
     socket_identities: Arc<RwLock<HashMap<String, String>>>,
     /// Server private key hex for creating bsv-sdk Peers.
     server_private_key_hex: String,
-    /// Database pool for WS-initiated message storage (sendMessage via BRC-103).
-    db: DbPool,
     /// Per-socket BRC-103 session, keyed by socket id. Stored as `Arc` so the
     /// map lock is held only long enough to clone the handle out — never across
     /// `await` on a Peer operation.
@@ -140,18 +138,33 @@ pub struct WsBroadcast {
     /// ids that joined it. Used to fan a signed broadcast out to exactly the
     /// sockets subscribed to that room.
     rooms: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Background, durable message persistence. Both send paths push live first
+    /// and then hand the INSERT to this worker so MySQL latency never blocks
+    /// live delivery. See [`crate::persist`].
+    persist: crate::persist::PersistHandle,
 }
 
 impl WsBroadcast {
     pub fn new(io: SocketIo, server_private_key_hex: String, db: DbPool) -> Self {
+        let persist = crate::persist::PersistHandle::spawn(
+            db.clone(),
+            crate::persist::PersistConfig::default(),
+        );
         Self {
             io,
             socket_identities: Arc::new(RwLock::new(HashMap::new())),
             server_private_key_hex,
-            db,
             socket_peers: Arc::new(RwLock::new(HashMap::new())),
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            persist,
         }
+    }
+
+    /// Enqueue a message for asynchronous, durable persistence (off the hot
+    /// path). The caller MUST have already performed all gating checks
+    /// (auth/recipient/fee/permission/payment) and the live broadcast.
+    pub async fn persist_async(&self, job: crate::persist::PersistJob) {
+        self.persist.enqueue(job).await;
     }
 
     /// Get or create the `SocketPeer` for a socket and return a handle to it.
@@ -167,7 +180,7 @@ impl WsBroadcast {
 
         let wallet = self.create_sdk_wallet()?;
         let (transport, incoming_tx, outgoing_rx) = ChannelTransport::new();
-        let mut peer = Peer::new(wallet, StdArc::new(transport));
+        let peer = Peer::new(wallet, StdArc::new(transport));
 
         // Take the general message receiver BEFORE storing the Peer.
         // on_general_message() is take-once — must be called here.
@@ -475,7 +488,7 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                     // result (the identity is only ever set from a verified
                     // general-message sender below).
                     {
-                        let mut peer = socket_peer.peer.lock().await;
+                        let peer = socket_peer.peer.lock().await;
                         if let Err(e) = peer.process_pending().await {
                             warn!(sid = %sid, error = %e, "Peer process_pending failed (verification did not complete; identity NOT trusted)");
                             // Don't return — there might still be outgoing/general messages
@@ -771,54 +784,18 @@ async fn handle_ws_send_message(
         }
     };
 
-    // Store message in database
     let ack_event = format!("sendMessageAck-{room_id_str}");
 
     // Wrap body in {"message": body} format matching the HTTP handler
     let stored_body = serde_json::json!({"message": body}).to_string();
 
-    match async {
-        db::queries::ensure_message_box(&ws.db, &recipient, &message_box)
-            .await
-            .map_err(|e| format!("ensure_message_box: {e}"))?;
-        let mb_id = db::queries::get_message_box_id(&ws.db, &recipient, &message_box)
-            .await
-            .map_err(|e| format!("get_message_box_id: {e}"))?
-            .ok_or_else(|| "messageBox not found after ensure".to_string())?;
-        let inserted = db::queries::insert_message(&ws.db, &message_id, mb_id, &sender, &recipient, &stored_body)
-            .await
-            .map_err(|e| format!("insert_message: {e}"))?;
-        if !inserted {
-            warn!(sid = %sid, msg_id = %message_id, "BRC-103 sendMessage: duplicate messageId");
-            // Still emit ack — the message already exists, client should not retry
-        }
-        Ok::<(), String>(())
-    }
-    .await
-    {
-        Ok(()) => {
-            debug!(
-                sid = %sid,
-                msg_id = %message_id,
-                recipient = %recipient,
-                message_box = %message_box,
-                "BRC-103 sendMessage: stored in DB"
-            );
-        }
-        Err(e) => {
-            warn!(sid = %sid, error = %e, "BRC-103 sendMessage: DB error");
-            ws.emit_signed(
-                socket,
-                sid,
-                &ack_event,
-                serde_json::json!({"status": "error", "messageId": message_id, "description": e}),
-            )
-            .await;
-            return;
-        }
-    }
-
-    // Broadcast to the target room for live delivery
+    // ── PUSH-LIVE-FIRST ───────────────────────────────────────────────
+    //
+    // All gating checks for this path (authenticated identity, valid roomId,
+    // body-size limit) have already passed above, and the WS sendMessage path
+    // carries no fee/permission/payment gate. So broadcast to the live recipient
+    // IMMEDIATELY — before touching MySQL — so live delivery never waits on the
+    // DB. Durability is preserved by the async persist below.
     let now = now_iso8601();
     let event = format!("sendMessage-{room_id_str}");
     ws.broadcast_to_room(
@@ -829,14 +806,42 @@ async fn handle_ws_send_message(
             sender: sender.clone(),
             recipient: recipient.clone(),
             message_box: message_box.clone(),
-            body: stored_body,
+            body: stored_body.clone(),
             created_at: now.clone(),
             updated_at: now,
         },
     ).await;
 
-    // Emit a signed ack to the sender socket. Payload shape matches the
-    // reference message-box-server: { status, messageId }.
+    // ── PERSIST-ASYNC ─────────────────────────────────────────────────
+    //
+    // Hand the durable INSERT (ensure_message_box + insert_message) to the
+    // background persist worker. It retries transient DB errors with backoff and
+    // logs permanent failures at ERROR — the row still lands in MySQL for the
+    // HTTP fallback (listMessages) used by offline recipients and re-polling
+    // recipients. A duplicate messageId is caught by the unique constraint at
+    // persist time and treated as idempotent success (see crate::persist).
+    ws.persist_async(crate::persist::PersistJob {
+        message_id: message_id.clone(),
+        recipient: recipient.clone(),
+        message_box: message_box.clone(),
+        sender: sender.clone(),
+        body: stored_body,
+    })
+    .await;
+
+    debug!(
+        sid = %sid,
+        msg_id = %message_id,
+        recipient = %recipient,
+        message_box = %message_box,
+        "BRC-103 sendMessage: pushed live, persistence enqueued"
+    );
+
+    // Emit a signed ack to the sender socket. The ack now means "accepted for
+    // delivery" (pushed live + durably enqueued), not "committed to MySQL".
+    // Persistence is guaranteed by the worker; the client treats a later
+    // duplicate as idempotent success. Payload shape matches the reference
+    // message-box-server: { status, messageId }.
     ws.emit_signed(
         socket,
         sid,

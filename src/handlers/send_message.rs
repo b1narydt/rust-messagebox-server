@@ -468,33 +468,26 @@ pub async fn send_message(
         std::collections::HashMap::new()
     };
 
-    // ── Insert messages ───────────────────────────────────────────────
+    // ── Push live, then persist asynchronously ────────────────────────
+    //
+    // All gating checks (recipient validation, messageBox ensure, fee/permission
+    // lookup, blocked-recipient rejection, and payment internalization) have
+    // already run synchronously ABOVE — a message that should be rejected for
+    // policy/fee reasons never reaches this loop. From here we PUSH-LIVE-FIRST
+    // and PERSIST-ASYNC: broadcast to the connected recipient immediately
+    // (off the DB hot path) and hand the durable INSERT to the background
+    // persist worker. Durability is preserved by the worker (bounded retry,
+    // ERROR on permanent failure, inline fallback under backpressure — never a
+    // silent drop), so listMessages still serves offline / re-polling recipients.
+    //
+    // Dedup: the previous synchronous ERR_DUPLICATE_MESSAGE check is gone because
+    // the INSERT now happens after the response is built. The unique messageId
+    // constraint (INSERT IGNORE in the worker) still prevents a second row, and
+    // the client treats a duplicate as idempotent success — so a retried send is
+    // safe. The worker logs duplicates at debug.
     let mut results: Vec<SendMessageResult> = Vec::with_capacity(fee_rows.len());
 
     for (i, fr) in fee_rows.iter().enumerate() {
-        let mb_id = match queries::get_message_box_id(&state.db, &fr.recipient, &box_type).await {
-            Ok(Some(id)) => id,
-            Ok(None) => {
-                // Should not happen since we ensured above, but handle gracefully.
-                error!("messageBox disappeared after ensure for {}", fr.recipient);
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "ERR_INTERNAL_ERROR",
-                    "An internal error has occurred.",
-                )
-                .into_response();
-            }
-            Err(e) => {
-                error!("failed to get messageBoxId: {e}");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "ERR_INTERNAL_ERROR",
-                    "An internal error has occurred.",
-                )
-                .into_response();
-            }
-        };
-
         let msg_id = &message_ids[i];
 
         // Build stored body: {"message": <body>, "payment"?: <per-recipient payment>}
@@ -516,45 +509,33 @@ pub async fn send_message(
 
         let body_bytes = serde_json::to_string(&stored_body).unwrap_or_default();
 
-        match queries::insert_message(&state.db, msg_id, mb_id, &sender_key, &fr.recipient, &body_bytes).await {
-            Ok(false) => {
-                // Duplicate message – the Go code returns an error.
-                error!("duplicate message rejected: messageId={msg_id}");
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "ERR_DUPLICATE_MESSAGE",
-                    "Duplicate message.",
-                )
-                .into_response();
-            }
-            Ok(true) => {
-                // Broadcast to WebSocket room for live message push.
-                let room = crate::ws::room_id(&fr.recipient, &box_type);
-                let event = format!("sendMessage-{room}");
-                state.ws.broadcast_to_room(
-                    &room,
-                    &event,
-                    &crate::ws::RoomMessage {
-                        message_id: msg_id.clone(),
-                        sender: sender_key.clone(),
-                        recipient: fr.recipient.clone(),
-                        message_box: box_type.clone(),
-                        body: body_bytes.clone(),
-                        created_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-                        updated_at: chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-                    },
-                ).await;
-            }
-            Err(e) => {
-                error!("failed to insert message: {e}");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "ERR_INTERNAL_ERROR",
-                    "An internal error has occurred.",
-                )
-                .into_response();
-            }
-        }
+        // Push-live-first: broadcast to the connected recipient before the DB write.
+        let room = crate::ws::room_id(&fr.recipient, &box_type);
+        let event = format!("sendMessage-{room}");
+        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        state.ws.broadcast_to_room(
+            &room,
+            &event,
+            &crate::ws::RoomMessage {
+                message_id: msg_id.clone(),
+                sender: sender_key.clone(),
+                recipient: fr.recipient.clone(),
+                message_box: box_type.clone(),
+                body: body_bytes.clone(),
+                created_at: now.clone(),
+                updated_at: now,
+            },
+        ).await;
+
+        // Persist-async: durable INSERT off the hot path (see crate::persist).
+        state.ws.persist_async(crate::persist::PersistJob {
+            message_id: msg_id.clone(),
+            recipient: fr.recipient.clone(),
+            message_box: box_type.clone(),
+            sender: sender_key.clone(),
+            body: body_bytes,
+        })
+        .await;
 
         // FCM notification for "notifications" box.
         if queries::should_use_fcm_delivery(&box_type) {
