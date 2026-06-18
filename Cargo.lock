@@ -270,6 +270,7 @@ dependencies = [
 [[package]]
 name = "bsv-auth-axum-middleware"
 version = "0.1.2"
+source = "git+https://github.com/b1narydt/bsv-auth-axum-middleware?branch=fix%2Fconcurrent-arc-peer#4d2e56042898ac6db3c2ccdc72611b464727ee53"
 dependencies = [
  "async-trait",
  "axum",
@@ -292,6 +293,7 @@ dependencies = [
 [[package]]
 name = "bsv-sdk"
 version = "0.2.86"
+source = "git+https://github.com/b1narydt/bsv-rust-sdk?branch=main#28a189b1661bb9cb7eeee110b5f58ca622c84a74"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -672,7 +674,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1622,7 +1624,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2243,7 +2245,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2980,10 +2982,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

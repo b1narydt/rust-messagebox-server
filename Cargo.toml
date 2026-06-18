@@ -65,12 +65,15 @@ lto = true
 # Without this, cargo walks up to rust-mpc/Cargo.toml and refuses to build.
 [workspace]
 
-# FIXED build (BRC-103 concurrency fix, TDD green step). This server is the
-# build root, so its [patch] applies graph-wide — pulling in BOTH local fixes:
-#   - bsv-sdk: the Arc<Peer>-shareable, all-&self concurrency-safe SDK
-#     (fix/brc103-concurrent-sessions working tree).
+# BRC-103 concurrency fix, sourced from git so this builds in CI/Docker without
+# the local checkout. This server is the build root, so its [patch] applies
+# graph-wide — pulling in both fixes and unifying bsv-sdk to one copy:
+#   - bsv-sdk: Arc<Peer>-shareable, all-&self concurrency-safe SDK (0.2.86,
+#     merged to main).
 #   - bsv-auth-axum-middleware: lock-free verify/create, cert-gate TOCTOU fix,
-#     SessionNotFound -> 401. Itself path-patches bsv-sdk to the same local crate.
+#     SessionNotFound -> 401 (0.1.2, requires bsv-sdk 0.2.86).
+# TEMP until bsv-sdk 0.2.86 + bsv-auth-axum-middleware 0.1.2 publish to crates.io,
+# then switch these to plain version requirements and drop the [patch].
 [patch.crates-io]
-bsv-sdk = { path = "../../bsv-rust-sdk" }
-bsv-auth-axum-middleware = { path = "../bsv-auth-axum-middleware" }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main" }
+bsv-auth-axum-middleware = { git = "https://github.com/b1narydt/bsv-auth-axum-middleware", branch = "fix/concurrent-arc-peer" }
