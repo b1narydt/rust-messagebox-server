@@ -9,7 +9,7 @@ use bsv::wallet::interfaces::{
     InternalizeActionArgs, InternalizeOutput, Payment as SdkPayment, WalletInterface,
 };
 use serde_json::Value;
-use tracing::error;
+use tracing::{debug, error, warn};
 
 use crate::db::queries;
 use crate::firebase::send_fcm_notification::{send_fcm_notification, FcmPayload};
@@ -528,26 +528,64 @@ pub async fn send_message(
         ).await;
 
         // Persist-async: durable INSERT off the hot path (see crate::persist).
-        state.ws.persist_async(crate::persist::PersistJob {
-            message_id: msg_id.clone(),
-            recipient: fr.recipient.clone(),
-            message_box: box_type.clone(),
-            sender: sender_key.clone(),
-            body: body_bytes,
-        })
-        .await;
+        // This path builds a richer stored body ({"message", "payment"?}), so it
+        // uses `with_stored_body` — the body is persisted VERBATIM (no extra
+        // `{"message": ...}` wrap, which would double-wrap it).
+        let enqueued = state
+            .ws
+            .persist_async(crate::persist::PersistJob::with_stored_body(
+                msg_id.clone(),
+                fr.recipient.clone(),
+                box_type.clone(),
+                sender_key.clone(),
+                body_bytes,
+            ))
+            .await;
+
+        // Observe fast-path bypass / dead-letter so it isn't silent. `Queued`
+        // is the happy path; everything else means an inline write (DB
+        // backpressure) or a dead-letter to disk.
+        match enqueued {
+            crate::persist::Enqueued::Queued => {}
+            crate::persist::Enqueued::InlineOk => debug!(
+                msg_id = %msg_id, recipient = %fr.recipient,
+                "persist: fast path bypassed — persisted inline (DB backpressure), row durably written"
+            ),
+            crate::persist::Enqueued::InlineDeadLettered => warn!(
+                msg_id = %msg_id, recipient = %fr.recipient,
+                "persist: inline write exhausted transient retries — dead-lettered to disk; row NOT yet in MySQL"
+            ),
+            crate::persist::Enqueued::DeadLettered => error!(
+                msg_id = %msg_id, recipient = %fr.recipient,
+                "persist: inline write hit a permanent error — dead-lettered to disk; row NOT in MySQL"
+            ),
+        }
 
         // FCM notification for "notifications" box.
         if queries::should_use_fcm_delivery(&box_type) {
             let pool = state.db.clone();
             let recipient = fr.recipient.clone();
+            let msg_id_for_fcm = msg_id.clone();
             let payload = FcmPayload {
                 title: "New Message".to_string(),
                 message_id: msg_id.clone(),
                 originator: sender_key.clone(),
             };
+            // Fire-and-forget, but don't rely on a dropped JoinHandle to surface
+            // problems. `send_fcm_notification` logs its own per-device errors
+            // internally and returns a result summary; we inspect that summary so
+            // a total delivery failure is observable at this call site too (it is
+            // best-effort — message durability does not depend on FCM).
             tokio::spawn(async move {
-                send_fcm_notification(&pool, &recipient, payload).await;
+                let result = send_fcm_notification(&pool, &recipient, payload).await;
+                if !result.success {
+                    warn!(
+                        msg_id = %msg_id_for_fcm,
+                        recipient = %recipient,
+                        error = result.error.as_deref().unwrap_or("unknown"),
+                        "FCM notification not delivered (best-effort; live push + persistence are unaffected)"
+                    );
+                }
             });
         }
 

@@ -28,20 +28,17 @@ socketioxide = { version = "0.15", features = ["state"] }
 # BRC-31 auth middleware — crates.io release
 bsv-auth-axum-middleware = "0.1"
 
-# bsv-sdk — sole SDK for all auth and wallet operations. Requirement relaxed to
-# "0.2" so the local [patch.crates-io] path crate (bsv-sdk 0.2.82, the
-# concurrency-safe Arc<Peer> fix on fix/brc103-concurrent-sessions) SATISFIES it
-# and the patch actually applies. A "=0.2.85" pin would reject the 0.2.82 patch
-# (semver: patch crate must satisfy the dep req) and silently fall back to the
-# registry copy. bsv-auth-axum-middleware and bsv-wallet-toolbox both depend on
-# bsv-sdk ^0.2, so all three still resolve to the single local copy.
+# bsv-sdk — sole SDK for all auth and wallet operations. Requirement is "0.2";
+# the [patch.crates-io] block at the bottom of this file pins it to the
+# concurrency-safe Arc<Peer> build (bsv-sdk 0.2.86) sourced from git until that
+# version publishes to crates.io. bsv-auth-axum-middleware and bsv-wallet-toolbox
+# both depend on bsv-sdk ^0.2, so the patch unifies all three to one copy.
 bsv-sdk = { version = "0.2", features = ["network"] }
 
-# Bumped to 0.2.24 (latest 0.2.x). Older 0.2.16 was written against a pre-0.2.82
-# SDK where CertificateResult.keyring was a bare HashMap; 0.2.82 made it
-# Option<HashMap>, so 0.2.16 failed to compile against the local patched SDK.
-# 0.2.24 targets the newer SDK shape and still requires bsv-sdk "0.2" (satisfied
-# by the local 0.2.82 patch).
+# Bumped to 0.2.24 (latest 0.2.x). Older 0.2.16 predates the SDK's
+# CertificateResult.keyring change (bare HashMap -> Option<HashMap>) and fails to
+# compile against 0.2.86. 0.2.24 targets the newer shape and requires bsv-sdk
+# "0.2" (satisfied by the 0.2.86 patch below).
 bsv-wallet-toolbox = "0.2.24"
 
 getrandom = "0.4"
@@ -74,6 +71,8 @@ lto = true
 #     SessionNotFound -> 401 (0.1.2, requires bsv-sdk 0.2.86).
 # TEMP until bsv-sdk 0.2.86 + bsv-auth-axum-middleware 0.1.2 publish to crates.io,
 # then switch these to plain version requirements and drop the [patch].
+# Pinned to immutable revs (not branches) so a force-push / new commit can't
+# silently change this payment-adjacent build; bump the rev when the upstreams move.
 [patch.crates-io]
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", branch = "main" }
-bsv-auth-axum-middleware = { git = "https://github.com/b1narydt/bsv-auth-axum-middleware", branch = "fix/concurrent-arc-peer" }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "28a189b1661bb9cb7eeee110b5f58ca622c84a74" }
+bsv-auth-axum-middleware = { git = "https://github.com/b1narydt/bsv-auth-axum-middleware", rev = "4d2e56042898ac6db3c2ccdc72611b464727ee53" }

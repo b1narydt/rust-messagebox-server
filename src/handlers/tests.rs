@@ -734,3 +734,165 @@ async fn test_send_message_duplicate_same_recipient_is_idempotent() {
     assert_eq!(body["status"], "success");
 }
 
+// ===========================================================================
+// Async-persistence durability tests (push-live-first, persist-in-background)
+//
+// These exercise the wiring between the send paths and the background persist
+// worker against the real testcontainers MySQL — they prove the worker writes
+// EXACTLY ONE row per distinct messageId (dedup), never persists a rejected
+// send (gating-order invariant), and survives concurrent load without loss or
+// duplication. The worker's failure-mode units (transient/permanent/exhausted/
+// dead-letter) live in `crate::persist` and are not duplicated here.
+// ===========================================================================
+
+/// A duplicate messageId must result in EXACTLY ONE persisted row. The first
+/// send enqueues the INSERT; the second is caught by the unique-messageId
+/// `INSERT IGNORE` in the worker and is a no-op. We poll to 1, then poll again
+/// after a worker tick to confirm the duplicate never wrote a second row.
+#[tokio::test]
+async fn test_send_message_duplicate_writes_exactly_one_row() {
+    let app = setup_app().await;
+
+    // Send TO the authenticated lister (TEST_KEY) so listMessages sees the row.
+    let mid = "dup-exactly-one";
+    for _ in 0..2 {
+        let (status, body) = post_json(&app, "/sendMessage", json!({
+            "message": {
+                "recipient": TEST_KEY,
+                "messageBox": "inbox",
+                "messageId": mid,
+                "body": "duplicate body"
+            }
+        })).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "success");
+    }
+
+    // The worker commits at least one row.
+    let body = list_messages_until(&app, "inbox", 1).await;
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "first poll: exactly one row expected");
+    assert_eq!(messages[0]["messageId"], mid);
+
+    // Give the worker another tick to (not) commit the duplicate, then confirm
+    // there is still exactly one row — the INSERT IGNORE dedup held.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let (status, body) = post_json(&app, "/listMessages", json!({
+        "messageBox": "inbox"
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 1, "duplicate messageId must not write a second row");
+}
+
+/// Gating-order invariant: a blocked recipient (fee = -1) is rejected with 403
+/// BEFORE the push/persist loop runs, so NOTHING is persisted (or broadcast).
+/// `listMessages` for that recipient must be empty.
+///
+/// Auth is fixed to TEST_KEY, so we model recipient == sender == TEST_KEY and
+/// have TEST_KEY block TEST_KEY on `inbox`. That trips the same blocked-recipient
+/// 403 path, and TEST_KEY (the authenticated lister) can then verify its inbox
+/// stayed empty.
+#[tokio::test]
+async fn test_blocked_recipient_not_persisted_or_broadcast() {
+    let pool = fresh_pool().await;
+
+    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
+    let wallet = Arc::new(SdkProtoWallet::new(pk));
+    let funded_wallet = test_funded_wallet().await;
+    let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
+    io.ns("/", |_: socketioxide::extract::SocketRef| {});
+    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
+
+    let state = AppState {
+        db: pool.clone(),
+        config: Arc::new(test_config()),
+        wallet,
+        funded_wallet,
+        ws: ws_broadcast,
+    };
+    let app = Router::new()
+        .route("/sendMessage", post(crate::handlers::send_message::send_message))
+        .route("/listMessages", post(crate::handlers::list_messages::list_messages))
+        .layer(axum::middleware::from_fn(auth_middleware))
+        .with_state(state);
+
+    // TEST_KEY (recipient) blocks TEST_KEY (sender) on 'inbox' → fee -1.
+    queries::set_message_permission(&pool, TEST_KEY, Some(TEST_KEY), "inbox", -1)
+        .await
+        .unwrap();
+
+    let (status, body) = post_json(&app, "/sendMessage", json!({
+        "message": {
+            "recipient": TEST_KEY,
+            "messageBox": "inbox",
+            "messageId": "blocked-mid-1",
+            "body": "should never persist"
+        }
+    })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "ERR_DELIVERY_BLOCKED");
+
+    // A rejected send must NOT have persisted anything. Wait a worker tick to
+    // rule out a late async write, then assert the inbox is empty.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let (status, body) = post_json(&app, "/listMessages", json!({
+        "messageBox": "inbox"
+    })).await;
+    assert_eq!(status, StatusCode::OK);
+    let messages = body["messages"].as_array().unwrap();
+    assert!(
+        messages.is_empty(),
+        "blocked send must persist nothing, found: {messages:?}"
+    );
+}
+
+/// Concurrent load: fire N distinct-messageId sends in parallel and confirm the
+/// single-consumer worker commits EXACTLY N distinct rows (no loss, no dup).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_concurrent_sends_all_persist_exactly_once() {
+    const N: usize = 30;
+    let app = setup_app().await;
+
+    let mut handles = Vec::with_capacity(N);
+    for i in 0..N {
+        let app = app.clone();
+        handles.push(tokio::spawn(async move {
+            let mid = format!("concurrent-mid-{i}");
+            let (status, _) = post_json(&app, "/sendMessage", json!({
+                "message": {
+                    "recipient": TEST_KEY,
+                    "messageBox": "inbox",
+                    "messageId": mid,
+                    "body": format!("concurrent body {i}")
+                }
+            })).await;
+            assert_eq!(status, StatusCode::OK);
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    // All N must land. list_messages_until polls until the worker drains.
+    let body = list_messages_until(&app, "inbox", N).await;
+    let messages = body["messages"].as_array().unwrap();
+
+    let distinct: std::collections::HashSet<&str> = messages
+        .iter()
+        .filter_map(|m| m["messageId"].as_str())
+        .collect();
+    assert_eq!(
+        messages.len(),
+        N,
+        "expected exactly {N} rows (no loss/dup), got {}",
+        messages.len()
+    );
+    assert_eq!(
+        distinct.len(),
+        N,
+        "expected {N} distinct messageIds, got {}",
+        distinct.len()
+    );
+}
+

@@ -270,7 +270,7 @@ dependencies = [
 [[package]]
 name = "bsv-auth-axum-middleware"
 version = "0.1.2"
-source = "git+https://github.com/b1narydt/bsv-auth-axum-middleware?branch=fix%2Fconcurrent-arc-peer#4d2e56042898ac6db3c2ccdc72611b464727ee53"
+source = "git+https://github.com/b1narydt/bsv-auth-axum-middleware?rev=4d2e56042898ac6db3c2ccdc72611b464727ee53#4d2e56042898ac6db3c2ccdc72611b464727ee53"
 dependencies = [
  "async-trait",
  "axum",
@@ -293,7 +293,7 @@ dependencies = [
 [[package]]
 name = "bsv-sdk"
 version = "0.2.86"
-source = "git+https://github.com/b1narydt/bsv-rust-sdk?branch=main#28a189b1661bb9cb7eeee110b5f58ca622c84a74"
+source = "git+https://github.com/b1narydt/bsv-rust-sdk?rev=28a189b1661bb9cb7eeee110b5f58ca622c84a74#28a189b1661bb9cb7eeee110b5f58ca622c84a74"
 dependencies = [
  "async-trait",
  "futures-util",

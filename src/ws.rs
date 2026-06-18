@@ -25,7 +25,7 @@ use serde::Serialize;
 use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use bsv::auth::peer::Peer;
 use bsv::auth::transports::Transport;
@@ -163,8 +163,12 @@ impl WsBroadcast {
     /// Enqueue a message for asynchronous, durable persistence (off the hot
     /// path). The caller MUST have already performed all gating checks
     /// (auth/recipient/fee/permission/payment) and the live broadcast.
-    pub async fn persist_async(&self, job: crate::persist::PersistJob) {
-        self.persist.enqueue(job).await;
+    ///
+    /// Returns the [`Enqueued`] outcome from the worker so callers can observe
+    /// when the fast (queued) path was bypassed for an inline write or the job
+    /// was dead-lettered. Never silently drops.
+    pub async fn persist_async(&self, job: crate::persist::PersistJob) -> crate::persist::Enqueued {
+        self.persist.enqueue(job).await
     }
 
     /// Get or create the `SocketPeer` for a socket and return a handle to it.
@@ -309,10 +313,17 @@ impl WsBroadcast {
             }
         };
         match serde_json::to_value(&signed) {
-            Ok(json) => {
-                socket.emit("authMessage", &json).ok();
-                true
-            }
+            Ok(json) => match socket.emit("authMessage", &json) {
+                Ok(()) => true,
+                Err(e) => {
+                    // A failed emit means this signed server→client event (e.g. a
+                    // sendMessageAck) never reached the client. Surface it rather
+                    // than reporting success to the caller.
+                    warn!(sid = %sid, event = %event_name, error = %e,
+                        "emit_signed: emit failed — signed event not delivered to client");
+                    false
+                }
+            },
             Err(e) => {
                 warn!(sid = %sid, event = %event_name, error = %e, "emit_signed: serialize failed");
                 false
@@ -370,15 +381,18 @@ impl WsBroadcast {
             // non-mutating `create_general_message`, which REQUIRES an existing
             // authenticated session and never initiates a handshake — so a
             // broadcast can only ever reach an already-authenticated socket.
-            // The common skip is "socket not authenticated yet" (benign); a
-            // sign failure on an authenticated session is a real defect, so this
-            // is logged loudly enough to notice via the zero-delivered warn below.
+            //
+            // We are PAST the `get_identity` guard above, so this socket has a
+            // verified identity recorded: a sign failure here is NOT the benign
+            // "not yet authenticated" case — it is a real defect (the session
+            // exists but signing failed), so log it at `warn` with the error.
             let signed = {
                 let peer = socket_peer.peer.lock().await;
                 match peer.create_general_message(&identity, payload.clone()).await {
                     Ok(m) => m,
                     Err(e) => {
-                        debug!(sid = %sid, error = %e, "broadcast: could not sign for socket (likely not yet authenticated), skipping");
+                        warn!(sid = %sid, room = %room_id, error = %e,
+                            "broadcast: sign failed for an authenticated session — recipient misses this live push and falls back to the HTTP poll");
                         continue;
                     }
                 }
@@ -579,6 +593,33 @@ fn now_iso8601() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
+/// Log the persist outcome so a fast-path bypass (and any dead-letter) is
+/// observable. `Queued` is the silent happy path; everything else means the
+/// caller paid DB latency inline or the job was dead-lettered to disk.
+fn log_persist_outcome(
+    sid: &str,
+    message_id: &str,
+    recipient: &str,
+    outcome: crate::persist::Enqueued,
+) {
+    use crate::persist::Enqueued;
+    match outcome {
+        Enqueued::Queued => {}
+        Enqueued::InlineOk => debug!(
+            sid = %sid, msg_id = %message_id, recipient = %recipient,
+            "persist: fast path bypassed — persisted inline (DB backpressure), row durably written"
+        ),
+        Enqueued::InlineDeadLettered => warn!(
+            sid = %sid, msg_id = %message_id, recipient = %recipient,
+            "persist: inline write exhausted transient retries — dead-lettered to disk; row NOT yet in MySQL"
+        ),
+        Enqueued::DeadLettered => error!(
+            sid = %sid, msg_id = %message_id, recipient = %recipient,
+            "persist: inline write hit a permanent error — dead-lettered to disk; row NOT in MySQL"
+        ),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // BRC-103 general message helpers
 // ---------------------------------------------------------------------------
@@ -673,7 +714,15 @@ async fn handle_general_event(
                 }
             }
 
-            socket.join(room_id_str.clone()).ok();
+            // A swallowed join error would leave the recipient silently absent
+            // from the socketioxide room → they never receive live pushes. Log
+            // it; we still record local membership so broadcast_to_room can fan
+            // out via our own `rooms` registry, but a failed join is a real
+            // degradation worth surfacing.
+            if let Err(e) = socket.join(room_id_str.clone()) {
+                warn!(sid = %sid, room = %room_id_str, error = %e,
+                    "BRC-103 joinRoom: socket.join failed — recipient may miss live pushes");
+            }
             ws.add_room_member(&room_id_str, sid);
             debug!(sid = %sid, room = %room_id_str, "BRC-103 joinRoom: joined room");
             ws.emit_signed(socket, sid, "joinedRoom", serde_json::json!({ "roomId": room_id_str }))
@@ -820,14 +869,21 @@ async fn handle_ws_send_message(
     // HTTP fallback (listMessages) used by offline recipients and re-polling
     // recipients. A duplicate messageId is caught by the unique constraint at
     // persist time and treated as idempotent success (see crate::persist).
-    ws.persist_async(crate::persist::PersistJob {
-        message_id: message_id.clone(),
-        recipient: recipient.clone(),
-        message_box: message_box.clone(),
-        sender: sender.clone(),
-        body: stored_body,
-    })
-    .await;
+    //
+    // `PersistJob::new` performs the canonical `{"message": <body>}` wrap from
+    // the RAW body (it owns the wrap), so we pass `body`, not the pre-wrapped
+    // `stored_body` used for the live broadcast above.
+    let enqueued = ws
+        .persist_async(crate::persist::PersistJob::new(
+            message_id.clone(),
+            recipient.clone(),
+            message_box.clone(),
+            sender.clone(),
+            body,
+        ))
+        .await;
+
+    log_persist_outcome(sid, &message_id, &recipient, enqueued);
 
     debug!(
         sid = %sid,
@@ -839,9 +895,12 @@ async fn handle_ws_send_message(
 
     // Emit a signed ack to the sender socket. The ack now means "accepted for
     // delivery" (pushed live + durably enqueued), not "committed to MySQL".
-    // Persistence is guaranteed by the worker; the client treats a later
-    // duplicate as idempotent success. Payload shape matches the reference
-    // message-box-server: { status, messageId }.
+    // Persistence is handled by the worker: bounded retry + inline fallback
+    // under backpressure; permanent or retry-exhausted failures are dead-lettered
+    // to disk and logged at ERROR, not silently dropped (recovery is via the
+    // dead-letter file). The client treats a later duplicate as idempotent
+    // success. Payload shape matches the reference message-box-server:
+    // { status, messageId }.
     ws.emit_signed(
         socket,
         sid,
