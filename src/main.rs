@@ -104,7 +104,7 @@ async fn main() {
     let wallet_args = WalletArgs {
         chain,
         key_deriver: key_deriver.clone(),
-        storage: storage_manager,
+        storage: Arc::new(storage_manager),
         services: Some(services),
         monitor: None,
         privileged_key_manager: None,
@@ -154,17 +154,17 @@ async fn main() {
     ws::setup_handlers(&io, ws_broadcast.clone());
     tracing::info!("Socket.IO WebSocket server ready");
 
-    // Set up BRC-31 auth middleware (bsv-sdk Peer — compatible signatures)
+    // Set up BRC-31 auth middleware (bsv-sdk Peer — concurrency-safe API).
     //
-    // The bsv-sdk ProtoWallet doesn't implement Clone, but Peer<W> requires
-    // W: Clone. Wrap in Arc for shared ownership (same pattern as cosigner).
+    // BRC-103 fix: Peer is now fully interior-mutable (Arc<Peer>, every method
+    // &self). No outer Mutex — concurrent requests on one session no longer
+    // serialize on a per-Peer lock. AuthLayer::from_config takes Arc<Peer>.
     let transport = Arc::new(ActixTransport::new());
     let auth_wallet = {
         let pk = PrivateKey::from_hex(&config.server_private_key).unwrap();
         cloneable_wallet::CloneableProtoWallet(Arc::new(SdkProtoWallet::new(pk)))
     };
-    let peer = Peer::new(auth_wallet.clone(), transport.clone());
-    let peer = Arc::new(tokio::sync::Mutex::new(peer));
+    let peer = Arc::new(Peer::new(auth_wallet.clone(), transport.clone()));
 
     let auth_config = bsv_auth_axum_middleware::AuthMiddlewareConfigBuilder::new()
         .wallet(auth_wallet.clone())
