@@ -41,6 +41,69 @@ async fn test_get_message_box_id_found() {
 }
 
 // ---------------------------------------------------------------------------
+// messageBox existence cache
+// ---------------------------------------------------------------------------
+
+/// Cache HIT: the second `ensure_message_box` for the same (key, box) must
+/// return the same id and stay consistent with the durable row.
+///
+/// Isolation: `fresh_pool()` bumps the cache generation (which is enabled, i.e.
+/// non-zero, by the bump itself), so each test sees only its own DB's entries.
+#[tokio::test]
+async fn test_ensure_message_box_cache_hit_returns_same_id() {
+    let pool = fresh_pool().await;
+
+    let box_name = "cache_hit_box";
+    let id1 = ensure_message_box(&pool, TEST_KEY, box_name).await.unwrap();
+    // Second call: should be served from cache and equal id1.
+    let id2 = ensure_message_box(&pool, TEST_KEY, box_name).await.unwrap();
+    assert_eq!(id1, id2, "cache hit must return the same messageBoxId");
+
+    // The DB row still exists and resolves to the same id (cache is consistent
+    // with the durable store).
+    let from_db = get_message_box_id(&pool, TEST_KEY, box_name)
+        .await
+        .unwrap();
+    assert_eq!(from_db, Some(id1), "cached id must match the durable row");
+}
+
+/// Cache MISS isolation: distinct (key, box) tuples are cached independently —
+/// a hit on one room must not return another room's id.
+#[tokio::test]
+async fn test_ensure_message_box_cache_distinct_rooms() {
+    let pool = fresh_pool().await;
+
+    let id_a = ensure_message_box(&pool, TEST_KEY, "room_a").await.unwrap();
+    let id_b = ensure_message_box(&pool, TEST_KEY, "room_b").await.unwrap();
+    let id_a2 = ensure_message_box(&pool, TEST_KEY, "room_a").await.unwrap();
+    let id_b2 = ensure_message_box(&pool, TEST_KEY, "room_b").await.unwrap();
+
+    assert_ne!(id_a, id_b, "distinct boxes must have distinct ids");
+    assert_eq!(id_a, id_a2, "room_a cache hit must be stable");
+    assert_eq!(id_b, id_b2, "room_b cache hit must be stable");
+
+    // Different identity key, same box name → independent room.
+    let id_other = ensure_message_box(&pool, TEST_KEY2, "room_a").await.unwrap();
+    assert_ne!(id_a, id_other, "same box name under a different key is a different room");
+}
+
+/// Invalidation hook: after `invalidate_message_box_cache`, the next call
+/// re-resolves from the DB and (since the row is unchanged) returns the same id.
+/// This is the safety valve required IF a messageBox-delete path is ever added.
+#[tokio::test]
+async fn test_ensure_message_box_cache_invalidation_reresolves() {
+    use crate::db::queries::invalidate_message_box_cache;
+    let pool = fresh_pool().await;
+
+    let box_name = "invalidate_box";
+    let id1 = ensure_message_box(&pool, TEST_KEY, box_name).await.unwrap();
+    invalidate_message_box_cache(TEST_KEY, box_name);
+    // Re-resolves via the DB; row is unchanged so the id is identical.
+    let id2 = ensure_message_box(&pool, TEST_KEY, box_name).await.unwrap();
+    assert_eq!(id1, id2, "re-resolve after invalidation must match the durable id");
+}
+
+// ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------
 

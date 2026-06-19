@@ -79,5 +79,14 @@ pub async fn fresh_pool() -> MySqlPool {
     // which is fine — the already-seeded values are identical.
     let _ = db::queries::init_delivery_fee_cache(&pool).await;
 
+    // Each fresh per-test database bumps the messageBox-cache generation. The
+    // existence cache embeds the generation in its key, so a cached id from a
+    // PRIOR test's DB (these tests reuse the same identity-key constants) can
+    // never match a lookup in THIS test's DB — it lives under an older
+    // generation. The only effect of a concurrent bump from a sibling test is a
+    // benign cache MISS (fall through to the DB), never a wrong id. In production
+    // the generation is bumped exactly once, at startup.
+    db::queries::bump_message_box_cache_generation();
+
     pool
 }

@@ -1,12 +1,90 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use parking_lot::RwLock;
 use sqlx::{QueryBuilder, Row};
 
 use super::DbPool;
 
 static DELIVERY_FEE_CACHE: OnceLock<HashMap<String, i64>> = OnceLock::new();
+
+/// Cache generation. The existence cache key embeds this counter so that a bump
+/// logically invalidates EVERY cached entry at once (old-generation keys can
+/// never match a current-generation lookup) without touching the map.
+///
+/// In production this is bumped exactly once, at startup, by
+/// [`enable_message_box_cache`] (so the cache is live for the process lifetime
+/// over one database). The test suite reuses the same identity-key constants
+/// across many ephemeral per-test databases; each fresh DB bumps the generation
+/// (see `test_support::fresh_pool`) so a cached id from one test's DB can never
+/// leak into another's. Generation 0 means "cache disabled" (the default before
+/// startup enables it), so a not-yet-enabled process always hits the DB.
+static MESSAGE_BOX_CACHE_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Enable the messageBox existence cache (bumps the generation off 0). Call once
+/// during server startup. Idempotent in effect — repeated calls just advance the
+/// generation, which only discards cache entries (always safe).
+pub fn enable_message_box_cache() {
+    MESSAGE_BOX_CACHE_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+/// Bump the cache generation, logically invalidating all current entries. Used
+/// by tests to isolate per-DB cache state.
+#[cfg(test)]
+pub fn bump_message_box_cache_generation() {
+    MESSAGE_BOX_CACHE_GEN.fetch_add(1, Ordering::SeqCst);
+}
+
+#[inline]
+fn message_box_cache_gen() -> u64 {
+    MESSAGE_BOX_CACHE_GEN.load(Ordering::SeqCst)
+}
+
+/// Existence cache for `messageBox` rooms: `(identityKey, type) -> messageBoxId`.
+///
+/// `ensure_message_box` is called on EVERY send (HTTP path per recipient, and
+/// the async persist worker per message). Without this cache it costs two DB
+/// round-trips per call (INSERT IGNORE + SELECT id) just to re-create/re-resolve
+/// a room that almost always already exists — the dominant avoidable per-message
+/// pool checkout under concurrent load.
+///
+/// **Correctness — why a create-on-first-sight cache cannot go stale:**
+/// messageBox rooms are CREATE-ONLY in this codebase. There is no DELETE / DROP
+/// of `messageBox` rows anywhere in the server (verified by grep over `src/`).
+/// Acknowledging a message deletes rows from `messages`, never from `messageBox`.
+/// So once a `(identityKey, type)` room exists and is resolved to an id, that id
+/// is immutable for the process lifetime — a cached hit is always valid. If a
+/// DELETE path is ever added, it MUST call [`invalidate_message_box_cache`].
+///
+/// **Bounding:** keyed by `(identityKey, messageBox)`. Identity keys are
+/// attacker-suppliable, so the map could grow with distinct peers. We bound it
+/// at [`MESSAGE_BOX_CACHE_MAX`] entries; on overflow we stop inserting (the cache
+/// degrades to "always miss → DB", i.e. exactly the pre-cache behaviour) rather
+/// than evicting, which keeps every cached id provably valid (no risk of evicting
+/// then re-inserting a different id, since ids are immutable anyway). The miss
+/// path is still fully correct on its own.
+type MessageBoxCacheKey = (u64, String, String); // (generation, identityKey, type)
+static MESSAGE_BOX_CACHE: OnceLock<RwLock<HashMap<MessageBoxCacheKey, i64>>> = OnceLock::new();
+
+/// Cap on cached rooms. ~64 bytes/key amortized → a few MB at the cap. Tunable.
+const MESSAGE_BOX_CACHE_MAX: usize = 100_000;
+
+fn message_box_cache() -> &'static RwLock<HashMap<MessageBoxCacheKey, i64>> {
+    MESSAGE_BOX_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Test/operability hook: drop a cached room so the next `ensure_message_box`
+/// re-resolves it from the DB. Required ONLY if a messageBox-delete path is ever
+/// introduced; rooms are create-only today so this is currently unused in prod.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn invalidate_message_box_cache(identity_key: &str, box_type: &str) {
+    let gen = message_box_cache_gen();
+    message_box_cache()
+        .write()
+        .remove(&(gen, identity_key.to_string(), box_type.to_string()));
+}
 
 /// Upsert a `server_fees` row. Creates the row if it does not exist; overwrites
 /// `delivery_fee` if it does. Must be called before `init_delivery_fee_cache`
@@ -88,6 +166,25 @@ pub async fn ensure_message_box(
     identity_key: &str,
     box_type: &str,
 ) -> Result<i64, sqlx::Error> {
+    // Generation 0 == cache disabled (startup has not enabled it). A non-zero
+    // generation is baked into the key so a generation bump logically discards
+    // every prior entry (used by tests for per-DB isolation; bumped once in prod).
+    let gen = message_box_cache_gen();
+    let cache_on = gen != 0;
+    let key: MessageBoxCacheKey = (gen, identity_key.to_string(), box_type.to_string());
+
+    // ── Fast path: in-memory hit, zero DB round-trips ─────────────────────
+    // Rooms are create-only (see MESSAGE_BOX_CACHE doc), so a cached id is
+    // always valid. This is the dominant win on the hot send path.
+    if cache_on {
+        if let Some(id) = message_box_cache().read().get(&key).copied() {
+            crate::bench_metrics::record_messagebox_cache(true);
+            return Ok(id);
+        }
+        crate::bench_metrics::record_messagebox_cache(false);
+    }
+
+    // ── Slow path: first sight of this room — create + resolve in the DB ───
     sqlx::query("INSERT IGNORE INTO messageBox (type, identityKey) VALUES (?, ?)")
         .bind(box_type)
         .bind(identity_key)
@@ -101,6 +198,17 @@ pub async fn ensure_message_box(
     .bind(identity_key)
     .fetch_one(pool)
     .await?;
+
+    // Populate the cache. Bounded: stop inserting past the cap (degrades to the
+    // pre-cache always-miss behaviour rather than evicting). The id is immutable,
+    // so a concurrent racer that resolved the same room writes the same value.
+    if cache_on {
+        let mut w = message_box_cache().write();
+        if w.len() < MESSAGE_BOX_CACHE_MAX || w.contains_key(&key) {
+            w.insert(key, id);
+        }
+    }
+
     Ok(id)
 }
 

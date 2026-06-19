@@ -67,6 +67,11 @@ async fn main() {
         .await
         .expect("Failed to prime delivery-fee cache");
 
+    // Turn on the messageBox existence cache (create-on-first-sight). Rooms are
+    // create-only, so a cached id never goes stale; this removes the dominant
+    // per-message DB round-trip on the send hot path under concurrent load.
+    db::queries::enable_message_box_cache();
+
     firebase::initialize(
         config.firebase_project_id.as_deref(),
         config.firebase_service_account_json.as_deref(),
