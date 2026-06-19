@@ -86,15 +86,21 @@ impl Config {
             "mysql://root:root@127.0.0.1:3306/messagebox".to_string()
         };
 
-        // Default 50 (was 10): under concurrent-session load the old default of 10
-        // was the measured throughput cliff — 100+ WS clients polling listMessages
-        // + sending starved the 10-slot sqlx pool and acquires timed out, collapsing
-        // delivery from 100% to ~15%. MySQL allows 151 by default, so 50 is safe
-        // headroom; raise further via DB_MAX_CONNECTIONS for high concurrency.
+        // Default 150 (was 50, originally 10): under concurrent-session load the
+        // sqlx pool is the throughput cliff — at N>=100 WS clients each send path
+        // checks out a connection for the per-message DB round-trips, and acquires
+        // time out, collapsing delivery (measured 100%->38% at N=200 with a 50-slot
+        // pool). The messageBox existence cache removes the dominant per-message
+        // round-trips, but pool headroom is still the second lever: a bench proved
+        // MySQL itself handled 348 concurrent connections fine, so the 151-default
+        // MySQL cap — not Rust — is the real ceiling. 150 sits just under that cap
+        // and gives N=100..200 enough slots that no acquire blocks. For >150
+        // concurrent senders, raise BOTH this AND MySQL `max_connections`
+        // (e.g. DB_MAX_CONNECTIONS=300 + `SET GLOBAL max_connections=400`).
         let db_max_connections = env::var("DB_MAX_CONNECTIONS")
             .ok()
             .and_then(|v| v.parse::<u32>().ok())
-            .unwrap_or(50);
+            .unwrap_or(150);
         let bsv_network = env::var("BSV_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
 
         let enable_websockets = env::var("ENABLE_WEBSOCKETS")
