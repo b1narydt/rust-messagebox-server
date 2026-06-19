@@ -74,5 +74,5 @@ lto = true
 # Pinned to immutable revs (not branches) so a force-push / new commit can't
 # silently change this payment-adjacent build; bump the rev when the upstreams move.
 [patch.crates-io]
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "28a189b1661bb9cb7eeee110b5f58ca622c84a74" }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk", rev = "d1ea827cc51a4cf8e1e2948b88b8eec850d5cab8" }
 bsv-auth-axum-middleware = { git = "https://github.com/b1narydt/bsv-auth-axum-middleware", rev = "4d2e56042898ac6db3c2ccdc72611b464727ee53" }
