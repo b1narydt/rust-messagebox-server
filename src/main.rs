@@ -21,7 +21,7 @@ use bsv_wallet_toolbox::types::Chain;
 use bsv_wallet_toolbox::wallet::wallet::Wallet;
 use bsv_wallet_toolbox::wallet::types::WalletArgs;
 
-use messagebox_server::{cloneable_wallet, config, db, firebase, handlers, logger, ws};
+use messagebox_server::{bench_metrics, cloneable_wallet, config, db, firebase, handlers, logger, ws};
 
 #[tokio::main]
 async fn main() {
@@ -30,6 +30,9 @@ async fn main() {
     let config = config::Config::load().expect("Failed to load config");
 
     logger::init(config.is_development());
+
+    // BENCH-ONLY: arm per-message send-path timing if MB_BENCH_METRICS=1.
+    bench_metrics::init();
 
     // Emit any MESSAGEBOX_FEES parse warnings now that the logger is up.
     for warning in &config.message_box_fees_warnings {
@@ -215,6 +218,12 @@ async fn main() {
                 "BSV MessageBox Server",
             )
         }),
+    )
+    // BENCH-ONLY: unauthenticated per-message timing snapshot. Returns zeros
+    // unless MB_BENCH_METRICS=1. Remove with the rest of the bench_metrics scaffold.
+    .route(
+        "/__bench_metrics",
+        get(|| async { axum::Json(messagebox_server::bench_metrics::snapshot()) }),
     );
 
     // Protected API routes — BRC-31 auth via bsv-sdk Peer middleware

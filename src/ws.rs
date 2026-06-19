@@ -503,10 +503,15 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                     // general-message sender below).
                     {
                         let peer = socket_peer.peer.lock().await;
+                        // BENCH-ONLY: time the BRC-103 verify stage (process_pending
+                        // runs signature/nonce/session verification). No-op unless
+                        // MB_BENCH_METRICS=1.
+                        let _verify_t0 = std::time::Instant::now();
                         if let Err(e) = peer.process_pending().await {
                             warn!(sid = %sid, error = %e, "Peer process_pending failed (verification did not complete; identity NOT trusted)");
                             // Don't return — there might still be outgoing/general messages
                         }
+                        crate::bench_metrics::record_verify(_verify_t0.elapsed().as_nanos() as u64);
                     }
 
                     // Drain all outgoing messages and emit as authMessage events
@@ -847,6 +852,8 @@ async fn handle_ws_send_message(
     // DB. Durability is preserved by the async persist below.
     let now = now_iso8601();
     let event = format!("sendMessage-{room_id_str}");
+    // BENCH-ONLY: time the route/broadcast stage. No-op unless MB_BENCH_METRICS=1.
+    let _route_t0 = std::time::Instant::now();
     ws.broadcast_to_room(
         &room_id_str,
         &event,
@@ -860,6 +867,7 @@ async fn handle_ws_send_message(
             updated_at: now,
         },
     ).await;
+    crate::bench_metrics::record_route(_route_t0.elapsed().as_nanos() as u64);
 
     // ── PERSIST-ASYNC ─────────────────────────────────────────────────
     //
@@ -873,6 +881,8 @@ async fn handle_ws_send_message(
     // `PersistJob::new` performs the canonical `{"message": <body>}` wrap from
     // the RAW body (it owns the wrap), so we pass `body`, not the pre-wrapped
     // `stored_body` used for the live broadcast above.
+    // BENCH-ONLY: time the persist-enqueue stage. No-op unless MB_BENCH_METRICS=1.
+    let _persist_t0 = std::time::Instant::now();
     let enqueued = ws
         .persist_async(crate::persist::PersistJob::new(
             message_id.clone(),
@@ -882,6 +892,7 @@ async fn handle_ws_send_message(
             body,
         ))
         .await;
+    crate::bench_metrics::record_persist(_persist_t0.elapsed().as_nanos() as u64);
 
     log_persist_outcome(sid, &message_id, &recipient, enqueued);
 
