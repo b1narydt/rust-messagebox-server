@@ -244,8 +244,8 @@ fn build_rs256_jwt(claims: &JwtClaims, pem_key: &str) -> Result<String, String> 
     let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
 
     // -- payload
-    let payload =
-        serde_json::to_string(claims).map_err(|e| format!("failed to serialise JWT claims: {e}"))?;
+    let payload = serde_json::to_string(claims)
+        .map_err(|e| format!("failed to serialise JWT claims: {e}"))?;
     let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
 
     let signing_input = format!("{header_b64}.{payload_b64}");

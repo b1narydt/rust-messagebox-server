@@ -1,17 +1,10 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde_json::Value;
 use tracing::error;
 
 use crate::db::queries;
 use crate::handlers::helpers::{error_response, AppState, AuthIdentity};
-use crate::handlers::response_types::{
-    DeviceOut, ListDevicesResponse, RegisterDeviceResponse,
-};
+use crate::handlers::response_types::{DeviceOut, ListDevicesResponse, RegisterDeviceResponse};
 
 /// POST /registerDevice
 pub async fn register_device(
@@ -91,10 +84,7 @@ pub async fn register_device(
 }
 
 /// GET /devices
-pub async fn list_devices(
-    State(state): State<AppState>,
-    auth: AuthIdentity,
-) -> impl IntoResponse {
+pub async fn list_devices(State(state): State<AppState>, auth: AuthIdentity) -> impl IntoResponse {
     let identity_key = auth.0;
 
     let devices = match queries::list_devices(&state.db, &identity_key).await {

@@ -51,17 +51,17 @@ pub async fn send_fcm_notification(
     };
 
     if devices.is_empty() {
-        tracing::debug!("No active devices found for recipient {}", truncate_key(recipient));
+        tracing::debug!(
+            "No active devices found for recipient {}",
+            truncate_key(recipient)
+        );
         return SendFcmNotificationResult {
             success: false,
             error: Some("no active devices for recipient".to_owned()),
         };
     }
 
-    let url = format!(
-        "https://fcm.googleapis.com/v1/projects/{}/messages:send",
-        project_id
-    );
+    let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
 
     // Spawn one task per device, collect join handles.
     let mut handles = Vec::with_capacity(devices.len());
@@ -101,7 +101,8 @@ pub async fn send_fcm_notification(
             let status = resp.status();
             if status.is_success() {
                 tracing::debug!("FCM sent successfully to device ...{}", token_tail);
-                if let Err(e) = crate::db::queries::update_device_last_used(&pool, device.id).await {
+                if let Err(e) = crate::db::queries::update_device_last_used(&pool, device.id).await
+                {
                     tracing::warn!("Failed to update last_used for device {}: {e}", device.id);
                 }
                 return true;
@@ -158,11 +159,7 @@ pub async fn send_fcm_notification(
 }
 
 /// Build the FCM v1 API request body with platform-specific overrides.
-fn build_fcm_body(
-    token: &str,
-    payload: &FcmPayload,
-    platform: Option<&str>,
-) -> serde_json::Value {
+fn build_fcm_body(token: &str, payload: &FcmPayload, platform: Option<&str>) -> serde_json::Value {
     let body_text = format!("New message: {}", payload.message_id);
 
     let message = json!({

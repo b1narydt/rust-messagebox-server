@@ -168,10 +168,7 @@ pub async fn get_permission(
     };
 
     // ── Parse optional sender ─────────────────────────────────────────
-    let sender = params
-        .get("sender")
-        .filter(|s| !s.is_empty())
-        .cloned();
+    let sender = params.get("sender").filter(|s| !s.is_empty()).cloned();
 
     if let Some(ref s) = sender {
         if !is_valid_pub_key(s) {
@@ -185,25 +182,21 @@ pub async fn get_permission(
     }
 
     // ── Query permission ──────────────────────────────────────────────
-    let perm = match queries::get_permission(
-        &state.db,
-        &identity_key,
-        sender.as_deref(),
-        &message_box,
-    )
-    .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            error!("failed to get permission: {e}");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ERR_INTERNAL_ERROR",
-                "An internal error has occurred.",
-            )
-            .into_response();
-        }
-    };
+    let perm =
+        match queries::get_permission(&state.db, &identity_key, sender.as_deref(), &message_box)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                error!("failed to get permission: {e}");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ERR_INTERNAL_ERROR",
+                    "An internal error has occurred.",
+                )
+                .into_response();
+            }
+        };
 
     match perm {
         Some(p) => {
@@ -220,7 +213,7 @@ pub async fn get_permission(
                     message_box
                 )
             } else {
-                format!("Box-wide permission setting found for {}.", message_box)
+                format!("Box-wide permission setting found for {message_box}.")
             };
 
             (
@@ -248,7 +241,7 @@ pub async fn get_permission(
                     message_box
                 )
             } else {
-                format!("No box-wide permission setting found for {}.", message_box)
+                format!("No box-wide permission setting found for {message_box}.")
             };
 
             (
@@ -275,10 +268,7 @@ pub async fn list_permissions(
 ) -> impl IntoResponse {
     let identity_key = auth.0;
 
-    let message_box = params
-        .get("messageBox")
-        .filter(|s| !s.is_empty())
-        .cloned();
+    let message_box = params.get("messageBox").filter(|s| !s.is_empty()).cloned();
 
     // ── Parse limit ───────────────────────────────────────────────────
     let limit: i64 = match params.get("limit") {
@@ -441,25 +431,21 @@ pub async fn get_quote(
 
     // ── Single recipient: legacy response shape ───────────────────────
     if recipients.len() == 1 {
-        let recipient_fee = match queries::get_recipient_fee(
-            &state.db,
-            &recipients[0],
-            &sender_key,
-            &message_box,
-        )
-        .await
-        {
-            Ok(f) => f,
-            Err(e) => {
-                error!("failed to get recipient fee: {e}");
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "ERR_INTERNAL_ERROR",
-                    "An internal error has occurred.",
-                )
-                .into_response();
-            }
-        };
+        let recipient_fee =
+            match queries::get_recipient_fee(&state.db, &recipients[0], &sender_key, &message_box)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("failed to get recipient fee: {e}");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ERR_INTERNAL_ERROR",
+                        "An internal error has occurred.",
+                    )
+                    .into_response();
+                }
+            };
 
         return (
             StatusCode::OK,

@@ -199,10 +199,7 @@ pub async fn acknowledge_messages(
 // Fees & permissions
 // ---------------------------------------------------------------------------
 
-pub async fn get_server_delivery_fee(
-    pool: &DbPool,
-    message_box: &str,
-) -> Result<i64, sqlx::Error> {
+pub async fn get_server_delivery_fee(pool: &DbPool, message_box: &str) -> Result<i64, sqlx::Error> {
     if let Some(cache) = DELIVERY_FEE_CACHE.get() {
         return Ok(cache.get(message_box).copied().unwrap_or(0));
     }
@@ -396,21 +393,22 @@ pub async fn list_permissions(
     };
 
     // Total count
-    let total_count: i64 = match message_box {
-        Some(mb) => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM message_permissions WHERE recipient = ? AND message_box = ?",
-        )
-        .bind(recipient)
-        .bind(mb)
-        .fetch_one(pool)
-        .await?,
-        None => sqlx::query_scalar(
-            "SELECT COUNT(*) FROM message_permissions WHERE recipient = ?",
-        )
-        .bind(recipient)
-        .fetch_one(pool)
-        .await?,
-    };
+    let total_count: i64 =
+        match message_box {
+            Some(mb) => sqlx::query_scalar(
+                "SELECT COUNT(*) FROM message_permissions WHERE recipient = ? AND message_box = ?",
+            )
+            .bind(recipient)
+            .bind(mb)
+            .fetch_one(pool)
+            .await?,
+            None => {
+                sqlx::query_scalar("SELECT COUNT(*) FROM message_permissions WHERE recipient = ?")
+                    .bind(recipient)
+                    .fetch_one(pool)
+                    .await?
+            }
+        };
 
     // Rows. Order: box asc, NULL-sender first, then sender asc, then created_at by order_dir.
     let select_sql = match message_box {
@@ -437,19 +435,23 @@ pub async fn list_permissions(
     };
 
     let rows = match message_box {
-        Some(mb) => sqlx::query(&select_sql)
-            .bind(recipient)
-            .bind(mb)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?,
-        None => sqlx::query(&select_sql)
-            .bind(recipient)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(pool)
-            .await?,
+        Some(mb) => {
+            sqlx::query(&select_sql)
+                .bind(recipient)
+                .bind(mb)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?
+        }
+        None => {
+            sqlx::query(&select_sql)
+                .bind(recipient)
+                .bind(limit)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?
+        }
     };
 
     let mut out = Vec::with_capacity(rows.len());
@@ -504,11 +506,12 @@ pub async fn register_device(
     if id > 0 {
         return Ok(id);
     }
-    let found: i64 =
-        sqlx::query_scalar("SELECT CAST(id AS SIGNED) FROM device_registrations WHERE fcm_token = ?")
-            .bind(fcm_token)
-            .fetch_one(pool)
-            .await?;
+    let found: i64 = sqlx::query_scalar(
+        "SELECT CAST(id AS SIGNED) FROM device_registrations WHERE fcm_token = ?",
+    )
+    .bind(fcm_token)
+    .fetch_one(pool)
+    .await?;
     Ok(found)
 }
 
