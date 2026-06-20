@@ -1,9 +1,4 @@
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bsv::primitives::public_key::PublicKey;
 use bsv::wallet::interfaces::{
     InternalizeActionArgs, InternalizeOutput, Payment as SdkPayment, WalletInterface,
@@ -105,11 +100,7 @@ pub async fn send_message(
     let recipients: Vec<String> = if let Some(arr) = recipients_raw.as_array() {
         match arr
             .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(|s| s.to_string())
-                    .ok_or(())
-            })
+            .map(|v| v.as_str().map(|s| s.to_string()).ok_or(()))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(v) => v,
@@ -388,19 +379,17 @@ pub async fn send_message(
             };
 
             let sender_pub_key = match &remittance.sender_identity_key {
-                Some(k) if !k.is_empty() => {
-                    match PublicKey::from_string(k) {
-                        Ok(pk) => pk,
-                        Err(_) => {
-                            return error_response(
-                                StatusCode::BAD_REQUEST,
-                                "ERR_INVALID_PAYMENT",
-                                "senderIdentityKey in payment remittance is not a valid public key.",
-                            )
-                            .into_response();
-                        }
+                Some(k) if !k.is_empty() => match PublicKey::from_string(k) {
+                    Ok(pk) => pk,
+                    Err(_) => {
+                        return error_response(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PAYMENT",
+                            "senderIdentityKey in payment remittance is not a valid public key.",
+                        )
+                        .into_response();
                     }
-                }
+                },
                 _ => {
                     return error_response(
                         StatusCode::BAD_REQUEST,
@@ -423,15 +412,16 @@ pub async fn send_message(
                         sender_identity_key: sender_pub_key,
                     },
                 }],
-                description: format!(
-                    "Delivery fee payment for message box: {}",
-                    box_type
-                ),
+                description: format!("Delivery fee payment for message box: {box_type}"),
                 labels: vec![],
                 seek_permission: Some(false).into(),
             };
 
-            match state.funded_wallet.internalize_action(internalize_args, None).await {
+            match state
+                .funded_wallet
+                .internalize_action(internalize_args, None)
+                .await
+            {
                 Ok(result) => {
                     if !result.accepted {
                         error!("internalize_action rejected delivery fee payment");
@@ -512,20 +502,25 @@ pub async fn send_message(
         // Push-live-first: broadcast to the connected recipient before the DB write.
         let room = crate::ws::room_id(&fr.recipient, &box_type);
         let event = format!("sendMessage-{room}");
-        let now = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
-        state.ws.broadcast_to_room(
-            &room,
-            &event,
-            &crate::ws::RoomMessage {
-                message_id: msg_id.clone(),
-                sender: sender_key.clone(),
-                recipient: fr.recipient.clone(),
-                message_box: box_type.clone(),
-                body: body_bytes.clone(),
-                created_at: now.clone(),
-                updated_at: now,
-            },
-        ).await;
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
+        state
+            .ws
+            .broadcast_to_room(
+                &room,
+                &event,
+                &crate::ws::RoomMessage {
+                    message_id: msg_id.clone(),
+                    sender: sender_key.clone(),
+                    recipient: fr.recipient.clone(),
+                    message_box: box_type.clone(),
+                    body: body_bytes.clone(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                },
+            )
+            .await;
 
         // Persist-async: durable INSERT off the hot path (see crate::persist).
         // This path builds a richer stored body ({"message", "payment"?}), so it

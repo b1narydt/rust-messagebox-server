@@ -50,7 +50,11 @@ pub struct ChannelTransport {
 }
 
 impl ChannelTransport {
-    pub fn new() -> (Self, mpsc::Sender<SdkAuthMessage>, mpsc::Receiver<SdkAuthMessage>) {
+    pub fn new() -> (
+        Self,
+        mpsc::Sender<SdkAuthMessage>,
+        mpsc::Receiver<SdkAuthMessage>,
+    ) {
         // Sized for handshake/auth bursts under many concurrent connections;
         // room broadcasts bypass this channel (emitted directly), so this only
         // buffers per-socket handshake + reply frames.
@@ -74,7 +78,11 @@ impl Transport for ChannelTransport {
     }
 
     fn subscribe(&self) -> mpsc::Receiver<SdkAuthMessage> {
-        self.incoming_rx.lock().unwrap().take().expect("subscribe called twice")
+        self.incoming_rx
+            .lock()
+            .unwrap()
+            .take()
+            .expect("subscribe called twice")
     }
 }
 
@@ -200,7 +208,10 @@ impl WsBroadcast {
         });
 
         let mut peers = self.socket_peers.write();
-        Ok(peers.entry(socket_id.to_string()).or_insert(socket_peer).clone())
+        Ok(peers
+            .entry(socket_id.to_string())
+            .or_insert(socket_peer)
+            .clone())
     }
 
     /// Look up an existing `SocketPeer` handle without creating one.
@@ -261,7 +272,9 @@ impl WsBroadcast {
 
     /// Store the identity key for an authenticated socket.
     pub fn set_identity(&self, socket_id: &str, identity_key: String) {
-        self.socket_identities.write().insert(socket_id.to_string(), identity_key);
+        self.socket_identities
+            .write()
+            .insert(socket_id.to_string(), identity_key);
     }
 
     /// Get the identity key for a socket.
@@ -388,7 +401,10 @@ impl WsBroadcast {
             // exists but signing failed), so log it at `warn` with the error.
             let signed = {
                 let peer = socket_peer.peer.lock().await;
-                match peer.create_general_message(&identity, payload.clone()).await {
+                match peer
+                    .create_general_message(&identity, payload.clone())
+                    .await
+                {
                     Ok(m) => m,
                     Err(e) => {
                         warn!(sid = %sid, room = %room_id, error = %e,
@@ -427,7 +443,12 @@ impl WsBroadcast {
             warn!(room = %room_id, members = member_count,
                 "signed broadcast reached 0 of {member_count} room members — live push may be broken; recipients depend on the HTTP poll");
         }
-        debug!(room = room_id, event = event, delivered, "signed broadcast to room");
+        debug!(
+            room = room_id,
+            event = event,
+            delivered,
+            "signed broadcast to room"
+        );
         delivered
     }
 }
@@ -503,10 +524,15 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                     // general-message sender below).
                     {
                         let peer = socket_peer.peer.lock().await;
+                        // BENCH-ONLY: time the BRC-103 verify stage (process_pending
+                        // runs signature/nonce/session verification). No-op unless
+                        // MB_BENCH_METRICS=1.
+                        let _verify_t0 = std::time::Instant::now();
                         if let Err(e) = peer.process_pending().await {
                             warn!(sid = %sid, error = %e, "Peer process_pending failed (verification did not complete; identity NOT trusted)");
                             // Don't return — there might still be outgoing/general messages
                         }
+                        crate::bench_metrics::record_verify(_verify_t0.elapsed().as_nanos() as u64);
                     }
 
                     // Drain all outgoing messages and emit as authMessage events
@@ -590,7 +616,9 @@ pub fn room_id(recipient: &str, message_box: &str) -> String {
 
 /// Current UTC timestamp in ISO 8601 format (matches SQLite strftime output).
 fn now_iso8601() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
 }
 
 /// Log the persist outcome so a fast-path bypass (and any dead-letter) is
@@ -661,9 +689,9 @@ fn split_room_id(room_id: &str) -> Option<(String, String)> {
         return Some((key, mb));
     }
     // Fallback: split at first hyphen
-    room_id.find('-').map(|pos| {
-        (room_id[..pos].to_string(), room_id[pos + 1..].to_string())
-    })
+    room_id
+        .find('-')
+        .map(|pos| (room_id[..pos].to_string(), room_id[pos + 1..].to_string()))
 }
 
 /// Handle a decoded BRC-103 general message (application event).
@@ -725,8 +753,13 @@ async fn handle_general_event(
             }
             ws.add_room_member(&room_id_str, sid);
             debug!(sid = %sid, room = %room_id_str, "BRC-103 joinRoom: joined room");
-            ws.emit_signed(socket, sid, "joinedRoom", serde_json::json!({ "roomId": room_id_str }))
-                .await;
+            ws.emit_signed(
+                socket,
+                sid,
+                "joinedRoom",
+                serde_json::json!({ "roomId": room_id_str }),
+            )
+            .await;
         }
         "leaveRoom" => {
             let room_id_str = data.as_str().unwrap_or("").to_string();
@@ -734,8 +767,13 @@ async fn handle_general_event(
                 socket.leave(room_id_str.clone()).ok();
                 ws.remove_room_member(&room_id_str, sid);
                 debug!(sid = %sid, room = %room_id_str, "BRC-103 leaveRoom: left room");
-                ws.emit_signed(socket, sid, "leftRoom", serde_json::json!({ "roomId": room_id_str }))
-                    .await;
+                ws.emit_signed(
+                    socket,
+                    sid,
+                    "leftRoom",
+                    serde_json::json!({ "roomId": room_id_str }),
+                )
+                .await;
             }
         }
         "sendMessage" => {
@@ -847,6 +885,8 @@ async fn handle_ws_send_message(
     // DB. Durability is preserved by the async persist below.
     let now = now_iso8601();
     let event = format!("sendMessage-{room_id_str}");
+    // BENCH-ONLY: time the route/broadcast stage. No-op unless MB_BENCH_METRICS=1.
+    let _route_t0 = std::time::Instant::now();
     ws.broadcast_to_room(
         &room_id_str,
         &event,
@@ -859,7 +899,9 @@ async fn handle_ws_send_message(
             created_at: now.clone(),
             updated_at: now,
         },
-    ).await;
+    )
+    .await;
+    crate::bench_metrics::record_route(_route_t0.elapsed().as_nanos() as u64);
 
     // ── PERSIST-ASYNC ─────────────────────────────────────────────────
     //
@@ -873,6 +915,8 @@ async fn handle_ws_send_message(
     // `PersistJob::new` performs the canonical `{"message": <body>}` wrap from
     // the RAW body (it owns the wrap), so we pass `body`, not the pre-wrapped
     // `stored_body` used for the live broadcast above.
+    // BENCH-ONLY: time the persist-enqueue stage. No-op unless MB_BENCH_METRICS=1.
+    let _persist_t0 = std::time::Instant::now();
     let enqueued = ws
         .persist_async(crate::persist::PersistJob::new(
             message_id.clone(),
@@ -882,6 +926,7 @@ async fn handle_ws_send_message(
             body,
         ))
         .await;
+    crate::bench_metrics::record_persist(_persist_t0.elapsed().as_nanos() as u64);
 
     log_persist_outcome(sid, &message_id, &recipient, enqueued);
 
@@ -984,7 +1029,10 @@ mod tests {
         let ws = test_ws();
         let a = ws.ensure_peer("sock1").expect("peer");
         let b = ws.ensure_peer("sock1").expect("peer");
-        assert!(Arc::ptr_eq(&a, &b), "second ensure_peer must reuse the handle");
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "second ensure_peer must reuse the handle"
+        );
     }
 
     #[tokio::test]

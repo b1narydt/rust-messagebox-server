@@ -1,4 +1,3 @@
-#![cfg(test)]
 //! Shared test infrastructure: a single MySQL container per test binary,
 //! and a `fresh_pool()` helper that creates a per-test database so tests
 //! are fully isolated.
@@ -16,7 +15,8 @@ use crate::db;
 
 // Public identity-key constants so test modules share them.
 pub const TEST_KEY: &str = "028d37b941208cd6b8a4c28288eda5f2f16c2b3ab0fcb6d13c18b47fe37b971fc1";
-pub const RECIPIENT_KEY: &str = "0350b59e3efb8e37ba1ba2bde37c24e2bed89346ef3dc46d780e2b99f3efe50d1c";
+pub const RECIPIENT_KEY: &str =
+    "0350b59e3efb8e37ba1ba2bde37c24e2bed89346ef3dc46d780e2b99f3efe50d1c";
 
 /// Lazily-initialised shared container for the current test binary.
 /// Tuple: (container handle to keep alive, base URL `mysql://root@host:port`).
@@ -78,6 +78,15 @@ pub async fn fresh_pool() -> MySqlPool {
     // OnceLock-backed: first call seeds, subsequent calls are a no-op Err
     // which is fine — the already-seeded values are identical.
     let _ = db::queries::init_delivery_fee_cache(&pool).await;
+
+    // Each fresh per-test database bumps the messageBox-cache generation. The
+    // existence cache embeds the generation in its key, so a cached id from a
+    // PRIOR test's DB (these tests reuse the same identity-key constants) can
+    // never match a lookup in THIS test's DB — it lives under an older
+    // generation. The only effect of a concurrent bump from a sibling test is a
+    // benign cache MISS (fall through to the DB), never a wrong id. In production
+    // the generation is bumped exactly once, at startup.
+    db::queries::bump_message_box_cache_generation();
 
     pool
 }
