@@ -282,12 +282,7 @@ impl PersistHandle {
         tokio::spawn(async move {
             run_supervised(rx, worker_db, worker_cfg, worker_stats).await;
         });
-        Self {
-            tx,
-            db,
-            cfg,
-            stats,
-        }
+        Self { tx, db, cfg, stats }
     }
 
     /// Observability counters (dead-letters, inline persists, worker panics).
@@ -363,9 +358,10 @@ async fn run_supervised(
         let drain_cfg = cfg.clone();
         let drain_stats = Arc::clone(&stats);
         // Run the drain in a child task so a panic is catchable via the JoinHandle.
-        let handle = tokio::spawn(async move {
-            run_drain(drain_rx, drain_db, drain_cfg, drain_stats).await
-        });
+        let handle =
+            tokio::spawn(
+                async move { run_drain(drain_rx, drain_db, drain_cfg, drain_stats).await },
+            );
         match handle.await {
             // Graceful: channel closed (all handles dropped at shutdown).
             Ok(DrainExit::ChannelClosed) => {
@@ -660,7 +656,10 @@ mod tests {
 
     // Build a transient and a permanent sqlx::Error for classify() tests.
     fn io_err() -> sqlx::Error {
-        sqlx::Error::Io(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset"))
+        sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ))
     }
 
     #[test]
@@ -672,7 +671,8 @@ mod tests {
 
     #[test]
     fn with_stored_body_is_verbatim() {
-        let j = PersistJob::with_stored_body("m", "r", "box", "s", r#"{"message":"x","payment":1}"#);
+        let j =
+            PersistJob::with_stored_body("m", "r", "box", "s", r#"{"message":"x","payment":1}"#);
         assert_eq!(j.body, r#"{"message":"x","payment":1}"#);
     }
 
@@ -686,10 +686,7 @@ mod tests {
 
     #[test]
     fn classify_permanent_variants() {
-        assert_eq!(
-            classify(&sqlx::Error::RowNotFound),
-            ErrorClass::Permanent
-        );
+        assert_eq!(classify(&sqlx::Error::RowNotFound), ErrorClass::Permanent);
         assert_eq!(
             classify(&sqlx::Error::Configuration("bad".into())),
             ErrorClass::Permanent
@@ -714,12 +711,18 @@ mod tests {
                 }
             }
         };
-        let outcome =
-            persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
         assert_eq!(outcome, PersistOutcome::Stored);
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "two failures then one success");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "two failures then one success"
+        );
         assert_eq!(stats.dead_lettered.load(Ordering::Relaxed), 0);
-        assert!(!cfg.dead_letter_path.exists(), "no dead-letter on eventual success");
+        assert!(
+            !cfg.dead_letter_path.exists(),
+            "no dead-letter on eventual success"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -737,10 +740,13 @@ mod tests {
                 Err(sqlx::Error::RowNotFound) // permanent
             }
         };
-        let outcome =
-            persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
         assert_eq!(outcome, PersistOutcome::DeadLetteredPermanent);
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "permanent error must NOT be retried 8x");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "permanent error must NOT be retried 8x"
+        );
         assert_eq!(stats.dead_lettered.load(Ordering::Relaxed), 1);
         let contents = std::fs::read_to_string(&cfg.dead_letter_path).unwrap();
         assert!(contents.contains(r#""reason":"permanent""#));
@@ -763,10 +769,13 @@ mod tests {
                 Err(io_err()) // always transient
             }
         };
-        let outcome =
-            persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
         assert_eq!(outcome, PersistOutcome::DeadLetteredTransient);
-        assert_eq!(calls.load(Ordering::SeqCst), 3, "exactly max_attempts tries");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "exactly max_attempts tries"
+        );
         assert_eq!(stats.dead_lettered.load(Ordering::Relaxed), 1);
         let contents = std::fs::read_to_string(&cfg.dead_letter_path).unwrap();
         assert!(contents.contains(r#""reason":"transient-exhausted""#));
@@ -779,8 +788,7 @@ mod tests {
         let cfg = test_cfg(&dir);
         let stats = PersistStats::default();
         let persist = |_db: DbPool, _job: PersistJob| async { Ok(false) };
-        let outcome =
-            persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
         assert_eq!(outcome, PersistOutcome::Duplicate);
         assert_eq!(stats.dead_lettered.load(Ordering::Relaxed), 0);
         std::fs::remove_dir_all(&dir).ok();
@@ -795,8 +803,8 @@ mod tests {
         let mut cfg = test_cfg(&dir);
         cfg.queue_capacity = 1;
         cfg.max_attempts = 1; // don't spin on the unconnected pool
-        // Build a handle WITHOUT spawning a draining worker: we want the queue
-        // to stay full. We construct the channel directly.
+                              // Build a handle WITHOUT spawning a draining worker: we want the queue
+                              // to stay full. We construct the channel directly.
         let (tx, _rx) = mpsc::channel::<PersistJob>(cfg.queue_capacity);
         let handle = PersistHandle {
             tx,

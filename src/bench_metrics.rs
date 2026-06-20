@@ -63,7 +63,10 @@ impl Stage {
         // Best-effort max (a benign race here only undercounts the tail slightly).
         let mut cur = self.max_ns.load(Ordering::Relaxed);
         while ns > cur {
-            match self.max_ns.compare_exchange_weak(cur, ns, Ordering::Relaxed, Ordering::Relaxed) {
+            match self
+                .max_ns
+                .compare_exchange_weak(cur, ns, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(observed) => cur = observed,
             }

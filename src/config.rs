@@ -48,8 +48,7 @@ impl Config {
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(default_port);
 
-        let server_private_key =
-            env::var("SERVER_PRIVATE_KEY").unwrap_or_default();
+        let server_private_key = env::var("SERVER_PRIVATE_KEY").unwrap_or_default();
         if server_private_key.is_empty() {
             return Err("SERVER_PRIVATE_KEY is required".to_string());
         }
@@ -111,8 +110,9 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "https://storage.babbage.systems".to_string());
-        let firebase_project_id =
-            env::var("FIREBASE_PROJECT_ID").ok().filter(|s| !s.is_empty());
+        let firebase_project_id = env::var("FIREBASE_PROJECT_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
         let firebase_service_account_json = env::var("FIREBASE_SERVICE_ACCOUNT_JSON")
             .ok()
             .filter(|s| !s.is_empty());
@@ -229,7 +229,7 @@ fn redact_db_url(url: &str) -> String {
     };
     let userinfo = &rest[..at];
     let after = &rest[at..]; // starts with '@'
-    // Split userinfo into user / password at first ':'.
+                             // Split userinfo into user / password at first ':'.
     let redacted_userinfo = match userinfo.find(':') {
         Some(ci) => format!("{}:***", &userinfo[..ci]),
         None => userinfo.to_string(),
