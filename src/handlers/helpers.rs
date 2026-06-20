@@ -40,7 +40,10 @@ impl<S: Send + Sync> FromRequestParts<S> for AuthIdentity {
 
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         // Try the new middleware's Authenticated extractor first
-        if let Some(auth) = parts.extensions.get::<bsv_auth_axum_middleware::Authenticated>() {
+        if let Some(auth) = parts
+            .extensions
+            .get::<bsv_auth_axum_middleware::Authenticated>()
+        {
             return Ok(AuthIdentity(auth.identity_key.clone()));
         }
         // Fallback: check for legacy AuthIdentity (e.g., from internal routes)
@@ -130,9 +133,7 @@ fn extract_recipient_key(out: &PaymentOutput) -> Option<String> {
     }
 
     let instr: Instr = serde_json::from_value(raw.clone()).ok()?;
-    instr
-        .recipient_identity_key
-        .filter(|k| !k.is_empty())
+    instr.recipient_identity_key.filter(|k| !k.is_empty())
 }
 
 /// Maps payment outputs to recipients based on `customInstructions` tagging or,

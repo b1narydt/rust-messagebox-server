@@ -18,8 +18,8 @@ use bsv_wallet_toolbox::services::Services;
 use bsv_wallet_toolbox::storage::manager::WalletStorageManager;
 use bsv_wallet_toolbox::storage::remoting::{StorageClient, WalletArc};
 use bsv_wallet_toolbox::types::Chain;
-use bsv_wallet_toolbox::wallet::wallet::Wallet;
 use bsv_wallet_toolbox::wallet::types::WalletArgs;
+use bsv_wallet_toolbox::wallet::wallet::Wallet;
 
 use messagebox_server::{cloneable_wallet, config, db, firebase, handlers, logger, ws};
 
@@ -50,9 +50,7 @@ async fn main() {
         for (box_name, fee) in &config.message_box_fees {
             match db::queries::upsert_server_fee(&pool, box_name, *fee).await {
                 Ok(()) => applied.push(format!("{box_name}={fee}")),
-                Err(e) => tracing::error!(
-                    "failed to upsert server fee for {box_name}={fee}: {e}"
-                ),
+                Err(e) => tracing::error!("failed to upsert server fee for {box_name}={fee}: {e}"),
             }
         }
         if !applied.is_empty() {
@@ -123,19 +121,22 @@ async fn main() {
     // Log server identity key via bsv-sdk
     let identity_key = {
         use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
-        match sdk_wallet.get_public_key(
-            GetPublicKeyArgs {
-                identity_key: true,
-                protocol_id: None,
-                key_id: None,
-                counterparty: None,
-                privileged: false,
-                privileged_reason: None,
-                for_self: None,
-                seek_permission: None,
-            },
-            None,
-        ).await {
+        match sdk_wallet
+            .get_public_key(
+                GetPublicKeyArgs {
+                    identity_key: true,
+                    protocol_id: None,
+                    key_id: None,
+                    counterparty: None,
+                    privileged: false,
+                    privileged_reason: None,
+                    for_self: None,
+                    seek_permission: None,
+                },
+                None,
+            )
+            .await
+        {
             Ok(r) => r.public_key.to_der_hex(),
             Err(e) => {
                 tracing::error!("Failed to get identity key: {e}");
@@ -150,7 +151,8 @@ async fn main() {
 
     // Set up Socket.IO for WebSocket live message push
     let (sio_layer, io) = socketioxide::SocketIo::new_layer();
-    let ws_broadcast = ws::WsBroadcast::new(io.clone(), config.server_private_key.clone(), pool.clone());
+    let ws_broadcast =
+        ws::WsBroadcast::new(io.clone(), config.server_private_key.clone(), pool.clone());
     ws::setup_handlers(&io, ws_broadcast.clone());
     tracing::info!("Socket.IO WebSocket server ready");
 
@@ -172,12 +174,8 @@ async fn main() {
         .build()
         .expect("auth middleware config");
 
-    let auth_layer = bsv_auth_axum_middleware::AuthLayer::from_config(
-        auth_config,
-        peer,
-        transport,
-    )
-    .await;
+    let auth_layer =
+        bsv_auth_axum_middleware::AuthLayer::from_config(auth_config, peer, transport).await;
 
     let app_state = handlers::helpers::AppState {
         db: pool,
@@ -228,10 +226,7 @@ async fn main() {
             "/acknowledgeMessage",
             post(handlers::acknowledge_message::acknowledge_message),
         )
-        .route(
-            "/registerDevice",
-            post(handlers::devices::register_device),
-        )
+        .route("/registerDevice", post(handlers::devices::register_device))
         .route("/devices", get(handlers::devices::list_devices))
         .route(
             "/permissions/set",
@@ -245,10 +240,7 @@ async fn main() {
             "/permissions/list",
             get(handlers::permissions::list_permissions),
         )
-        .route(
-            "/permissions/quote",
-            get(handlers::permissions::get_quote),
-        )
+        .route("/permissions/quote", get(handlers::permissions::get_quote))
         .layer(auth_layer)
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

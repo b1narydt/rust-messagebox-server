@@ -28,7 +28,9 @@ async fn test_ensure_message_box_idempotent() {
 #[tokio::test]
 async fn test_get_message_box_id_not_found() {
     let pool = fresh_pool().await;
-    let result = get_message_box_id(&pool, TEST_KEY, "nonexistent").await.unwrap();
+    let result = get_message_box_id(&pool, TEST_KEY, "nonexistent")
+        .await
+        .unwrap();
     assert!(result.is_none(), "should return None for non-existent box");
 }
 
@@ -48,7 +50,9 @@ async fn test_get_message_box_id_found() {
 async fn test_insert_message() {
     let pool = fresh_pool().await;
     let mb_id = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
-    let ok = insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello").await.unwrap();
+    let ok = insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello")
+        .await
+        .unwrap();
     assert!(ok, "insert should succeed");
 }
 
@@ -56,8 +60,12 @@ async fn test_insert_message() {
 async fn test_insert_message_duplicate() {
     let pool = fresh_pool().await;
     let mb_id = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
-    insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello").await.unwrap();
-    let ok = insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello again").await.unwrap();
+    insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello")
+        .await
+        .unwrap();
+    let ok = insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello again")
+        .await
+        .unwrap();
     assert!(!ok, "duplicate messageId should return false");
 }
 
@@ -65,8 +73,12 @@ async fn test_insert_message_duplicate() {
 async fn test_list_messages() {
     let pool = fresh_pool().await;
     let mb_id = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
-    insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "first").await.unwrap();
-    insert_message(&pool, "msg-2", mb_id, TEST_KEY2, TEST_KEY, "second").await.unwrap();
+    insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "first")
+        .await
+        .unwrap();
+    insert_message(&pool, "msg-2", mb_id, TEST_KEY2, TEST_KEY, "second")
+        .await
+        .unwrap();
 
     let msgs = list_messages(&pool, TEST_KEY, mb_id).await.unwrap();
     assert_eq!(msgs.len(), 2);
@@ -88,9 +100,15 @@ async fn test_list_messages_empty() {
 async fn test_acknowledge_messages() {
     let pool = fresh_pool().await;
     let mb_id = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
-    insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "first").await.unwrap();
-    insert_message(&pool, "msg-2", mb_id, TEST_KEY2, TEST_KEY, "second").await.unwrap();
-    insert_message(&pool, "msg-3", mb_id, TEST_KEY2, TEST_KEY, "third").await.unwrap();
+    insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "first")
+        .await
+        .unwrap();
+    insert_message(&pool, "msg-2", mb_id, TEST_KEY2, TEST_KEY, "second")
+        .await
+        .unwrap();
+    insert_message(&pool, "msg-3", mb_id, TEST_KEY2, TEST_KEY, "third")
+        .await
+        .unwrap();
 
     let ids = vec!["msg-1".to_string(), "msg-2".to_string()];
     let deleted = acknowledge_messages(&pool, TEST_KEY, &ids).await.unwrap();
@@ -116,7 +134,9 @@ async fn test_acknowledge_messages_not_found() {
 #[tokio::test]
 async fn test_get_server_delivery_fee_default() {
     let pool = fresh_pool().await;
-    let fee = get_server_delivery_fee(&pool, "notifications").await.unwrap();
+    let fee = get_server_delivery_fee(&pool, "notifications")
+        .await
+        .unwrap();
     assert_eq!(fee, 0, "notifications default delivery fee should be 0 (zeroed by the zero_default_fees migration; opt-in via MESSAGEBOX_FEES)");
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
@@ -138,9 +158,13 @@ async fn test_get_server_delivery_fee_unknown() {
 async fn test_get_recipient_fee_sender_specific() {
     let pool = fresh_pool().await;
     // Set a sender-specific fee
-    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 42).await.unwrap();
+    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 42)
+        .await
+        .unwrap();
 
-    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox").await.unwrap();
+    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
+        .await
+        .unwrap();
     assert_eq!(fee, 42, "should return sender-specific fee");
 }
 
@@ -148,10 +172,14 @@ async fn test_get_recipient_fee_sender_specific() {
 async fn test_get_recipient_fee_box_wide_fallback() {
     let pool = fresh_pool().await;
     // Set a box-wide fee (sender = NULL)
-    set_message_permission(&pool, TEST_KEY, None, "inbox", 25).await.unwrap();
+    set_message_permission(&pool, TEST_KEY, None, "inbox", 25)
+        .await
+        .unwrap();
 
     // Query with a sender that has no specific permission
-    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox").await.unwrap();
+    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
+        .await
+        .unwrap();
     assert_eq!(fee, 25, "should fall back to box-wide fee");
 }
 
@@ -160,10 +188,14 @@ async fn test_get_recipient_fee_auto_create_default() {
     let pool = fresh_pool().await;
 
     // No permissions set at all for this recipient/box - should auto-create
-    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "notifications").await.unwrap();
+    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "notifications")
+        .await
+        .unwrap();
     assert_eq!(fee, 10, "notifications box smart default should be 10");
 
-    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox").await.unwrap();
+    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
+        .await
+        .unwrap();
     assert_eq!(fee, 0, "inbox box smart default should be 0");
 }
 
@@ -174,10 +206,14 @@ async fn test_get_recipient_fee_auto_create_default() {
 #[tokio::test]
 async fn test_set_message_permission() {
     let pool = fresh_pool().await;
-    let ok = set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 50).await.unwrap();
+    let ok = set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 50)
+        .await
+        .unwrap();
     assert!(ok);
 
-    let perm = get_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox").await.unwrap();
+    let perm = get_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox")
+        .await
+        .unwrap();
     assert!(perm.is_some());
     let perm = perm.unwrap();
     assert_eq!(perm.recipient, TEST_KEY);
@@ -189,10 +225,14 @@ async fn test_set_message_permission() {
 #[tokio::test]
 async fn test_set_message_permission_null_sender() {
     let pool = fresh_pool().await;
-    let ok = set_message_permission(&pool, TEST_KEY, None, "inbox", 30).await.unwrap();
+    let ok = set_message_permission(&pool, TEST_KEY, None, "inbox", 30)
+        .await
+        .unwrap();
     assert!(ok);
 
-    let perm = get_permission(&pool, TEST_KEY, None, "inbox").await.unwrap();
+    let perm = get_permission(&pool, TEST_KEY, None, "inbox")
+        .await
+        .unwrap();
     assert!(perm.is_some());
     let perm = perm.unwrap();
     assert_eq!(perm.recipient, TEST_KEY);
@@ -203,17 +243,26 @@ async fn test_set_message_permission_null_sender() {
 #[tokio::test]
 async fn test_set_message_permission_update() {
     let pool = fresh_pool().await;
-    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 50).await.unwrap();
-    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 100).await.unwrap();
+    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 50)
+        .await
+        .unwrap();
+    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 100)
+        .await
+        .unwrap();
 
-    let perm = get_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox").await.unwrap().unwrap();
+    let perm = get_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(perm.recipient_fee, 100, "fee should be updated to 100");
 }
 
 #[tokio::test]
 async fn test_get_permission_not_found() {
     let pool = fresh_pool().await;
-    let perm = get_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox").await.unwrap();
+    let perm = get_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox")
+        .await
+        .unwrap();
     assert!(perm.is_none());
 }
 
@@ -221,26 +270,40 @@ async fn test_get_permission_not_found() {
 async fn test_list_permissions_with_pagination() {
     let pool = fresh_pool().await;
     // Insert several permissions
-    set_message_permission(&pool, TEST_KEY, None, "inbox", 10).await.unwrap();
-    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 20).await.unwrap();
-    set_message_permission(&pool, TEST_KEY, None, "notifications", 30).await.unwrap();
+    set_message_permission(&pool, TEST_KEY, None, "inbox", 10)
+        .await
+        .unwrap();
+    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 20)
+        .await
+        .unwrap();
+    set_message_permission(&pool, TEST_KEY, None, "notifications", 30)
+        .await
+        .unwrap();
 
     // List all with limit
-    let (perms, total) = list_permissions(&pool, TEST_KEY, None, 10, 0, "asc").await.unwrap();
+    let (perms, total) = list_permissions(&pool, TEST_KEY, None, 10, 0, "asc")
+        .await
+        .unwrap();
     assert_eq!(total, 3);
     assert_eq!(perms.len(), 3);
 
     // List with pagination
-    let (perms, total) = list_permissions(&pool, TEST_KEY, None, 2, 0, "asc").await.unwrap();
+    let (perms, total) = list_permissions(&pool, TEST_KEY, None, 2, 0, "asc")
+        .await
+        .unwrap();
     assert_eq!(total, 3);
     assert_eq!(perms.len(), 2);
 
-    let (perms, total) = list_permissions(&pool, TEST_KEY, None, 2, 2, "asc").await.unwrap();
+    let (perms, total) = list_permissions(&pool, TEST_KEY, None, 2, 2, "asc")
+        .await
+        .unwrap();
     assert_eq!(total, 3);
     assert_eq!(perms.len(), 1);
 
     // Filter by messageBox
-    let (perms, total) = list_permissions(&pool, TEST_KEY, Some("inbox"), 10, 0, "asc").await.unwrap();
+    let (perms, total) = list_permissions(&pool, TEST_KEY, Some("inbox"), 10, 0, "asc")
+        .await
+        .unwrap();
     assert_eq!(total, 2);
     assert_eq!(perms.len(), 2);
 }
@@ -252,16 +315,40 @@ async fn test_list_permissions_with_pagination() {
 #[tokio::test]
 async fn test_register_device() {
     let pool = fresh_pool().await;
-    let id = register_device(&pool, TEST_KEY, "fcm-token-abc", Some("dev-1"), Some("android")).await.unwrap();
+    let id = register_device(
+        &pool,
+        TEST_KEY,
+        "fcm-token-abc",
+        Some("dev-1"),
+        Some("android"),
+    )
+    .await
+    .unwrap();
     assert!(id > 0);
 }
 
 #[tokio::test]
 async fn test_register_device_upsert() {
     let pool = fresh_pool().await;
-    register_device(&pool, TEST_KEY, "fcm-token-abc", Some("dev-1"), Some("android")).await.unwrap();
+    register_device(
+        &pool,
+        TEST_KEY,
+        "fcm-token-abc",
+        Some("dev-1"),
+        Some("android"),
+    )
+    .await
+    .unwrap();
     // Same fcm_token, different identity_key should upsert
-    register_device(&pool, TEST_KEY2, "fcm-token-abc", Some("dev-2"), Some("ios")).await.unwrap();
+    register_device(
+        &pool,
+        TEST_KEY2,
+        "fcm-token-abc",
+        Some("dev-2"),
+        Some("ios"),
+    )
+    .await
+    .unwrap();
 
     let devices = list_devices(&pool, TEST_KEY2).await.unwrap();
     assert_eq!(devices.len(), 1, "upsert should update, not duplicate");
@@ -272,8 +359,12 @@ async fn test_register_device_upsert() {
 #[tokio::test]
 async fn test_list_devices() {
     let pool = fresh_pool().await;
-    register_device(&pool, TEST_KEY, "token-1", None, Some("android")).await.unwrap();
-    register_device(&pool, TEST_KEY, "token-2", None, Some("ios")).await.unwrap();
+    register_device(&pool, TEST_KEY, "token-1", None, Some("android"))
+        .await
+        .unwrap();
+    register_device(&pool, TEST_KEY, "token-2", None, Some("ios"))
+        .await
+        .unwrap();
 
     let devices = list_devices(&pool, TEST_KEY).await.unwrap();
     assert_eq!(devices.len(), 2);
@@ -282,8 +373,12 @@ async fn test_list_devices() {
 #[tokio::test]
 async fn test_list_active_devices() {
     let pool = fresh_pool().await;
-    let id1 = register_device(&pool, TEST_KEY, "token-1", None, Some("android")).await.unwrap();
-    register_device(&pool, TEST_KEY, "token-2", None, Some("ios")).await.unwrap();
+    let id1 = register_device(&pool, TEST_KEY, "token-1", None, Some("android"))
+        .await
+        .unwrap();
+    register_device(&pool, TEST_KEY, "token-2", None, Some("ios"))
+        .await
+        .unwrap();
 
     // Deactivate the first one
     deactivate_device(&pool, id1).await.unwrap();
@@ -296,12 +391,17 @@ async fn test_list_active_devices() {
 #[tokio::test]
 async fn test_deactivate_device() {
     let pool = fresh_pool().await;
-    let id = register_device(&pool, TEST_KEY, "token-1", None, None).await.unwrap();
+    let id = register_device(&pool, TEST_KEY, "token-1", None, None)
+        .await
+        .unwrap();
     deactivate_device(&pool, id).await.unwrap();
 
     let devices = list_devices(&pool, TEST_KEY).await.unwrap();
     assert_eq!(devices.len(), 1);
-    assert!(!devices[0].active, "device should be inactive after deactivation");
+    assert!(
+        !devices[0].active,
+        "device should be inactive after deactivation"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -326,8 +426,13 @@ async fn test_delivery_fee_cache() {
     // After init_delivery_fee_cache (called in fresh_pool), fees should come from cache.
     // The zero_default_fees migration zeroes every seeded fee (incl. notifications),
     // so the cached value is 0 unless an operator opts in via MESSAGEBOX_FEES.
-    let fee = get_server_delivery_fee(&pool, "notifications").await.unwrap();
-    assert_eq!(fee, 0, "notifications delivery fee should be 0 after zero_default_fees");
+    let fee = get_server_delivery_fee(&pool, "notifications")
+        .await
+        .unwrap();
+    assert_eq!(
+        fee, 0,
+        "notifications delivery fee should be 0 after zero_default_fees"
+    );
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
     assert_eq!(fee, 0, "inbox delivery fee should be 0");
@@ -344,12 +449,18 @@ async fn test_delivery_fee_cache() {
 async fn test_consolidated_permission_lookup() {
     let pool = fresh_pool().await;
     // Set box-wide fee=10
-    set_message_permission(&pool, TEST_KEY, None, "inbox", 10).await.unwrap();
+    set_message_permission(&pool, TEST_KEY, None, "inbox", 10)
+        .await
+        .unwrap();
     // Set sender-specific fee=50
-    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 50).await.unwrap();
+    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", 50)
+        .await
+        .unwrap();
 
     // Sender-specific should win over box-wide
-    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox").await.unwrap();
+    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
+        .await
+        .unwrap();
     assert_eq!(fee, 50, "sender-specific fee should win over box-wide");
 }
 
@@ -363,14 +474,26 @@ async fn test_cross_user_message_isolation() {
 
     // Create inbox for user A and send a message to user A
     let mb_id_a = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
-    insert_message(&pool, "msg-isolated-1", mb_id_a, TEST_KEY2, TEST_KEY, "for user A").await.unwrap();
+    insert_message(
+        &pool,
+        "msg-isolated-1",
+        mb_id_a,
+        TEST_KEY2,
+        TEST_KEY,
+        "for user A",
+    )
+    .await
+    .unwrap();
 
     // Create inbox for user B
     let mb_id_b = ensure_message_box(&pool, TEST_KEY2, "inbox").await.unwrap();
 
     // List messages as user B - should be empty
     let msgs = list_messages(&pool, TEST_KEY2, mb_id_b).await.unwrap();
-    assert!(msgs.is_empty(), "user B should see no messages in their own box");
+    assert!(
+        msgs.is_empty(),
+        "user B should see no messages in their own box"
+    );
 
     // Also listing from user A's box as user B should yield nothing (recipient mismatch)
     let msgs = list_messages(&pool, TEST_KEY2, mb_id_a).await.unwrap();
@@ -379,7 +502,10 @@ async fn test_cross_user_message_isolation() {
     // Acknowledge as user B should delete nothing
     let ids = vec!["msg-isolated-1".to_string()];
     let deleted = acknowledge_messages(&pool, TEST_KEY2, &ids).await.unwrap();
-    assert_eq!(deleted, 0, "user B should not be able to acknowledge user A's messages");
+    assert_eq!(
+        deleted, 0,
+        "user B should not be able to acknowledge user A's messages"
+    );
 
     // Verify message still exists for user A
     let msgs = list_messages(&pool, TEST_KEY, mb_id_a).await.unwrap();
@@ -399,18 +525,18 @@ async fn test_acknowledge_multiple_messages() {
     for i in 1..=5 {
         insert_message(
             &pool,
-            &format!("msg-multi-{}", i),
+            &format!("msg-multi-{i}"),
             mb_id,
             TEST_KEY2,
             TEST_KEY,
-            &format!("body {}", i),
+            &format!("body {i}"),
         )
         .await
         .unwrap();
     }
 
     // Acknowledge 3 of them
-    let ids: Vec<String> = (1..=3).map(|i| format!("msg-multi-{}", i)).collect();
+    let ids: Vec<String> = (1..=3).map(|i| format!("msg-multi-{i}")).collect();
     let deleted = acknowledge_messages(&pool, TEST_KEY, &ids).await.unwrap();
     assert_eq!(deleted, 3, "should delete exactly 3 messages");
 
@@ -434,11 +560,11 @@ async fn test_message_ordering() {
     for i in 1..=5 {
         insert_message(
             &pool,
-            &format!("msg-order-{}", i),
+            &format!("msg-order-{i}"),
             mb_id,
             TEST_KEY2,
             TEST_KEY,
-            &format!("body {}", i),
+            &format!("body {i}"),
         )
         .await
         .unwrap();
@@ -467,9 +593,13 @@ async fn test_message_ordering() {
 async fn test_permission_blocking() {
     let pool = fresh_pool().await;
     // Set fee=-1 for a recipient (blocking)
-    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", -1).await.unwrap();
+    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", -1)
+        .await
+        .unwrap();
 
-    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox").await.unwrap();
+    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
+        .await
+        .unwrap();
     assert_eq!(fee, -1, "fee should be -1 indicating blocked sender");
 }
 
@@ -494,7 +624,9 @@ async fn test_concurrent_message_operations() {
                     .await
                     .expect("insert should succeed");
             }
-            let msgs = list_messages(&pool, TEST_KEY, mb_id).await.expect("list should succeed");
+            let msgs = list_messages(&pool, TEST_KEY, mb_id)
+                .await
+                .expect("list should succeed");
             assert!(!msgs.is_empty(), "should have messages after inserts");
         });
     }
@@ -527,5 +659,9 @@ async fn test_concurrent_message_operations() {
     }
 
     let remaining = list_messages(&pool, TEST_KEY, mb_id).await.unwrap();
-    assert_eq!(remaining.len(), 20, "20 messages should remain after acknowledging 20");
+    assert_eq!(
+        remaining.len(),
+        20,
+        "20 messages should remain after acknowledging 20"
+    );
 }

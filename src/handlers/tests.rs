@@ -83,15 +83,39 @@ async fn setup_app() -> Router {
     };
 
     Router::new()
-        .route("/sendMessage", post(crate::handlers::send_message::send_message))
-        .route("/listMessages", post(crate::handlers::list_messages::list_messages))
-        .route("/acknowledgeMessage", post(crate::handlers::acknowledge_message::acknowledge_message))
-        .route("/registerDevice", post(crate::handlers::devices::register_device))
+        .route(
+            "/sendMessage",
+            post(crate::handlers::send_message::send_message),
+        )
+        .route(
+            "/listMessages",
+            post(crate::handlers::list_messages::list_messages),
+        )
+        .route(
+            "/acknowledgeMessage",
+            post(crate::handlers::acknowledge_message::acknowledge_message),
+        )
+        .route(
+            "/registerDevice",
+            post(crate::handlers::devices::register_device),
+        )
         .route("/devices", get(crate::handlers::devices::list_devices))
-        .route("/permissions/set", post(crate::handlers::permissions::set_permission))
-        .route("/permissions/get", get(crate::handlers::permissions::get_permission))
-        .route("/permissions/list", get(crate::handlers::permissions::list_permissions))
-        .route("/permissions/quote", get(crate::handlers::permissions::get_quote))
+        .route(
+            "/permissions/set",
+            post(crate::handlers::permissions::set_permission),
+        )
+        .route(
+            "/permissions/get",
+            get(crate::handlers::permissions::get_permission),
+        )
+        .route(
+            "/permissions/list",
+            get(crate::handlers::permissions::list_permissions),
+        )
+        .route(
+            "/permissions/quote",
+            get(crate::handlers::permissions::get_quote),
+        )
         .layer(axum::middleware::from_fn(auth_middleware))
         .with_state(state)
 }
@@ -101,7 +125,9 @@ async fn auth_middleware(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     if request.headers().get("x-skip-auth").is_none() {
-        request.extensions_mut().insert(AuthIdentity(TEST_KEY.to_string()));
+        request
+            .extensions_mut()
+            .insert(AuthIdentity(TEST_KEY.to_string()));
     }
     next.run(request).await
 }
@@ -131,9 +157,14 @@ async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value)
 async fn list_messages_until(app: &Router, message_box: &str, expected: usize) -> Value {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let (status, body) = post_json(app, "/listMessages", json!({
-            "messageBox": message_box
-        })).await;
+        let (status, body) = post_json(
+            app,
+            "/listMessages",
+            json!({
+                "messageBox": message_box
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let len = body["messages"].as_array().map(|a| a.len()).unwrap_or(0);
         if len >= expected || std::time::Instant::now() >= deadline {
@@ -190,14 +221,19 @@ async fn get_path_no_auth(app: &Router, path: &str) -> (StatusCode, Value) {
 
 // Helper: send a valid message and return the response.
 async fn send_valid_message(app: &Router, message_id: &str) -> (StatusCode, Value) {
-    post_json(app, "/sendMessage", json!({
-        "message": {
-            "recipient": RECIPIENT_KEY,
-            "messageBox": "inbox",
-            "messageId": message_id,
-            "body": "test message body"
-        }
-    })).await
+    post_json(
+        app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageBox": "inbox",
+                "messageId": message_id,
+                "body": "test message body"
+            }
+        }),
+    )
+    .await
 }
 
 // ===========================================================================
@@ -215,13 +251,18 @@ async fn test_send_message_missing_message() {
 #[tokio::test]
 async fn test_send_message_missing_recipient() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "messageBox": "inbox",
-            "messageId": "m1",
-            "body": "hello"
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "messageBox": "inbox",
+                "messageId": "m1",
+                "body": "hello"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_RECIPIENT_REQUIRED");
 }
@@ -229,14 +270,19 @@ async fn test_send_message_missing_recipient() {
 #[tokio::test]
 async fn test_send_message_invalid_recipient_key() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipient": "not-a-valid-key",
-            "messageBox": "inbox",
-            "messageId": "m1",
-            "body": "hello"
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": "not-a-valid-key",
+                "messageBox": "inbox",
+                "messageId": "m1",
+                "body": "hello"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_INVALID_RECIPIENT_KEY");
 }
@@ -244,13 +290,18 @@ async fn test_send_message_invalid_recipient_key() {
 #[tokio::test]
 async fn test_send_message_missing_message_box() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipient": RECIPIENT_KEY,
-            "messageId": "m1",
-            "body": "hello"
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageId": "m1",
+                "body": "hello"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_INVALID_MESSAGEBOX");
 }
@@ -258,13 +309,18 @@ async fn test_send_message_missing_message_box() {
 #[tokio::test]
 async fn test_send_message_missing_body() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipient": RECIPIENT_KEY,
-            "messageBox": "inbox",
-            "messageId": "m1"
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageBox": "inbox",
+                "messageId": "m1"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_INVALID_MESSAGE_BODY");
 }
@@ -272,13 +328,18 @@ async fn test_send_message_missing_body() {
 #[tokio::test]
 async fn test_send_message_missing_message_id() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipient": RECIPIENT_KEY,
-            "messageBox": "inbox",
-            "body": "hello"
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageBox": "inbox",
+                "body": "hello"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MESSAGEID_REQUIRED");
 }
@@ -286,14 +347,19 @@ async fn test_send_message_missing_message_id() {
 #[tokio::test]
 async fn test_send_message_id_count_mismatch() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipients": [RECIPIENT_KEY, TEST_KEY],
-            "messageBox": "inbox",
-            "messageId": "single-id",
-            "body": "hello"
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipients": [RECIPIENT_KEY, TEST_KEY],
+                "messageBox": "inbox",
+                "messageId": "single-id",
+                "body": "hello"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MESSAGEID_COUNT_MISMATCH");
 }
@@ -330,14 +396,19 @@ async fn test_send_message_duplicate() {
 #[tokio::test]
 async fn test_send_message_json_body() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipient": RECIPIENT_KEY,
-            "messageBox": "inbox",
-            "messageId": "json-body-msg",
-            "body": {"nested": "object", "count": 42}
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageBox": "inbox",
+                "messageId": "json-body-msg",
+                "body": {"nested": "object", "count": 42}
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
 }
@@ -357,9 +428,14 @@ async fn test_list_messages_missing_box() {
 #[tokio::test]
 async fn test_list_messages_empty_box() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/listMessages", json!({
-        "messageBox": "inbox"
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/listMessages",
+        json!({
+            "messageBox": "inbox"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
     assert!(body["messages"].as_array().unwrap().is_empty());
@@ -372,14 +448,19 @@ async fn test_list_messages_with_messages() {
     // The authenticated user is TEST_KEY. We send a message TO TEST_KEY
     // so that when TEST_KEY lists messages, it appears.
     // We need to send as a *different* sender but the recipient is TEST_KEY.
-    let (status, _) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipient": TEST_KEY,
-            "messageBox": "inbox",
-            "messageId": "list-test-1",
-            "body": "hello from test"
-        }
-    })).await;
+    let (status, _) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": TEST_KEY,
+                "messageBox": "inbox",
+                "messageId": "list-test-1",
+                "body": "hello from test"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Now list messages for the authenticated user (TEST_KEY). Persistence is
@@ -405,9 +486,14 @@ async fn test_acknowledge_missing_ids() {
 #[tokio::test]
 async fn test_acknowledge_invalid_ids_format() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/acknowledgeMessage", json!({
-        "messageIds": [123, 456]
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/acknowledgeMessage",
+        json!({
+            "messageIds": [123, 456]
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_INVALID_MESSAGE_ID");
 }
@@ -415,9 +501,14 @@ async fn test_acknowledge_invalid_ids_format() {
 #[tokio::test]
 async fn test_acknowledge_not_found() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/acknowledgeMessage", json!({
-        "messageIds": ["nonexistent-id"]
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/acknowledgeMessage",
+        json!({
+            "messageIds": ["nonexistent-id"]
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_INVALID_ACKNOWLEDGMENT");
 }
@@ -427,14 +518,19 @@ async fn test_acknowledge_success() {
     let app = setup_app().await;
 
     // Send message TO self (TEST_KEY) so we can acknowledge it
-    let (status, _) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipient": TEST_KEY,
-            "messageBox": "inbox",
-            "messageId": "ack-msg-1",
-            "body": "to be acked"
-        }
-    })).await;
+    let (status, _) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": TEST_KEY,
+                "messageBox": "inbox",
+                "messageId": "ack-msg-1",
+                "body": "to be acked"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Wait for the async persist worker to commit before acknowledging — the
@@ -442,16 +538,26 @@ async fn test_acknowledge_success() {
     list_messages_until(&app, "inbox", 1).await;
 
     // Acknowledge it
-    let (status, body) = post_json(&app, "/acknowledgeMessage", json!({
-        "messageIds": ["ack-msg-1"]
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/acknowledgeMessage",
+        json!({
+            "messageIds": ["ack-msg-1"]
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
 
     // Verify it's gone
-    let (status, body) = post_json(&app, "/listMessages", json!({
-        "messageBox": "inbox"
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/listMessages",
+        json!({
+            "messageBox": "inbox"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["messages"].as_array().unwrap().is_empty());
 }
@@ -471,10 +577,15 @@ async fn test_register_device_missing_token() {
 #[tokio::test]
 async fn test_register_device_invalid_platform() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/registerDevice", json!({
-        "fcmToken": "valid-token-123",
-        "platform": "windows"
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/registerDevice",
+        json!({
+            "fcmToken": "valid-token-123",
+            "platform": "windows"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_INVALID_PLATFORM");
 }
@@ -482,10 +593,15 @@ async fn test_register_device_invalid_platform() {
 #[tokio::test]
 async fn test_register_device_success() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/registerDevice", json!({
-        "fcmToken": "fcm-token-12345",
-        "platform": "android"
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/registerDevice",
+        json!({
+            "fcmToken": "fcm-token-12345",
+            "platform": "android"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
     assert!(body["deviceId"].as_i64().unwrap() > 0);
@@ -505,10 +621,15 @@ async fn test_list_devices_with_registered() {
     let app = setup_app().await;
 
     // Register a device first
-    let (status, _) = post_json(&app, "/registerDevice", json!({
-        "fcmToken": "a]very-long-fcm-token-that-gets-masked",
-        "platform": "ios"
-    })).await;
+    let (status, _) = post_json(
+        &app,
+        "/registerDevice",
+        json!({
+            "fcmToken": "a]very-long-fcm-token-that-gets-masked",
+            "platform": "ios"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // List devices
@@ -518,7 +639,10 @@ async fn test_list_devices_with_registered() {
     assert_eq!(devices.len(), 1);
     // Token should be masked (only last 10 chars shown)
     let token = devices[0]["fcmToken"].as_str().unwrap();
-    assert!(token.starts_with("..."), "fcm token should be masked: {}", token);
+    assert!(
+        token.starts_with("..."),
+        "fcm token should be masked: {token}"
+    );
 }
 
 // ===========================================================================
@@ -528,10 +652,15 @@ async fn test_list_devices_with_registered() {
 #[tokio::test]
 async fn test_set_permission_success() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/permissions/set", json!({
-        "messageBox": "inbox",
-        "recipientFee": 50
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/permissions/set",
+        json!({
+            "messageBox": "inbox",
+            "recipientFee": 50
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
 }
@@ -550,10 +679,15 @@ async fn test_get_permission_after_set() {
     let app = setup_app().await;
 
     // Set a permission
-    let (status, _) = post_json(&app, "/permissions/set", json!({
-        "messageBox": "inbox",
-        "recipientFee": 75
-    })).await;
+    let (status, _) = post_json(
+        &app,
+        "/permissions/set",
+        json!({
+            "messageBox": "inbox",
+            "recipientFee": 75
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
 
     // Retrieve it
@@ -571,14 +705,24 @@ async fn test_list_permissions() {
     let app = setup_app().await;
 
     // Set a couple permissions
-    post_json(&app, "/permissions/set", json!({
-        "messageBox": "inbox",
-        "recipientFee": 10
-    })).await;
-    post_json(&app, "/permissions/set", json!({
-        "messageBox": "notifications",
-        "recipientFee": 20
-    })).await;
+    post_json(
+        &app,
+        "/permissions/set",
+        json!({
+            "messageBox": "inbox",
+            "recipientFee": 10
+        }),
+    )
+    .await;
+    post_json(
+        &app,
+        "/permissions/set",
+        json!({
+            "messageBox": "notifications",
+            "recipientFee": 20
+        }),
+    )
+    .await;
 
     let (status, body) = get_path(&app, "/permissions/list").await;
     assert_eq!(status, StatusCode::OK);
@@ -591,10 +735,7 @@ async fn test_list_permissions() {
 #[tokio::test]
 async fn test_get_quote_single() {
     let app = setup_app().await;
-    let url = format!(
-        "/permissions/quote?messageBox=inbox&recipient={}",
-        RECIPIENT_KEY
-    );
+    let url = format!("/permissions/quote?messageBox=inbox&recipient={RECIPIENT_KEY}");
     let (status, body) = get_path(&app, &url).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
@@ -620,17 +761,27 @@ async fn test_no_auth_returns_401() {
     let app = setup_app().await;
 
     // Test POST endpoints without auth
-    let (status, body) = post_json_no_auth(&app, "/sendMessage", json!({
-        "message": {"body": "test"}
-    })).await;
+    let (status, body) = post_json_no_auth(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {"body": "test"}
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["code"], "ERR_AUTH_REQUIRED");
 
     // Test another POST endpoint
     let app = setup_app().await;
-    let (status, _) = post_json_no_auth(&app, "/listMessages", json!({
-        "messageBox": "inbox"
-    })).await;
+    let (status, _) = post_json_no_auth(
+        &app,
+        "/listMessages",
+        json!({
+            "messageBox": "inbox"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Test GET endpoint without auth
@@ -672,7 +823,10 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
         ws: ws_broadcast,
     };
     let app = Router::new()
-        .route("/sendMessage", post(crate::handlers::send_message::send_message))
+        .route(
+            "/sendMessage",
+            post(crate::handlers::send_message::send_message),
+        )
         .layer(axum::middleware::from_fn(auth_middleware))
         .with_state(state);
 
@@ -685,22 +839,26 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
     // A second valid compressed secp256k1 pubkey (66 hex chars, starts with 02/03).
     let other_recipient = "02e876feaf6b7f73fa7d1d7e5b2c2e1a0c7c0b9e3fa5a3d4a7b8c9d0e1f2a3b4c5";
 
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipients": [RECIPIENT_KEY, other_recipient],
-            "messageBox": "inbox",
-            "messageId": ["mid-1", "mid-2"],
-            "body": "should be blocked for one recipient"
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipients": [RECIPIENT_KEY, other_recipient],
+                "messageBox": "inbox",
+                "messageId": ["mid-1", "mid-2"],
+                "body": "should be blocked for one recipient"
+            }
+        }),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "ERR_DELIVERY_BLOCKED");
     let blocked = body["blockedRecipients"].as_array().unwrap();
     assert!(
         blocked.iter().any(|v| v == RECIPIENT_KEY),
-        "blockedRecipients must include the -1 recipient: got {:?}",
-        blocked
+        "blockedRecipients must include the -1 recipient: got {blocked:?}"
     );
 }
 
@@ -709,13 +867,21 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
 #[tokio::test]
 async fn test_list_messages_returns_empty_when_box_does_not_exist() {
     let app = setup_app().await;
-    let (status, body) = post_json(&app, "/listMessages", json!({
-        "messageBox": "never-created-box-xyz"
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/listMessages",
+        json!({
+            "messageBox": "never-created-box-xyz"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "success");
     let msgs = body["messages"].as_array().expect("messages array");
-    assert!(msgs.is_empty(), "messages should be empty for nonexistent box");
+    assert!(
+        msgs.is_empty(),
+        "messages should be empty for nonexistent box"
+    );
 }
 
 /// Duplicate messageId to the same recipient is idempotent: with async
@@ -756,14 +922,19 @@ async fn test_send_message_duplicate_writes_exactly_one_row() {
     // Send TO the authenticated lister (TEST_KEY) so listMessages sees the row.
     let mid = "dup-exactly-one";
     for _ in 0..2 {
-        let (status, body) = post_json(&app, "/sendMessage", json!({
-            "message": {
-                "recipient": TEST_KEY,
-                "messageBox": "inbox",
-                "messageId": mid,
-                "body": "duplicate body"
-            }
-        })).await;
+        let (status, body) = post_json(
+            &app,
+            "/sendMessage",
+            json!({
+                "message": {
+                    "recipient": TEST_KEY,
+                    "messageBox": "inbox",
+                    "messageId": mid,
+                    "body": "duplicate body"
+                }
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["status"], "success");
     }
@@ -777,12 +948,21 @@ async fn test_send_message_duplicate_writes_exactly_one_row() {
     // Give the worker another tick to (not) commit the duplicate, then confirm
     // there is still exactly one row — the INSERT IGNORE dedup held.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    let (status, body) = post_json(&app, "/listMessages", json!({
-        "messageBox": "inbox"
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/listMessages",
+        json!({
+            "messageBox": "inbox"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let messages = body["messages"].as_array().unwrap();
-    assert_eq!(messages.len(), 1, "duplicate messageId must not write a second row");
+    assert_eq!(
+        messages.len(),
+        1,
+        "duplicate messageId must not write a second row"
+    );
 }
 
 /// Gating-order invariant: a blocked recipient (fee = -1) is rejected with 403
@@ -812,8 +992,14 @@ async fn test_blocked_recipient_not_persisted_or_broadcast() {
         ws: ws_broadcast,
     };
     let app = Router::new()
-        .route("/sendMessage", post(crate::handlers::send_message::send_message))
-        .route("/listMessages", post(crate::handlers::list_messages::list_messages))
+        .route(
+            "/sendMessage",
+            post(crate::handlers::send_message::send_message),
+        )
+        .route(
+            "/listMessages",
+            post(crate::handlers::list_messages::list_messages),
+        )
         .layer(axum::middleware::from_fn(auth_middleware))
         .with_state(state);
 
@@ -822,23 +1008,33 @@ async fn test_blocked_recipient_not_persisted_or_broadcast() {
         .await
         .unwrap();
 
-    let (status, body) = post_json(&app, "/sendMessage", json!({
-        "message": {
-            "recipient": TEST_KEY,
-            "messageBox": "inbox",
-            "messageId": "blocked-mid-1",
-            "body": "should never persist"
-        }
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": TEST_KEY,
+                "messageBox": "inbox",
+                "messageId": "blocked-mid-1",
+                "body": "should never persist"
+            }
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["code"], "ERR_DELIVERY_BLOCKED");
 
     // A rejected send must NOT have persisted anything. Wait a worker tick to
     // rule out a late async write, then assert the inbox is empty.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    let (status, body) = post_json(&app, "/listMessages", json!({
-        "messageBox": "inbox"
-    })).await;
+    let (status, body) = post_json(
+        &app,
+        "/listMessages",
+        json!({
+            "messageBox": "inbox"
+        }),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let messages = body["messages"].as_array().unwrap();
     assert!(
@@ -859,14 +1055,19 @@ async fn test_concurrent_sends_all_persist_exactly_once() {
         let app = app.clone();
         handles.push(tokio::spawn(async move {
             let mid = format!("concurrent-mid-{i}");
-            let (status, _) = post_json(&app, "/sendMessage", json!({
-                "message": {
-                    "recipient": TEST_KEY,
-                    "messageBox": "inbox",
-                    "messageId": mid,
-                    "body": format!("concurrent body {i}")
-                }
-            })).await;
+            let (status, _) = post_json(
+                &app,
+                "/sendMessage",
+                json!({
+                    "message": {
+                        "recipient": TEST_KEY,
+                        "messageBox": "inbox",
+                        "messageId": mid,
+                        "body": format!("concurrent body {i}")
+                    }
+                }),
+            )
+            .await;
             assert_eq!(status, StatusCode::OK);
         }));
     }
@@ -895,4 +1096,3 @@ async fn test_concurrent_sends_all_persist_exactly_once() {
         distinct.len()
     );
 }
-
