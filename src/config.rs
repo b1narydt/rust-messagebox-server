@@ -27,6 +27,10 @@ pub struct Config {
     pub db_max_connections: u32,
     pub bsv_network: String,
     pub wallet_storage_url: String,
+    /// `REDIS_URL` — unset/empty → Model A (single instance, in-process
+    /// routing, the default); set → Model B (Redis pub/sub backplane for
+    /// cross-instance live push; safe to run N replicas behind a sticky LB).
+    pub redis_url: Option<String>,
     /// Parsed from `MESSAGEBOX_FEES=chat=10,priority=100` — applied at boot.
     pub message_box_fees: Vec<(String, i64)>,
     /// Parse warnings from `MESSAGEBOX_FEES` — emitted after the logger is up.
@@ -97,6 +101,9 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "https://storage.babbage.systems".to_string());
 
+        // Model A/B toggle — see the field doc. Whitespace-only counts as unset.
+        let redis_url = env::var("REDIS_URL").ok().filter(|s| !s.trim().is_empty());
+
         // Parse MESSAGEBOX_FEES=chat=10,priority=100
         // Format: comma-separated box_name=satoshis pairs. Whitespace is trimmed.
         // Malformed or negative entries are collected as warnings and emitted
@@ -113,6 +120,7 @@ impl Config {
             db_max_connections,
             bsv_network,
             wallet_storage_url,
+            redis_url,
             message_box_fees,
             message_box_fees_warnings,
         })
@@ -216,6 +224,7 @@ impl fmt::Debug for Config {
             .field("db_max_connections", &self.db_max_connections)
             .field("bsv_network", &self.bsv_network)
             .field("wallet_storage_url", &self.wallet_storage_url)
+            .field("redis_url", &self.redis_url.as_deref().map(redact_db_url))
             .field("message_box_fees", &self.message_box_fees)
             // message_box_fees_warnings are transient — omitted from Debug output.
             .finish()

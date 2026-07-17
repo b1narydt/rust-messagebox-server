@@ -32,6 +32,7 @@ fn test_config() -> Config {
         db_max_connections: 4,
         bsv_network: "testnet".to_string(),
         wallet_storage_url: "https://storage.babbage.systems".to_string(),
+        redis_url: None,
         message_box_fees: Vec::new(),
         message_box_fees_warnings: Vec::new(),
     }
@@ -65,7 +66,7 @@ async fn setup_app() -> Router {
     // but needs a default namespace registered to avoid panics on broadcast).
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
-    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
+    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone(), None);
 
     let state = AppState {
         db: pool,
@@ -710,7 +711,7 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
     let funded_wallet = test_funded_wallet().await;
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
-    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
+    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone(), None);
 
     let state = AppState {
         db: pool.clone(),
@@ -876,7 +877,7 @@ async fn test_blocked_recipient_not_persisted_or_broadcast() {
     let funded_wallet = test_funded_wallet().await;
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
-    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
+    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone(), None);
 
     let state = AppState {
         db: pool.clone(),

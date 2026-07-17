@@ -142,10 +142,30 @@ async fn main() {
     let port = config.port;
     let prefix = config.routing_prefix.clone();
 
+    // Topology (transport-architecture WS2-3): no REDIS_URL → Model A
+    // (single instance, in-process routing). REDIS_URL set → Model B
+    // (Redis pub/sub backplane; N replicas behind a sticky LB). Same binary,
+    // config decides. Redis is live-push only — durability stays in MySQL.
+    let backplane = config
+        .redis_url
+        .as_deref()
+        .map(messagebox_server::backplane::Backplane::new);
+    match &backplane {
+        Some(bp) => tracing::info!(
+            instance = %bp.instance_id(),
+            "topology: Model B — Redis backplane enabled (cross-instance live push)"
+        ),
+        None => tracing::info!("topology: Model A — single instance, in-process routing"),
+    }
+
     // Set up Socket.IO for WebSocket live message push
     let (sio_layer, io) = socketioxide::SocketIo::new_layer();
-    let ws_broadcast =
-        ws::WsBroadcast::new(io.clone(), config.server_private_key.clone(), pool.clone());
+    let ws_broadcast = ws::WsBroadcast::new(
+        io.clone(),
+        config.server_private_key.clone(),
+        pool.clone(),
+        backplane,
+    );
     ws::setup_handlers(&io, ws_broadcast.clone());
     tracing::info!("Socket.IO WebSocket server ready");
 

@@ -29,6 +29,17 @@
 //! `Arc`-clone-out locks — the crate carries forward the design this server
 //! adopted after a documented 100%→15% delivery collapse under a single
 //! global session lock.
+//!
+//! ## Topology: Model A / Model B (one code path)
+//!
+//! [`WsBroadcast::broadcast_to_room`] always runs the same signed
+//! local-delivery leg ([`WsBroadcast::deliver_local`]). With a
+//! [`crate::backplane::Backplane`] attached (Model B, `REDIS_URL` set) it
+//! *additionally* enqueues the UNSIGNED [`RoomMessage`] to Redis so the
+//! instances owning the recipient's sockets can sign and deliver to their
+//! local members — carry-unsigned/sign-on-owner. Model A simply skips that
+//! publish; the delivery path itself never diverges. Redis is live-push
+//! only: durability is always the MySQL mailbox + HTTP `/listMessages`.
 
 use std::sync::Arc;
 
@@ -53,7 +64,10 @@ pub use authsocket::room_id;
 /// Includes `created_at` and `updated_at` fields required by the client's
 /// `ServerPeerMessage` parser. Without these, the client's handler fails to
 /// deserialize the broadcast and the callback never fires.
-#[derive(Serialize, Clone, Debug)]
+///
+/// `Deserialize` exists for the Model B backplane, which carries this exact
+/// (unsigned) shape between instances — see [`crate::backplane`].
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
 pub struct RoomMessage {
     #[serde(rename = "messageId")]
     pub message_id: String,
@@ -81,20 +95,46 @@ pub struct WsBroadcast {
     /// and then hand the INSERT to this worker so MySQL latency never blocks
     /// live delivery. See [`crate::persist`].
     persist: crate::persist::PersistHandle,
+    /// Model B backplane (`REDIS_URL` set) — `None` means Model A: single
+    /// instance, in-process routing only. See [`crate::backplane`].
+    backplane: Option<Arc<crate::backplane::Backplane>>,
 }
 
 impl WsBroadcast {
-    pub fn new(io: SocketIo, server_private_key_hex: String, db: DbPool) -> Self {
+    /// `backplane: None` → Model A (the default). `Some` → Model B: local
+    /// broadcasts are additionally published (unsigned) to Redis, and a
+    /// background task delivers remote-origin envelopes to local room
+    /// members through the same signed path.
+    pub fn new(
+        io: SocketIo,
+        server_private_key_hex: String,
+        db: DbPool,
+        backplane: Option<Arc<crate::backplane::Backplane>>,
+    ) -> Self {
         let persist = crate::persist::PersistHandle::spawn(
             db.clone(),
             crate::persist::PersistConfig::default(),
         );
-        Self {
+        let ws = Self {
             io,
             core: Arc::new(AuthSocketServer::new()),
             server_private_key_hex,
             persist,
+            backplane,
+        };
+        if let Some(bp) = &ws.backplane {
+            match bp.take_delivery_rx() {
+                Some(rx) => {
+                    tokio::spawn(backplane_delivery_task(ws.clone(), bp.clone(), rx));
+                }
+                None => {
+                    // A Backplane is single-consumer; a second WsBroadcast on
+                    // the same handle would split the subscription stream.
+                    warn!("backplane delivery stream already taken — this WsBroadcast will not receive cross-instance pushes");
+                }
+            }
         }
+        ws
     }
 
     /// Enqueue a message for asynchronous, durable persistence (off the hot
@@ -122,9 +162,17 @@ impl WsBroadcast {
     /// initiate a handshake). The message is already persisted, so failures
     /// never propagate to the caller.
     ///
-    /// Returns the number of room members the signed frame was successfully
-    /// emitted to; a non-empty room delivering to zero members is logged at
-    /// `warn` inside the adapter as a degradation signal.
+    /// Returns the number of **local** room members the signed frame was
+    /// successfully emitted to (in Model B, remote deliveries happen on the
+    /// instances owning those sockets and are not counted here); a non-empty
+    /// room delivering to zero members is logged at `warn` inside the adapter
+    /// as a degradation signal.
+    ///
+    /// One code path across topologies: the signed local leg
+    /// ([`Self::deliver_local`]) is identical in Model A and Model B; Model B
+    /// only *adds* a non-blocking publish of the UNSIGNED message so owner
+    /// instances elsewhere can run the same local leg for their members
+    /// (carry-unsigned/sign-on-owner). Model A skips the publish.
     pub async fn broadcast_to_room(&self, room_id: &str, event: &str, msg: &RoomMessage) -> usize {
         let data = match serde_json::to_value(msg) {
             Ok(v) => v,
@@ -133,8 +181,71 @@ impl WsBroadcast {
                 return 0;
             }
         };
-        emit_signed_to_room(&self.io, &self.core, room_id, event, &data).await
+        // Model B: hand the unsigned message to the backplane first (a
+        // non-blocking enqueue) so the cross-instance hop overlaps with the
+        // local signing below. Best-effort by design — Redis down degrades
+        // to persist + HTTP /listMessages, never fails the send.
+        if let Some(bp) = &self.backplane {
+            bp.publish(room_id, event, msg);
+        }
+        // Local leg — identical in Model A and Model B.
+        self.deliver_local(room_id, event, &data).await
     }
+
+    /// The one signed local-delivery path: sign for every authenticated local
+    /// member of `room_id` (this instance's Peer sessions — the per-instance
+    /// room registry) and emit over their sockets. Used by both the direct
+    /// broadcast path and the Model B backplane delivery task; keeping them
+    /// on one function is what keeps Model A and Model B from diverging.
+    async fn deliver_local(&self, room_id: &str, event: &str, data: &serde_json::Value) -> usize {
+        emit_signed_to_room(&self.io, &self.core, room_id, event, data).await
+    }
+}
+
+/// Model B: drain the backplane subscription and deliver every
+/// **remote-origin** envelope to local room members via the same signed
+/// local-delivery path the direct broadcast uses. Own-origin envelopes are
+/// skipped — the publishing instance already ran its local leg at publish
+/// time (skipping prevents double delivery, not a correctness gate: the
+/// client also dedupes on messageId).
+///
+/// Only this instance holds the authsocket `Peer` sessions for its sockets,
+/// so only it can sign for them — the envelope arrives UNSIGNED and signing
+/// happens here, on the connection owner.
+async fn backplane_delivery_task(
+    ws: WsBroadcast,
+    bp: Arc<crate::backplane::Backplane>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    while let Some(raw) = rx.recv().await {
+        let envelope: crate::backplane::BackplaneEnvelope = match serde_json::from_str(&raw) {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "backplane: undecodable envelope — skipped");
+                continue;
+            }
+        };
+        if envelope.origin == bp.instance_id() {
+            continue;
+        }
+        let data = match serde_json::to_value(&envelope.message) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "backplane: envelope message failed to re-serialize — skipped");
+                continue;
+            }
+        };
+        let delivered = ws
+            .deliver_local(&envelope.room_id, &envelope.event, &data)
+            .await;
+        debug!(
+            origin = %envelope.origin,
+            room = %envelope.room_id,
+            delivered,
+            "backplane: remote-origin message delivered to local members"
+        );
+    }
+    debug!("backplane delivery task ended (subscription stream closed)");
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +519,7 @@ mod tests {
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .connect_lazy("mysql://test@127.0.0.1/test")
             .expect("build lazy MySQL pool");
-        WsBroadcast::new(io, TEST_SERVER_KEY.to_string(), pool)
+        WsBroadcast::new(io, TEST_SERVER_KEY.to_string(), pool, None)
     }
 
     fn test_room_message() -> RoomMessage {

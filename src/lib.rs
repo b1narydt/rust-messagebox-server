@@ -1,3 +1,4 @@
+pub mod backplane;
 pub mod cloneable_wallet;
 pub mod config;
 pub mod db;
