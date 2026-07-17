@@ -66,6 +66,19 @@ pub struct PermissionRow {
     pub updated_at: String,
 }
 
+#[derive(Debug)]
+pub struct DeviceRow {
+    pub id: i64,
+    pub identity_key: String,
+    pub fcm_token: String,
+    pub device_id: Option<String>,
+    pub platform: Option<String>,
+    pub last_used: Option<String>,
+    pub active: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 // ---------------------------------------------------------------------------
 // Message-box helpers
 // ---------------------------------------------------------------------------
@@ -455,4 +468,138 @@ pub async fn list_permissions(
     }
 
     Ok((out, total_count))
+}
+
+// ---------------------------------------------------------------------------
+// Device registrations (parity audit §4 — the TS notification/device contract)
+// ---------------------------------------------------------------------------
+
+/// Upsert a device registration keyed on the UNIQUE `fcm_token`.
+///
+/// On conflict the row is re-pointed at the caller's `identity_key` (token
+/// reassignment across accounts is deliberate — TS behavior), `device_id` /
+/// `platform` are refreshed, the device is reactivated, and `last_used` is
+/// bumped. Returns the row id; on an upsert-hit this is the EXISTING row's id
+/// (looked up explicitly — TS's knex `.onConflict().merge()` insert-id on
+/// update is driver-defined, so the lookup is the deterministic fix).
+pub async fn register_device(
+    pool: &DbPool,
+    identity_key: &str,
+    fcm_token: &str,
+    device_id: Option<&str>,
+    platform: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    let result = sqlx::query(
+        "INSERT INTO device_registrations \
+           (identity_key, fcm_token, device_id, platform, last_used, active) \
+         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, 1) \
+         ON DUPLICATE KEY UPDATE \
+           identity_key = VALUES(identity_key), \
+           device_id = VALUES(device_id), \
+           platform = VALUES(platform), \
+           last_used = CURRENT_TIMESTAMP, \
+           active = 1, \
+           updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(identity_key)
+    .bind(fcm_token)
+    .bind(device_id)
+    .bind(platform)
+    .execute(pool)
+    .await?;
+
+    // On an INSERT last_insert_id is the new id; on an UPDATE (upsert hit an
+    // existing row) MySQL may report 0. For the existing-row case, look it up.
+    let id = result.last_insert_id() as i64;
+    if id > 0 {
+        return Ok(id);
+    }
+    let found: i64 = sqlx::query_scalar(
+        "SELECT CAST(id AS SIGNED) FROM device_registrations WHERE fcm_token = ?",
+    )
+    .bind(fcm_token)
+    .fetch_one(pool)
+    .await?;
+    Ok(found)
+}
+
+/// All of the caller's devices, ordered `updated_at DESC` (TS contract H14).
+pub async fn list_devices(
+    pool: &DbPool,
+    identity_key: &str,
+) -> Result<Vec<DeviceRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT CAST(id AS SIGNED) AS id, identity_key, fcm_token, device_id, platform, \
+                last_used, active, created_at, updated_at \
+         FROM device_registrations WHERE identity_key = ? ORDER BY updated_at DESC",
+    )
+    .bind(identity_key)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_device).collect()
+}
+
+/// Active devices only — the FCM fan-out set for a recipient.
+pub async fn list_active_devices(
+    pool: &DbPool,
+    identity_key: &str,
+) -> Result<Vec<DeviceRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT CAST(id AS SIGNED) AS id, identity_key, fcm_token, device_id, platform, \
+                last_used, active, created_at, updated_at \
+         FROM device_registrations WHERE identity_key = ? AND active = 1 \
+         ORDER BY updated_at DESC",
+    )
+    .bind(identity_key)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter().map(row_to_device).collect()
+}
+
+fn row_to_device(row: sqlx::mysql::MySqlRow) -> Result<DeviceRow, sqlx::Error> {
+    Ok(DeviceRow {
+        id: row.try_get::<i64, _>("id")?,
+        identity_key: row.try_get("identity_key")?,
+        fcm_token: row.try_get("fcm_token")?,
+        device_id: row.try_get("device_id")?,
+        platform: row.try_get("platform")?,
+        last_used: row
+            .try_get::<Option<DateTime<Utc>>, _>("last_used")?
+            .map(fmt_ts),
+        active: row.try_get::<bool, _>("active")?,
+        created_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("created_at")?),
+        updated_at: fmt_ts(row.try_get::<DateTime<Utc>, _>("updated_at")?),
+    })
+}
+
+/// Successful FCM delivery: bump `last_used` (token lifecycle, §4.3).
+pub async fn update_device_last_used(pool: &DbPool, device_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE device_registrations \
+         SET last_used = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ?",
+    )
+    .bind(device_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// FCM reported the token permanently invalid: deactivate (token lifecycle, §4.3).
+pub async fn deactivate_device(pool: &DbPool, device_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE device_registrations \
+         SET active = 0, updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ?",
+    )
+    .bind(device_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// FCM delivery is gated on exactly one magic box name — `notifications`
+/// (TS `shouldUseFCMDelivery`).
+pub fn should_use_fcm_delivery(message_box: &str) -> bool {
+    message_box == "notifications"
 }

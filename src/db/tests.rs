@@ -562,8 +562,8 @@ async fn test_concurrent_message_operations() {
 // Baseline schema (migration squash, design D1/D2)
 // ---------------------------------------------------------------------------
 
-/// Fresh deploy produces exactly the 4 baseline tables — `device_registrations`
-/// is gone until the Phase-5 parity rebuild re-adds it.
+/// Fresh deploy produces exactly the 4 baseline tables plus
+/// `device_registrations` (re-added by the Phase-5 parity rebuild, TS DDL).
 #[tokio::test]
 async fn test_baseline_schema_tables() {
     let pool = fresh_pool().await;
@@ -578,13 +578,130 @@ async fn test_baseline_schema_tables() {
     assert_eq!(
         tables,
         vec![
+            "device_registrations".to_string(),
             "messageBox".to_string(),
             "message_permissions".to_string(),
             "messages".to_string(),
             "server_fees".to_string(),
         ],
-        "baseline must create exactly messageBox, message_permissions, messages, server_fees"
+        "fresh deploy must create exactly the 4 baseline tables + device_registrations"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Device registrations (parity audit §4 — TS contract)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_register_device_insert_and_list() {
+    let pool = fresh_pool().await;
+    let id = register_device(
+        &pool,
+        TEST_KEY,
+        "token-abc-1234567890",
+        Some("dev1"),
+        Some("ios"),
+    )
+    .await
+    .unwrap();
+    assert!(id > 0);
+
+    let devices = list_devices(&pool, TEST_KEY).await.unwrap();
+    assert_eq!(devices.len(), 1);
+    let d = &devices[0];
+    assert_eq!(d.id, id);
+    assert_eq!(d.fcm_token, "token-abc-1234567890");
+    assert_eq!(d.device_id.as_deref(), Some("dev1"));
+    assert_eq!(d.platform.as_deref(), Some("ios"));
+    assert!(d.active);
+    assert!(d.last_used.is_some(), "registration bumps last_used");
+}
+
+/// Upsert on the UNIQUE fcm_token returns the EXISTING row id (H13 — the
+/// deterministic fix over TS's driver-defined knex insert-id on update).
+#[tokio::test]
+async fn test_register_device_upsert_returns_existing_id() {
+    let pool = fresh_pool().await;
+    let id1 = register_device(&pool, TEST_KEY, "token-upsert-1", Some("dev1"), Some("ios"))
+        .await
+        .unwrap();
+    let id2 = register_device(
+        &pool,
+        TEST_KEY,
+        "token-upsert-1",
+        Some("dev2"),
+        Some("android"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(id1, id2, "upsert must return the existing row's id");
+
+    let devices = list_devices(&pool, TEST_KEY).await.unwrap();
+    assert_eq!(devices.len(), 1, "upsert must not create a second row");
+    assert_eq!(devices[0].device_id.as_deref(), Some("dev2"));
+    assert_eq!(devices[0].platform.as_deref(), Some("android"));
+}
+
+/// Token moving owners re-points identity_key at the new caller (deliberate
+/// TS behavior — the token identifies the physical device).
+#[tokio::test]
+async fn test_register_device_token_reassignment_moves_owner() {
+    let pool = fresh_pool().await;
+    register_device(&pool, TEST_KEY, "token-moved-1", None, None)
+        .await
+        .unwrap();
+    register_device(&pool, TEST_KEY2, "token-moved-1", None, None)
+        .await
+        .unwrap();
+
+    assert!(list_devices(&pool, TEST_KEY).await.unwrap().is_empty());
+    let devices = list_devices(&pool, TEST_KEY2).await.unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].identity_key, TEST_KEY2);
+}
+
+/// Deactivated devices drop out of the FCM fan-out set but still list; a
+/// re-registration reactivates.
+#[tokio::test]
+async fn test_deactivate_and_reactivate_device() {
+    let pool = fresh_pool().await;
+    let id = register_device(&pool, TEST_KEY, "token-deact-1", None, None)
+        .await
+        .unwrap();
+
+    deactivate_device(&pool, id).await.unwrap();
+    assert!(list_active_devices(&pool, TEST_KEY)
+        .await
+        .unwrap()
+        .is_empty());
+    let all = list_devices(&pool, TEST_KEY).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(!all[0].active);
+
+    // Re-registering the same token reactivates it.
+    register_device(&pool, TEST_KEY, "token-deact-1", None, None)
+        .await
+        .unwrap();
+    assert_eq!(list_active_devices(&pool, TEST_KEY).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_update_device_last_used() {
+    let pool = fresh_pool().await;
+    let id = register_device(&pool, TEST_KEY, "token-lu-1", None, None)
+        .await
+        .unwrap();
+    update_device_last_used(&pool, id).await.unwrap();
+    let devices = list_devices(&pool, TEST_KEY).await.unwrap();
+    assert!(devices[0].last_used.is_some());
+}
+
+#[test]
+fn test_should_use_fcm_delivery_gate() {
+    assert!(should_use_fcm_delivery("notifications"));
+    assert!(!should_use_fcm_delivery("inbox"));
+    assert!(!should_use_fcm_delivery("Notifications"));
+    assert!(!should_use_fcm_delivery("notifications2"));
 }
 
 /// `messages` has a REAL primary key (design D1 — fixes the TS no-PK artifact)
