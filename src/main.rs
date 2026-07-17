@@ -164,7 +164,7 @@ async fn main() {
         io.clone(),
         config.server_private_key.clone(),
         pool.clone(),
-        backplane,
+        backplane.clone(),
     );
     ws::setup_handlers(&io, ws_broadcast.clone());
     tracing::info!("Socket.IO WebSocket server ready");
@@ -195,7 +195,7 @@ async fn main() {
         db: pool,
         config: Arc::new(config),
         funded_wallet,
-        ws: ws_broadcast,
+        ws: ws_broadcast.clone(),
     };
 
     let cors = CorsLayer::new()
@@ -216,17 +216,58 @@ async fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(10 * 1024 * 1024);
 
-    // Unauthenticated health endpoint — always at `/`, never under the
-    // routing prefix, never behind BRC-103/104 auth. Returns plain text.
-    let health_routes = Router::new().route(
-        "/",
-        get(|| async {
-            (
-                [(axum::http::header::CONTENT_TYPE, "text/plain")],
-                "BSV MessageBox Server",
-            )
-        }),
-    );
+    // Unauthenticated ops endpoints — always at the root, never under the
+    // routing prefix, never behind BRC-103/104 auth. `GET /` returns plain
+    // text (the pre-existing extension over TS, which has no health route);
+    // `GET /metrics` is the Prometheus scrape target (operational counts
+    // only — no identities, no message data, no key material).
+    let metrics_ws = ws_broadcast.clone();
+    let metrics_backplane = backplane.clone();
+    let health_routes = Router::new()
+        .route(
+            "/",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                    "BSV MessageBox Server",
+                )
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let ws = metrics_ws.clone();
+                let backplane = metrics_backplane.clone();
+                async move {
+                    let (connections, identities) = ws.live_counts();
+                    let (depth, capacity) = ws.persist_queue();
+                    let persist = ws.persist_stats();
+                    let page =
+                        messagebox_server::metrics::render(&messagebox_server::metrics::Snapshot {
+                            connections,
+                            authenticated_identities: identities,
+                            persist_queue_depth: depth,
+                            persist_queue_capacity: capacity,
+                            persist: &persist,
+                            backplane: backplane.as_ref().map(|bp| {
+                                messagebox_server::metrics::BackplaneSnapshot {
+                                    published: bp.published(),
+                                    dropped: bp.dropped(),
+                                    subscribed: bp.is_subscribed(),
+                                }
+                            }),
+                            ops: None,
+                        });
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
+                        page,
+                    )
+                }
+            }),
+        );
 
     // Protected API routes — BRC-103/104 auth via bsv-sdk Peer middleware
     let api_routes = Router::new()

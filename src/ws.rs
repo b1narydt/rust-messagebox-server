@@ -197,8 +197,46 @@ impl WsBroadcast {
     /// room registry) and emit over their sockets. Used by both the direct
     /// broadcast path and the Model B backplane delivery task; keeping them
     /// on one function is what keeps Model A and Model B from diverging.
+    ///
+    /// Because every delivery goes through here, this is also the single
+    /// observation point for the fan-out + sign-latency metrics.
     async fn deliver_local(&self, room_id: &str, event: &str, data: &serde_json::Value) -> usize {
-        emit_signed_to_room(&self.io, &self.core, room_id, event, data).await
+        let start = std::time::Instant::now();
+        let delivered = emit_signed_to_room(&self.io, &self.core, room_id, event, data).await;
+        crate::metrics::BROADCAST_SIGN_SECONDS.observe(start.elapsed().as_secs_f64());
+        crate::metrics::BROADCAST_FANOUT.observe(delivered as f64);
+        delivered
+    }
+
+    /// Scrape-time sample: (connected sockets, distinct verified identities).
+    /// Identities are the room owners (own-room enforcement means one identity
+    /// ⇔ one room family) — the `mbs_rooms` lower bound; authsocket 0.1.0
+    /// exposes no room enumeration.
+    pub fn live_counts(&self) -> (usize, usize) {
+        let sockets = self.io.sockets().unwrap_or_default();
+        let mut identities = std::collections::HashSet::new();
+        for s in &sockets {
+            if let Some(key) = self.core.identity_key(&s.id.to_string()) {
+                identities.insert(key);
+            }
+        }
+        (sockets.len(), identities.len())
+    }
+
+    /// Persist-pipeline counters (shared with the background worker).
+    pub fn persist_stats(&self) -> Arc<crate::persist::PersistStats> {
+        Arc::clone(self.persist.stats())
+    }
+
+    /// Scrape-time sample of the persist queue: (depth, capacity).
+    pub fn persist_queue(&self) -> (usize, usize) {
+        (self.persist.queue_depth(), self.persist.queue_capacity())
+    }
+
+    /// Bounded wait for the persist queue to fully drain (graceful shutdown).
+    /// See [`crate::persist::PersistHandle::flush`].
+    pub async fn flush_persist(&self, timeout: std::time::Duration) -> bool {
+        self.persist.flush(timeout).await
     }
 }
 
@@ -226,6 +264,14 @@ async fn backplane_delivery_task(
             }
         };
         if envelope.origin == bp.instance_id() {
+            // Own envelope back off the channel: skip delivery (the local leg
+            // already ran at publish time), but use it to measure pub/sub
+            // round-trip lag on a single clock (publisher == observer).
+            if envelope.published_at_us > 0 {
+                let lag_us =
+                    crate::backplane::now_epoch_us().saturating_sub(envelope.published_at_us);
+                crate::metrics::BACKPLANE_LAG_SECONDS.observe(lag_us as f64 / 1e6);
+            }
             continue;
         }
         let data = match serde_json::to_value(&envelope.message) {

@@ -76,6 +76,21 @@ pub struct BackplaneEnvelope {
     pub room_id: String,
     pub event: String,
     pub message: RoomMessage,
+    /// Publisher's wall clock at enqueue time (µs since epoch). Used for the
+    /// pub/sub-lag metric: the publishing instance observes its OWN envelope
+    /// coming back off the channel and measures publish→subscribe round-trip
+    /// on a single clock (no cross-instance skew). `0`/absent = unknown
+    /// (older publisher during a rolling deploy) — no lag sample is taken.
+    #[serde(rename = "publishedAtUs", default)]
+    pub published_at_us: u64,
+}
+
+/// Microseconds since the Unix epoch (publisher clock).
+pub(crate) fn now_epoch_us() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
 }
 
 /// Handle to the Model B backplane: a non-blocking publisher plus a
@@ -141,6 +156,7 @@ impl Backplane {
             room_id: room_id.to_string(),
             event: event.to_string(),
             message: message.clone(),
+            published_at_us: now_epoch_us(),
         };
         let payload = match serde_json::to_string(&envelope) {
             Ok(p) => p,
@@ -366,11 +382,13 @@ mod tests {
             room_id: "03bb-inbox".into(),
             event: "sendMessage-03bb-inbox".into(),
             message: room_message(),
+            published_at_us: 1_700_000_000_000_000,
         };
         let v = serde_json::to_value(&env).expect("serialize");
         assert_eq!(v["origin"], "abc123");
         assert_eq!(v["roomId"], "03bb-inbox");
         assert_eq!(v["event"], "sendMessage-03bb-inbox");
+        assert_eq!(v["publishedAtUs"], 1_700_000_000_000_000u64);
         // The carried message is the plain RoomMessage JSON…
         assert_eq!(
             v["message"],
