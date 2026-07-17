@@ -78,7 +78,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, Instrument};
 
 use crate::db::{self, DbPool};
 
@@ -452,7 +452,15 @@ async fn run_drain(
         };
         match next {
             Some(job) => {
-                persist_with_retry(&db, &job, &cfg, &stats, persist_once_db).await;
+                let span = tracing::debug_span!(
+                    "persist_job",
+                    msg_id = %job.message_id,
+                    recipient = %job.recipient,
+                    message_box = %job.message_box,
+                );
+                persist_with_retry(&db, &job, &cfg, &stats, persist_once_db)
+                    .instrument(span)
+                    .await;
                 // Counted after the retry loop resolves (stored / duplicate /
                 // dead-lettered): `completed` means "no longer pending", which
                 // is what `flush` waits on during graceful drain.

@@ -15,6 +15,11 @@ use crate::handlers::response_types::{
     DeliveryBlockedError, SendMessageResponse, SendMessageResult,
 };
 
+#[tracing::instrument(
+    name = "http_send_message",
+    skip_all,
+    fields(sender = %auth.0, message_box = tracing::field::Empty, recipients = tracing::field::Empty)
+)]
 pub async fn send_message(
     State(state): State<AppState>,
     auth: AuthIdentity,
@@ -47,6 +52,8 @@ pub async fn send_message(
             .into_response();
         }
     };
+
+    tracing::Span::current().record("message_box", tracing::field::display(&box_type));
 
     // ── body ──────────────────────────────────────────────────────────
     let msg_body_val = msg.get("body");
@@ -131,6 +138,8 @@ pub async fn send_message(
         )
         .into_response();
     }
+
+    tracing::Span::current().record("recipients", recipients.len());
 
     // Validate recipient keys.
     for r in &recipients {

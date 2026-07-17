@@ -151,6 +151,12 @@ impl Backplane {
     /// and best-effort: on a full queue (Redis down/backed up) the frame is
     /// dropped and counted — never stalls or fails the caller's send.
     pub fn publish(&self, room_id: &str, event: &str, message: &RoomMessage) {
+        let _span = tracing::debug_span!(
+            "backplane_publish",
+            room = %room_id,
+            msg_id = %message.message_id,
+        )
+        .entered();
         let envelope = BackplaneEnvelope {
             origin: self.instance_id.clone(),
             room_id: room_id.to_string(),

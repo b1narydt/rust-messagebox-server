@@ -46,7 +46,7 @@ use std::sync::Arc;
 use serde::Serialize;
 use socketioxide::extract::SocketRef;
 use socketioxide::SocketIo;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use authsocket::server::{AuthSocketServer, SharedAuthSocketServer};
 use authsocket::server_io::{attach, emit_signed_to_room, emit_signed_to_socket, AppDispatcher};
@@ -174,22 +174,35 @@ impl WsBroadcast {
     /// instances elsewhere can run the same local leg for their members
     /// (carry-unsigned/sign-on-owner). Model A skips the publish.
     pub async fn broadcast_to_room(&self, room_id: &str, event: &str, msg: &RoomMessage) -> usize {
-        let data = match serde_json::to_value(msg) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "failed to serialize room message");
-                return 0;
+        let span = tracing::debug_span!(
+            "broadcast",
+            room = %room_id,
+            event = %event,
+            msg_id = %msg.message_id,
+            delivered = tracing::field::Empty,
+        );
+        async {
+            let data = match serde_json::to_value(msg) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "failed to serialize room message");
+                    return 0;
+                }
+            };
+            // Model B: hand the unsigned message to the backplane first (a
+            // non-blocking enqueue) so the cross-instance hop overlaps with the
+            // local signing below. Best-effort by design — Redis down degrades
+            // to persist + HTTP /listMessages, never fails the send.
+            if let Some(bp) = &self.backplane {
+                bp.publish(room_id, event, msg);
             }
-        };
-        // Model B: hand the unsigned message to the backplane first (a
-        // non-blocking enqueue) so the cross-instance hop overlaps with the
-        // local signing below. Best-effort by design — Redis down degrades
-        // to persist + HTTP /listMessages, never fails the send.
-        if let Some(bp) = &self.backplane {
-            bp.publish(room_id, event, msg);
+            // Local leg — identical in Model A and Model B.
+            let delivered = self.deliver_local(room_id, event, &data).await;
+            tracing::Span::current().record("delivered", delivered);
+            delivered
         }
-        // Local leg — identical in Model A and Model B.
-        self.deliver_local(room_id, event, &data).await
+        .instrument(span)
+        .await
     }
 
     /// The one signed local-delivery path: sign for every authenticated local
@@ -274,22 +287,31 @@ async fn backplane_delivery_task(
             }
             continue;
         }
-        let data = match serde_json::to_value(&envelope.message) {
-            Ok(v) => v,
-            Err(e) => {
-                warn!(error = %e, "backplane: envelope message failed to re-serialize — skipped");
-                continue;
-            }
-        };
-        let delivered = ws
-            .deliver_local(&envelope.room_id, &envelope.event, &data)
-            .await;
-        debug!(
+        // subscribe → sign → deliver: the owner-side leg of the Model B path.
+        let span = tracing::debug_span!(
+            "backplane_deliver",
             origin = %envelope.origin,
             room = %envelope.room_id,
-            delivered,
-            "backplane: remote-origin message delivered to local members"
+            msg_id = %envelope.message.message_id,
         );
+        async {
+            let data = match serde_json::to_value(&envelope.message) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "backplane: envelope message failed to re-serialize — skipped");
+                    return;
+                }
+            };
+            let delivered = ws
+                .deliver_local(&envelope.room_id, &envelope.event, &data)
+                .await;
+            debug!(
+                delivered,
+                "backplane: remote-origin message delivered to local members"
+            );
+        }
+        .instrument(span)
+        .await;
     }
     debug!("backplane delivery task ended (subscription stream closed)");
 }
@@ -397,6 +419,11 @@ const MAX_MESSAGE_BODY_BYTES: usize = 1024 * 1024;
 ///
 /// Pushes the message live to the target room, enqueues the durable INSERT,
 /// and emits a signed `sendMessageAck-{roomId}` back to the sender.
+#[tracing::instrument(
+    name = "ws_send_message",
+    skip_all,
+    fields(sid = %sid, sender = %sender, msg_id = tracing::field::Empty, room = tracing::field::Empty)
+)]
 async fn handle_ws_send_message(
     socket: &SocketRef,
     ws: &WsBroadcast,
@@ -428,6 +455,10 @@ async fn handle_ws_send_message(
             return;
         }
     };
+    // Backfill the span fields declared Empty on the instrument attribute.
+    let span = tracing::Span::current();
+    span.record("msg_id", tracing::field::display(&message_id));
+    span.record("room", tracing::field::display(&room_id_str));
 
     let recipient = match message.get("recipient").and_then(|v| v.as_str()) {
         Some(r) if !r.is_empty() => r.to_string(),
