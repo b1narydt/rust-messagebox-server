@@ -81,7 +81,7 @@ async fn main() {
 
     // Build the funded wallet that can internalize incoming delivery-fee payments.
     // Uses StorageClient<WalletArc<SdkProtoWallet>> to forward all storage calls
-    // (including internalizeAction) to the remote wallet-storage backend via BRC-31
+    // (including internalizeAction) to the remote wallet-storage backend via BRC-103/104
     // authenticated JSON-RPC. The WalletArc wrapper makes SdkProtoWallet Clone-able
     // so it satisfies StorageClient<W: Clone>'s bound.
     let chain = if config.bsv_network == "mainnet" {
@@ -156,7 +156,7 @@ async fn main() {
     ws::setup_handlers(&io, ws_broadcast.clone());
     tracing::info!("Socket.IO WebSocket server ready");
 
-    // Set up BRC-31 auth middleware (bsv-sdk Peer — concurrency-safe API).
+    // Set up BRC-103/104 auth middleware (bsv-sdk Peer — concurrency-safe API).
     //
     // BRC-103 fix: Peer is now fully interior-mutable (Arc<Peer>, every method
     // &self). No outer Mutex — concurrent requests on one session no longer
@@ -206,7 +206,7 @@ async fn main() {
         .unwrap_or(10 * 1024 * 1024);
 
     // Unauthenticated health endpoint — always at `/`, never under the
-    // routing prefix, never behind BRC-31 auth. Returns plain text.
+    // routing prefix, never behind BRC-103/104 auth. Returns plain text.
     let health_routes = Router::new().route(
         "/",
         get(|| async {
@@ -217,7 +217,7 @@ async fn main() {
         }),
     );
 
-    // Protected API routes — BRC-31 auth via bsv-sdk Peer middleware
+    // Protected API routes — BRC-103/104 auth via bsv-sdk Peer middleware
     let api_routes = Router::new()
         .route("/sendMessage", post(handlers::send_message::send_message))
         .route(

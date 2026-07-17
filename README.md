@@ -1,6 +1,6 @@
 # rust-messagebox-server
 
-Rust implementation of the MessageBox server protocol. Stores and routes messages between authenticated parties. All API requests are authenticated via BRC-31 (HTTP) using `bsv-auth-axum-middleware`. WebSocket connections use BRC-103 mutual authentication via `bsv-sdk` Peer.
+Rust implementation of the MessageBox server protocol. Stores and routes messages between authenticated parties. All API requests are authenticated via BRC-104 (BRC-103's HTTP binding — the `x-bsv-auth-*` headers + `/.well-known/auth`) using `bsv-auth-axum-middleware`. WebSocket connections use raw BRC-103 mutual authentication via the shared `authsocket` crate (`bsv-sdk` Peer).
 
 Built with axum + socketioxide.
 
@@ -10,12 +10,12 @@ The MessageBox server is the central communication hub for the MPC system. Parti
 
 - **Store messages** -- parties send messages addressed to other parties' identity keys, tagged with a message box name.
 - **Route messages** -- recipients poll for messages or receive them in real time via WebSocket.
-- **Authenticate** -- every HTTP request is verified via BRC-31 mutual auth. WebSocket connections perform BRC-103 handshake on connect.
+- **Authenticate** -- every HTTP request is verified via BRC-104 mutual auth. WebSocket connections perform the BRC-103 handshake on connect.
 - **Push notifications** -- optional Firebase Cloud Messaging for mobile clients.
 
 ## API routes
 
-All routes require BRC-31 authentication (via `AuthLayer`). The authenticated caller's identity key is extracted from the `x-bsv-auth-*` headers.
+All routes require BRC-104 authentication (via `AuthLayer`). The authenticated caller's identity key is extracted from the `x-bsv-auth-*` headers.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -53,8 +53,10 @@ SERVER_PRIVATE_KEY="<64-hex-private-key>" PORT=3322 cargo run --release --bin me
 | `SERVER_PRIVATE_KEY` | *required* | 64-character hex private key for the server's identity |
 | `PORT` / `HTTP_PORT` | `8080` (dev), `3000` (prod) | TCP listen port |
 | `NODE_ENV` | `development` | `production` or `development` |
-| `DB_DRIVER` | `sqlite3` | Database driver |
-| `DB_SOURCE` | `messagebox.db` | SQLite database path |
+| `DATABASE_URL` | *(none)* | MySQL connection URL (Railway convention, takes precedence) |
+| `KNEX_DB_CONNECTION` | *(none)* | MySQL connection as Knex-style JSON (team/TS convention) |
+| `DB_SOURCE` | `mysql://root:root@127.0.0.1:3306/messagebox` | MySQL connection URL (backwards compat) |
+| `DB_MAX_CONNECTIONS` | `50` | sqlx MySQL pool size |
 | `ROUTING_PREFIX` | *(empty)* | Optional URL prefix for all API routes |
 | `BSV_NETWORK` | `mainnet` | BSV network |
 | `ENABLE_WEBSOCKETS` | `false` | Enable Socket.IO WebSocket layer |
@@ -67,7 +69,7 @@ SERVER_PRIVATE_KEY="<64-hex-private-key>" PORT=3322 cargo run --release --bin me
 ```
 Incoming HTTP request
   |
-  +-- /.well-known/auth --> AuthLayer handles BRC-31 handshake via bsv-sdk Peer
+  +-- /.well-known/auth --> AuthLayer handles the BRC-104 handshake via bsv-sdk Peer
   |
   +-- x-bsv-auth-* headers present --> AuthLayer verifies request signature,
   |   calls handler, signs response --> mutual auth complete
@@ -86,9 +88,9 @@ Incoming WebSocket (Socket.IO)
 |--------|---------|
 | `main` | Server setup: database, auth middleware, Socket.IO, route mounting |
 | `config` | `Config` struct loaded from environment |
-| `db` | SQLite database: connection pool, migrations, queries |
+| `db` | MySQL (InnoDB) database: connection pool, migrations, queries |
 | `handlers` | HTTP handlers: send, list, acknowledge, devices, permissions |
-| `ws` | WebSocket (Socket.IO) handlers: connection, BRC-103 auth, message broadcast |
+| `ws` | MessageBox app layer over the shared `authsocket` crate (BRC-103 sessions, rooms, signed broadcast) |
 | `cloneable_wallet` | `CloneableProtoWallet` wrapper for `bsv-sdk` `ProtoWallet` (needed for `Peer<W: Clone>`) |
 | `firebase` | Optional Firebase Cloud Messaging for push notifications |
 | `logger` | Tracing/logging initialization |
