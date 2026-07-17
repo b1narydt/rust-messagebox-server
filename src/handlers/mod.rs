@@ -1,4 +1,5 @@
 pub mod acknowledge_message;
+pub mod devices;
 pub mod helpers;
 pub mod list_messages;
 pub mod permissions;

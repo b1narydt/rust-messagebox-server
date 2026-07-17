@@ -97,6 +97,11 @@ async fn setup_app() -> Router {
             post(crate::handlers::acknowledge_message::acknowledge_message),
         )
         .route(
+            "/registerDevice",
+            post(crate::handlers::devices::register_device),
+        )
+        .route("/devices", get(crate::handlers::devices::list_devices))
+        .route(
             "/permissions/set",
             post(crate::handlers::permissions::set_permission),
         )
@@ -663,6 +668,147 @@ async fn test_get_quote_missing_params() {
     let (status, body) = get_path(&app, "/permissions/quote").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MISSING_PARAMETERS");
+}
+
+// ===========================================================================
+// Device registration tests (parity audit §4.1/§4.2 — the TS contract)
+// ===========================================================================
+
+/// §4.1: 200 `{status:'success', message:'Device registered successfully for
+/// push notifications', deviceId: <numeric row id>}`.
+#[tokio::test]
+async fn test_register_device_success_shape() {
+    let app = setup_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/registerDevice",
+        json!({
+            "fcmToken": "handler-token-1234567890",
+            "deviceId": "phone-1",
+            "platform": "ios"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
+    assert_eq!(
+        body["message"],
+        "Device registered successfully for push notifications"
+    );
+    assert!(
+        body["deviceId"].is_i64() && body["deviceId"].as_i64().unwrap() > 0,
+        "deviceId must be the numeric row id, got {:?}",
+        body["deviceId"]
+    );
+}
+
+/// §4.1: missing / empty / whitespace-only fcmToken → 400 ERR_INVALID_FCM_TOKEN.
+#[tokio::test]
+async fn test_register_device_invalid_fcm_token() {
+    let app = setup_app().await;
+    for bad in [
+        json!({}),
+        json!({"fcmToken": ""}),
+        json!({"fcmToken": "   "}),
+    ] {
+        let (status, body) = post_json(&app, "/registerDevice", bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {bad}");
+        assert_eq!(body["code"], "ERR_INVALID_FCM_TOKEN", "body: {bad}");
+    }
+}
+
+/// §4.1: platform outside ios|android|web → 400 ERR_INVALID_PLATFORM with the
+/// exact TS description.
+#[tokio::test]
+async fn test_register_device_invalid_platform() {
+    let app = setup_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/registerDevice",
+        json!({"fcmToken": "tok-x-1234567890", "platform": "windows"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INVALID_PLATFORM");
+    assert_eq!(
+        body["description"],
+        "platform must be one of: ios, android, web"
+    );
+}
+
+/// §4.1: re-registering the same token returns the SAME deviceId (upsert
+/// returns the existing row id — the deterministic fix over TS driver-luck).
+#[tokio::test]
+async fn test_register_device_upsert_same_device_id() {
+    let app = setup_app().await;
+    let (_, first) = post_json(
+        &app,
+        "/registerDevice",
+        json!({"fcmToken": "tok-upsert-h-1234567890"}),
+    )
+    .await;
+    let (status, second) = post_json(
+        &app,
+        "/registerDevice",
+        json!({"fcmToken": "tok-upsert-h-1234567890", "platform": "web"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["deviceId"], second["deviceId"]);
+}
+
+/// §4.2 (H14): `fcmToken` masked to `'...' + last 10`; absent
+/// `deviceId`/`platform` serialize as explicit `null` (TS shape — key present,
+/// value null); `lastUsed` present (registration bumps it).
+#[tokio::test]
+async fn test_list_devices_masked_token_and_null_serialization() {
+    let app = setup_app().await;
+    let (status, _) = post_json(
+        &app,
+        "/registerDevice",
+        json!({"fcmToken": "abcdefghijKLMNOPQRST"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get_path(&app, "/devices").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
+    let devices = body["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 1);
+    let d = devices[0].as_object().unwrap();
+
+    assert_eq!(d["fcmToken"], "...KLMNOPQRST", "token masked to last 10");
+    assert!(
+        d.contains_key("deviceId") && d["deviceId"].is_null(),
+        "absent deviceId must serialize as null, got {:?}",
+        d.get("deviceId")
+    );
+    assert!(
+        d.contains_key("platform") && d["platform"].is_null(),
+        "absent platform must serialize as null, got {:?}",
+        d.get("platform")
+    );
+    assert!(d.contains_key("lastUsed"), "lastUsed key present");
+    assert!(
+        d["lastUsed"].is_string(),
+        "registration bumps last_used, got {:?}",
+        d["lastUsed"]
+    );
+    assert_eq!(d["active"], true);
+    assert!(d["createdAt"].is_string() && d["updatedAt"].is_string());
+}
+
+/// Devices are per-identity: 401 without auth on both routes.
+#[tokio::test]
+async fn test_device_routes_require_auth() {
+    let app = setup_app().await;
+    let (status, _) =
+        post_json_no_auth(&app, "/registerDevice", json!({"fcmToken": "t-1234567890"})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = get_path_no_auth(&app, "/devices").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
 // ===========================================================================

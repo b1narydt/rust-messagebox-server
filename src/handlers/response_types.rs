@@ -44,6 +44,40 @@ pub struct SendMessageResponse {
     pub results: Vec<SendMessageResult>,
 }
 
+/// One row of `GET /devices` (H14). Absent `deviceId`/`platform`/`lastUsed`
+/// serialize as `null` — the TS shape (no `skip_serializing_if`, no ""
+/// placeholder). `fcmToken` is pre-masked by the handler.
+#[derive(Debug, Serialize)]
+pub struct DeviceOut {
+    pub id: i64,
+    #[serde(rename = "deviceId")]
+    pub device_id: Option<String>,
+    pub platform: Option<String>,
+    #[serde(rename = "fcmToken")]
+    pub fcm_token: String,
+    pub active: bool,
+    #[serde(rename = "createdAt")]
+    pub created_at: String,
+    #[serde(rename = "updatedAt")]
+    pub updated_at: String,
+    #[serde(rename = "lastUsed")]
+    pub last_used: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListDevicesResponse {
+    pub status: String,
+    pub devices: Vec<DeviceOut>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RegisterDeviceResponse {
+    pub status: String,
+    pub message: String,
+    #[serde(rename = "deviceId")]
+    pub device_id: i64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct SetPermissionResponse {
     pub status: String,

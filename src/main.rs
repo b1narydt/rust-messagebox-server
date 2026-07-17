@@ -322,6 +322,8 @@ async fn main() {
             "/acknowledgeMessage",
             post(handlers::acknowledge_message::acknowledge_message),
         )
+        .route("/registerDevice", post(handlers::devices::register_device))
+        .route("/devices", get(handlers::devices::list_devices))
         .route(
             "/permissions/set",
             post(handlers::permissions::set_permission),
