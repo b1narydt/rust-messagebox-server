@@ -56,6 +56,34 @@ SERVER_PRIVATE_KEY="<64-hex-private-key>" PORT=3322 cargo run --release --bin me
 | `DB_MAX_CONNECTIONS` | `50` | sqlx MySQL pool size |
 | `ROUTING_PREFIX` | *(empty)* | Optional URL prefix for all API routes |
 | `BSV_NETWORK` | `mainnet` | BSV network |
+| `REDIS_URL` | *(none)* | Unset → **Model A** (single instance, in-process routing — the default). Set → **Model B**: Redis pub/sub backplane for cross-instance live push; run N replicas behind a **sticky** LB. See below. |
+
+## Topology: Model A / Model B
+
+One binary, topology chosen by config (`REDIS_URL`). Durable state always
+lives in MySQL — an instance holds only ephemeral WebSocket/room state,
+rebuilt when a client reconnects — so any instance can serve any mailbox
+over HTTP. Redis's one job is bridging **live push** between instances.
+
+```
+MODEL A — single self-contained instance (default)
+   [ MBS ] ── [ MySQL ]           no Redis, no LB
+
+MODEL B — horizontal fleet (REDIS_URL set)
+   [ LB, sticky WS ] → [ MBS × N ] ── shared [ MySQL ] + shared [ Redis pub/sub ]
+```
+
+Model B delivery is **carry-unsigned / sign-on-owner**: `broadcast_to_room`
+publishes the *unsigned* message to Redis; every instance subscribes and
+signs **only for its own local room members** — BRC-103 signing is pinned to
+the instance holding that socket's authsocket `Peer` session, so no other
+instance can (or does) sign for it. The local delivery path is byte-identical
+in both models; Model A merely skips the publish.
+
+Redis is live-push only, **never durability**: if Redis is down, local
+delivery keeps working, cross-instance recipients fall back to the durable
+mailbox (`/listMessages` from any instance), and the degradation is logged +
+counted — the server never fails or blocks a send on Redis.
 
 ## Auth stack
 
@@ -84,5 +112,6 @@ Incoming WebSocket (Socket.IO)
 | `db` | MySQL (InnoDB) database: connection pool, migrations, queries |
 | `handlers` | HTTP handlers: send, list, acknowledge, permissions |
 | `ws` | MessageBox app layer over the shared `authsocket` crate (BRC-103 sessions, rooms, signed broadcast) |
+| `backplane` | Model B Redis pub/sub backplane: unsigned cross-instance envelopes, sign-on-owner delivery, degrade-don't-fail |
 | `cloneable_wallet` | `CloneableProtoWallet` wrapper for `bsv-sdk` `ProtoWallet` (needed for `Peer<W: Clone>`) |
 | `logger` | Tracing/logging initialization |
