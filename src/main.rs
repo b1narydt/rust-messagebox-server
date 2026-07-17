@@ -174,7 +174,6 @@ async fn main() {
     let app_state = handlers::helpers::AppState {
         db: pool,
         config: Arc::new(config),
-        wallet: sdk_wallet,
         funded_wallet,
         ws: ws_broadcast,
     };

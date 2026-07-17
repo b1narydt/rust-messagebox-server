@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tower::ServiceExt; // for .oneshot()
 
 use bsv::primitives::private_key::PrivateKey;
-use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
 use bsv_wallet_toolbox::types::Chain;
 use bsv_wallet_toolbox::wallet::setup::WalletBuilder;
 use bsv_wallet_toolbox::wallet::wallet::Wallet;
@@ -32,7 +31,6 @@ fn test_config() -> Config {
         db_source: "mysql://unused".to_string(),
         db_max_connections: 4,
         bsv_network: "testnet".to_string(),
-        enable_websockets: false,
         wallet_storage_url: "https://storage.babbage.systems".to_string(),
         message_box_fees: Vec::new(),
         message_box_fees_warnings: Vec::new(),
@@ -61,8 +59,6 @@ async fn test_funded_wallet() -> Arc<Wallet> {
 async fn setup_app() -> Router {
     let pool = fresh_pool().await;
 
-    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
-    let wallet = Arc::new(SdkProtoWallet::new(pk));
     let funded_wallet = test_funded_wallet().await;
 
     // Create a minimal WsBroadcast for tests (Socket.IO is not exercised
@@ -74,7 +70,6 @@ async fn setup_app() -> Router {
     let state = AppState {
         db: pool,
         config: Arc::new(test_config()),
-        wallet,
         funded_wallet,
         ws: ws_broadcast,
     };
@@ -712,8 +707,6 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
     // app is using, so we build the Router inline here with a shared pool.
     let pool = fresh_pool().await;
 
-    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
-    let wallet = Arc::new(SdkProtoWallet::new(pk));
     let funded_wallet = test_funded_wallet().await;
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
@@ -722,7 +715,6 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
     let state = AppState {
         db: pool.clone(),
         config: Arc::new(test_config()),
-        wallet,
         funded_wallet,
         ws: ws_broadcast,
     };
@@ -881,8 +873,6 @@ async fn test_send_message_duplicate_writes_exactly_one_row() {
 async fn test_blocked_recipient_not_persisted_or_broadcast() {
     let pool = fresh_pool().await;
 
-    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
-    let wallet = Arc::new(SdkProtoWallet::new(pk));
     let funded_wallet = test_funded_wallet().await;
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
@@ -891,7 +881,6 @@ async fn test_blocked_recipient_not_persisted_or_broadcast() {
     let state = AppState {
         db: pool.clone(),
         config: Arc::new(test_config()),
-        wallet,
         funded_wallet,
         ws: ws_broadcast,
     };

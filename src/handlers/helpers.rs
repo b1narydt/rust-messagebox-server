@@ -5,7 +5,6 @@ use axum::{
     http::{request::Parts, StatusCode},
     Json,
 };
-use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
 use bsv_wallet_toolbox::wallet::wallet::Wallet;
 
 use crate::config::Config;
@@ -19,8 +18,6 @@ use crate::ws::WsBroadcast;
 pub struct AppState {
     pub db: DbPool,
     pub config: Arc<Config>,
-    /// Signing-only wallet used for BRC-103 auth handshakes.
-    pub wallet: Arc<SdkProtoWallet>,
     /// Funded wallet connected to the remote storage backend.
     /// Used to internalize incoming delivery-fee payments via `internalize_action`.
     pub funded_wallet: Arc<Wallet>,

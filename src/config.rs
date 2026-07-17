@@ -26,7 +26,6 @@ pub struct Config {
     pub db_source: String,
     pub db_max_connections: u32,
     pub bsv_network: String,
-    pub enable_websockets: bool,
     pub wallet_storage_url: String,
     /// Parsed from `MESSAGEBOX_FEES=chat=10,priority=100` — applied at boot.
     pub message_box_fees: Vec<(String, i64)>,
@@ -93,10 +92,6 @@ impl Config {
             .unwrap_or(50);
         let bsv_network = env::var("BSV_NETWORK").unwrap_or_else(|_| "mainnet".to_string());
 
-        let enable_websockets = env::var("ENABLE_WEBSOCKETS")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
-
         let wallet_storage_url = env::var("WALLET_STORAGE_URL")
             .ok()
             .filter(|s| !s.is_empty())
@@ -117,7 +112,6 @@ impl Config {
             db_source,
             db_max_connections,
             bsv_network,
-            enable_websockets,
             wallet_storage_url,
             message_box_fees,
             message_box_fees_warnings,
@@ -126,11 +120,6 @@ impl Config {
 
     pub fn is_development(&self) -> bool {
         self.node_env != "production"
-    }
-
-    /// True when running on Railway (detected via `RAILWAY_ENVIRONMENT`).
-    pub fn is_railway(&self) -> bool {
-        std::env::var("RAILWAY_ENVIRONMENT").is_ok()
     }
 }
 
@@ -226,7 +215,6 @@ impl fmt::Debug for Config {
             .field("db_source", &redact_db_url(&self.db_source))
             .field("db_max_connections", &self.db_max_connections)
             .field("bsv_network", &self.bsv_network)
-            .field("enable_websockets", &self.enable_websockets)
             .field("wallet_storage_url", &self.wallet_storage_url)
             .field("message_box_fees", &self.message_box_fees)
             // message_box_fees_warnings are transient — omitted from Debug output.

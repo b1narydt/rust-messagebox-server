@@ -11,7 +11,6 @@ The MessageBox server is the central communication hub for the MPC system. Parti
 - **Store messages** -- parties send messages addressed to other parties' identity keys, tagged with a message box name.
 - **Route messages** -- recipients poll for messages or receive them in real time via WebSocket.
 - **Authenticate** -- every HTTP request is verified via BRC-104 mutual auth. WebSocket connections perform the BRC-103 handshake on connect.
-- **Push notifications** -- optional Firebase Cloud Messaging for mobile clients.
 
 ## API routes
 
@@ -22,8 +21,6 @@ All routes require BRC-104 authentication (via `AuthLayer`). The authenticated c
 | `POST` | `/sendMessage` | Send a message to a recipient's message box |
 | `POST` | `/listMessages` | List messages in a message box (supports `messageBox` filter) |
 | `POST` | `/acknowledgeMessage` | Acknowledge (delete) messages by ID |
-| `POST` | `/registerDevice` | Register a device for push notifications |
-| `GET` | `/devices` | List registered devices |
 | `POST` | `/permissions/set` | Set message permissions for a sender |
 | `GET` | `/permissions/get` | Get permission for a specific sender |
 | `GET` | `/permissions/list` | List all permissions |
@@ -59,10 +56,6 @@ SERVER_PRIVATE_KEY="<64-hex-private-key>" PORT=3322 cargo run --release --bin me
 | `DB_MAX_CONNECTIONS` | `50` | sqlx MySQL pool size |
 | `ROUTING_PREFIX` | *(empty)* | Optional URL prefix for all API routes |
 | `BSV_NETWORK` | `mainnet` | BSV network |
-| `ENABLE_WEBSOCKETS` | `false` | Enable Socket.IO WebSocket layer |
-| `FIREBASE_PROJECT_ID` | *(none)* | Firebase project ID for push notifications |
-| `FIREBASE_SERVICE_ACCOUNT_JSON` | *(none)* | Firebase service account JSON (inline) |
-| `FIREBASE_SERVICE_ACCOUNT_PATH` | *(none)* | Path to Firebase service account JSON file |
 
 ## Auth stack
 
@@ -89,8 +82,7 @@ Incoming WebSocket (Socket.IO)
 | `main` | Server setup: database, auth middleware, Socket.IO, route mounting |
 | `config` | `Config` struct loaded from environment |
 | `db` | MySQL (InnoDB) database: connection pool, migrations, queries |
-| `handlers` | HTTP handlers: send, list, acknowledge, devices, permissions |
+| `handlers` | HTTP handlers: send, list, acknowledge, permissions |
 | `ws` | MessageBox app layer over the shared `authsocket` crate (BRC-103 sessions, rooms, signed broadcast) |
 | `cloneable_wallet` | `CloneableProtoWallet` wrapper for `bsv-sdk` `ProtoWallet` (needed for `Peer<W: Clone>`) |
-| `firebase` | Optional Firebase Cloud Messaging for push notifications |
 | `logger` | Tracing/logging initialization |
