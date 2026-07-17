@@ -1,6 +1,6 @@
 # rust-messagebox-server
 
-Rust implementation of the MessageBox server protocol. Stores and routes messages between authenticated parties. All API requests are authenticated via BRC-104 (BRC-103's HTTP binding — the `x-bsv-auth-*` headers + `/.well-known/auth`) using `bsv-auth-axum-middleware`. WebSocket connections use raw BRC-103 mutual authentication via the shared `authsocket` crate (`bsv-sdk` Peer).
+Rust implementation of the MessageBox server protocol — a **drop-in-compatible reimplementation of the TS `@bsv/messagebox-server`** (Parity++: same public API and intended behavior, with the TS bugs deliberately fixed — see [TS parity](#ts-parity--deliberate-deviations-parity)). Stores and routes messages between authenticated parties. All API requests are authenticated via BRC-104 (BRC-103's HTTP binding — the `x-bsv-auth-*` headers + `/.well-known/auth`) using `bsv-auth-axum-middleware`. WebSocket connections use raw BRC-103 mutual authentication via the shared `authsocket` crate (`bsv-sdk` Peer).
 
 Built with axum + socketioxide.
 
@@ -21,12 +21,22 @@ All routes require BRC-104 authentication (via `AuthLayer`). The authenticated c
 | `POST` | `/sendMessage` | Send a message to a recipient's message box |
 | `POST` | `/listMessages` | List messages in a message box (supports `messageBox` filter) |
 | `POST` | `/acknowledgeMessage` | Acknowledge (delete) messages by ID |
+| `POST` | `/registerDevice` | Register an FCM device token for push notifications (upsert on token) |
+| `GET` | `/devices` | List the caller's registered devices (token masked to last 10 chars) |
 | `POST` | `/permissions/set` | Set message permissions for a sender |
 | `GET` | `/permissions/get` | Get permission for a specific sender |
-| `GET` | `/permissions/list` | List all permissions |
+| `GET` | `/permissions/list` | List all permissions (accepts both `message_box` and `messageBox` filter params; rows serialize snake_case — pinned to client 2.1.0) |
 | `GET` | `/permissions/quote` | Get payment quote for sending messages |
 
 The handshake endpoint `POST /.well-known/auth` is handled automatically by the `AuthLayer`.
+
+Pre-auth (like TS): `GET /docs` (Swagger UI) and `GET /openapi.json`.
+
+### Push notifications (FCM)
+
+Messages stored to the magic box name **`notifications`** additionally trigger a Firebase Cloud Messaging (v1) push to every **active** device the recipient registered via `/registerDevice` — best-effort, after the send, never failing it. The visible notification is `title: "New Message"`, `body: <messageId>` (content stays E2E-encrypted; the ID lets the app fetch it). Delivery success bumps the device's `lastUsed`; an FCM invalid-token response (`NOT_FOUND`/`UNREGISTERED`) deactivates the device. Enablement is explicit: `ENABLE_FIREBASE=true` + `FIREBASE_PROJECT_ID` + one credential source (see env vars). The service-account key material is **never logged** (upstream TS logs its first 100 chars at init — deliberately not reproduced).
+
+`notifications` is also pay-to-deliver out of the box, matching TS: delivery fee 10 sats (seeded, overridable via `MESSAGEBOX_FEES`) plus the smart-default recipient fee of 10.
 
 ## WebSocket (Socket.IO)
 
@@ -59,6 +69,11 @@ SERVER_PRIVATE_KEY="<64-hex-private-key>" PORT=3322 cargo run --release --bin me
 | `REDIS_URL` | *(none)* | Unset → **Model A** (single instance, in-process routing — the default). Set → **Model B**: Redis pub/sub backplane for cross-instance live push; run N replicas behind a **sticky** LB. See below. |
 | `MAX_CONNECTIONS` | `0` (unlimited) | Per-instance WebSocket connection ceiling (admission control). Past it, NEW connections get `503` + `Retry-After` (Model B: the LB sheds to another instance; Model A: the client retries). In-flight sessions are never affected. |
 | `DRAIN_TIMEOUT_SECS` | `30` | Per-phase bound on the SIGTERM graceful drain (in-flight send quiesce, persist-queue flush). |
+| `MESSAGEBOX_FEES` | *(none)* | Operator per-box delivery-fee overrides, `box=sats` comma-separated (e.g. `notifications=0,priority=100`). Upserted at boot **before** the fee cache is primed. Out-of-box seed matches TS: `notifications=10`, `inbox=0`, `payment_inbox=0`. |
+| `ENABLE_FIREBASE` | `false` | Explicit opt-in for FCM push notifications (must be exactly `true`, TS parity). |
+| `FIREBASE_PROJECT_ID` | *(none)* | Firebase project id — required when Firebase is enabled. |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` | *(none)* | Service-account key JSON (inline). SECRET — never logged or Debug-printed. |
+| `FIREBASE_SERVICE_ACCOUNT_PATH` | *(none)* | Path to the service-account key file (alternative to the inline JSON). |
 
 ## Topology: Model A / Model B
 
@@ -109,6 +124,60 @@ the MySQL mailbox covers the gap) → flush the persist queue → exit. Zero
 message loss: every accepted message ends durably stored, a confirmed
 duplicate, or dead-lettered to disk.
 
+## TS parity & deliberate deviations (Parity++)
+
+This server matches the TS `@bsv/messagebox-server` (1.1.13) public API and
+intended behavior — routes, request/response shapes, error codes and
+statuses, the notification/device system, fee semantics, and the WS event
+surface (including the failure events `authenticationFailed` / `joinFailed`
+/ `leaveFailed` / `messageFailed`). The full row-by-row audit lives in the
+PARAGON wiki (`mbs-ts-parity-audit-2026-07-17`).
+
+**Seven deviations are deliberate and will not be "fixed back" to TS** —
+they correct TS bugs or add enterprise behavior the client is agnostic to
+(client 2.1.0 works identically against both servers):
+
+1. **Room-scoped signed live delivery.** TS live delivery is a global
+   `io.emit` — every WS message is broadcast to *every* connected
+   authenticated socket (a privacy/scale leak). Here delivery is signed and
+   scoped to the recipient's room members only.
+2. **Cryptographically verified WS sender.** TS stores the client-*claimed*
+   `identityKey` as the message sender (spoofable within an authed socket).
+   Here the sender is always the BRC-103-verified key; claimed keys are
+   ignored.
+3. **Own-room join enforcement.** A client may only join
+   `{itsIdentityKey}-{box}` rooms; TS performs no ownership check. Rejected
+   joins get a signed `joinFailed` (not silence), but stay rejected.
+4. **No Firebase-key logging.** Upstream TS logs the first 100 characters of
+   the service-account JSON at init. This server never logs or Debug-prints
+   key material (test-pinned).
+5. **Push-live-first + async persistence.** TS inserts synchronously on the
+   request path (and never live-pushes HTTP sends). Here live push happens
+   before the DB write on both paths, the durable INSERT runs in a bounded
+   background worker (retry → inline fallback → dead-letter, never a silent
+   drop) — consequence: a duplicate `messageId` is idempotent success
+   instead of TS's 400 `ERR_DUPLICATE_MESSAGE`.
+6. **Normalized stored-body wrap.** TS wraps HTTP-stored bodies in
+   `{"message": …}` but stores WS bodies raw (internally inconsistent). Here
+   both paths store the wrap; the client's parser handles it natively.
+7. **Enterprise config & ops.** Delivery-fee in-memory cache (fees read at
+   boot; restart or `MESSAGEBOX_FEES` to change), 10 MB body cap (vs TS's
+   1 GB), saner port/env handling, plus the whole ops surface below
+   (health/readiness, metrics, admission control, graceful drain, Model B).
+
+One **contract pin** where TS disagrees with itself: `/permissions/list`
+rows are snake_case and the `message_box` filter param is accepted, because
+that is what `@bsv/message-box-client` 2.1.0 actually sends/reads — the TS
+*server* uses camelCase rows and only reads `messageBox` (so the client's
+filter is silently dead against it). Parity is pinned to the client;
+`messageBox` is also accepted.
+
+Also carried as a **compat surface, not a control**: the fee/permission
+plane (`/permissions/*`, payments) matches TS wire-for-wire, but the WS
+`sendMessage` path bypasses it on **both** implementations — do not build
+authorization or monetization on it without new work (see
+`handlers/permissions.rs` module docs).
+
 ## Auth stack
 
 ```
@@ -134,8 +203,10 @@ Incoming WebSocket (Socket.IO)
 | `main` | Server setup: database, auth middleware, Socket.IO, route mounting |
 | `config` | `Config` struct loaded from environment |
 | `db` | MySQL (InnoDB) database: connection pool, migrations, queries |
-| `handlers` | HTTP handlers: send, list, acknowledge, permissions |
-| `ws` | MessageBox app layer over the shared `authsocket` crate (BRC-103 sessions, rooms, signed broadcast) |
+| `handlers` | HTTP handlers: send, list, acknowledge, devices, permissions |
+| `firebase` | FCM v1 push delivery + service-account OAuth2 (explicit `ENABLE_FIREBASE` opt-in; key material never logged) |
+| `docs` | `GET /docs` (Swagger UI) + `GET /openapi.json` (static OpenAPI 3.0 spec) |
+| `ws` | MessageBox app layer over the shared `authsocket` crate (BRC-103 sessions, rooms, signed broadcast, TS-parity failure events) |
 | `backplane` | Model B Redis pub/sub backplane: unsigned cross-instance envelopes, sign-on-owner delivery, degrade-don't-fail |
 | `ops` | Operational floor: admission control (connection ceiling), structured liveness/readiness, graceful drain |
 | `metrics` | Prometheus text exposition for `GET /metrics` (histograms + scrape-time counter sampling) |
