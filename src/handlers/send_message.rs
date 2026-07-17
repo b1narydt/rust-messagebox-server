@@ -25,6 +25,11 @@ pub async fn send_message(
     auth: AuthIdentity,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // In-flight marker for graceful drain: an authenticated client's HTTP
+    // send counts as in-flight work — drain waits for it (bounded), and
+    // admission control never gates this route.
+    let _send_guard = state.ws.ops().begin_send();
+
     let sender_key = auth.0;
 
     // ── Parse message object ──────────────────────────────────────────

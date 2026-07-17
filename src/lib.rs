@@ -5,6 +5,7 @@ pub mod db;
 pub mod handlers;
 pub mod logger;
 pub mod metrics;
+pub mod ops;
 pub mod persist;
 pub mod ws;
 

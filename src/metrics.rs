@@ -110,8 +110,7 @@ pub struct BackplaneSnapshot {
     pub subscribed: bool,
 }
 
-/// Admission/drain state sampled from the ops admission-control state
-/// (Phase-3 D3; populated once admission control is wired).
+/// Admission/drain state sampled from [`crate::ops::OpsState`] (Phase-3 D3).
 pub struct OpsSnapshot {
     pub draining: bool,
     pub in_flight_sends: u64,

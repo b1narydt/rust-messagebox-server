@@ -31,6 +31,14 @@ pub struct Config {
     /// routing, the default); set → Model B (Redis pub/sub backplane for
     /// cross-instance live push; safe to run N replicas behind a sticky LB).
     pub redis_url: Option<String>,
+    /// `MAX_CONNECTIONS` — per-instance WebSocket connection ceiling for
+    /// admission control (design D3). `0` (the default) = unlimited. Past the
+    /// ceiling, NEW connections get 503 + Retry-After (Model B: the LB sheds
+    /// to another instance); in-flight sessions are never affected.
+    pub max_connections: usize,
+    /// `DRAIN_TIMEOUT_SECS` — per-phase bound on the SIGTERM graceful drain
+    /// (in-flight send quiesce, persist-queue flush). Default 30.
+    pub drain_timeout_secs: u64,
     /// Parsed from `MESSAGEBOX_FEES=chat=10,priority=100` — applied at boot.
     pub message_box_fees: Vec<(String, i64)>,
     /// Parse warnings from `MESSAGEBOX_FEES` — emitted after the logger is up.
@@ -104,6 +112,16 @@ impl Config {
         // Model A/B toggle — see the field doc. Whitespace-only counts as unset.
         let redis_url = env::var("REDIS_URL").ok().filter(|s| !s.trim().is_empty());
 
+        // Admission-control ceiling + drain bound (Phase 3 / D3) — field docs.
+        let max_connections = env::var("MAX_CONNECTIONS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let drain_timeout_secs = env::var("DRAIN_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+
         // Parse MESSAGEBOX_FEES=chat=10,priority=100
         // Format: comma-separated box_name=satoshis pairs. Whitespace is trimmed.
         // Malformed or negative entries are collected as warnings and emitted
@@ -121,6 +139,8 @@ impl Config {
             bsv_network,
             wallet_storage_url,
             redis_url,
+            max_connections,
+            drain_timeout_secs,
             message_box_fees,
             message_box_fees_warnings,
         })
@@ -225,6 +245,8 @@ impl fmt::Debug for Config {
             .field("bsv_network", &self.bsv_network)
             .field("wallet_storage_url", &self.wallet_storage_url)
             .field("redis_url", &self.redis_url.as_deref().map(redact_db_url))
+            .field("max_connections", &self.max_connections)
+            .field("drain_timeout_secs", &self.drain_timeout_secs)
             .field("message_box_fees", &self.message_box_fees)
             // message_box_fees_warnings are transient — omitted from Debug output.
             .finish()

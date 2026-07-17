@@ -98,6 +98,10 @@ pub struct WsBroadcast {
     /// Model B backplane (`REDIS_URL` set) — `None` means Model A: single
     /// instance, in-process routing only. See [`crate::backplane`].
     backplane: Option<Arc<crate::backplane::Backplane>>,
+    /// Admission/drain state (Phase 3, D3). Both send paths hold a
+    /// [`crate::ops::SendGuard`] for their duration so graceful drain can
+    /// wait for real in-flight work, never nacking it.
+    ops: Arc<crate::ops::OpsState>,
 }
 
 impl WsBroadcast {
@@ -110,6 +114,7 @@ impl WsBroadcast {
         server_private_key_hex: String,
         db: DbPool,
         backplane: Option<Arc<crate::backplane::Backplane>>,
+        ops: Arc<crate::ops::OpsState>,
     ) -> Self {
         let persist = crate::persist::PersistHandle::spawn(
             db.clone(),
@@ -121,6 +126,7 @@ impl WsBroadcast {
             server_private_key_hex,
             persist,
             backplane,
+            ops,
         };
         if let Some(bp) = &ws.backplane {
             match bp.take_delivery_rx() {
@@ -234,6 +240,12 @@ impl WsBroadcast {
             }
         }
         (sockets.len(), identities.len())
+    }
+
+    /// Admission/drain state — shared with the HTTP handlers (send guards),
+    /// the admission middleware, health routes, and `/metrics`.
+    pub fn ops(&self) -> &Arc<crate::ops::OpsState> {
+        &self.ops
     }
 
     /// Persist-pipeline counters (shared with the background worker).
@@ -431,6 +443,10 @@ async fn handle_ws_send_message(
     sender: &str,
     data: serde_json::Value,
 ) {
+    // In-flight marker for graceful drain: this send belongs to a connected
+    // session and is never nacked — drain waits for it (bounded) instead.
+    let _send_guard = ws.ops.begin_send();
+
     // Parse the sendMessage payload
     let room_id_str = match data.get("roomId").and_then(|v| v.as_str()) {
         Some(r) if !r.is_empty() => r.to_string(),
@@ -596,7 +612,13 @@ mod tests {
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .connect_lazy("mysql://test@127.0.0.1/test")
             .expect("build lazy MySQL pool");
-        WsBroadcast::new(io, TEST_SERVER_KEY.to_string(), pool, None)
+        WsBroadcast::new(
+            io,
+            TEST_SERVER_KEY.to_string(),
+            pool,
+            None,
+            crate::ops::OpsState::new(0),
+        )
     }
 
     fn test_room_message() -> RoomMessage {

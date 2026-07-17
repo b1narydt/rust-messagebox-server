@@ -81,7 +81,13 @@ async fn boot_instance(
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .connect_lazy("mysql://unused@127.0.0.1/unused")
         .expect("lazy pool");
-    let ws = WsBroadcast::new(io.clone(), server_key_hex.to_string(), pool, backplane);
+    let ws = WsBroadcast::new(
+        io.clone(),
+        server_key_hex.to_string(),
+        pool,
+        backplane,
+        messagebox_server::ops::OpsState::new(0),
+    );
     ws::setup_handlers(&io, ws.clone());
 
     let app = axum::Router::new().layer(layer);
