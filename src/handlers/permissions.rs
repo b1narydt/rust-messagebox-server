@@ -1,3 +1,18 @@
+//! `/permissions/*` — fee/permission plane, kept for wire-parity with the
+//! upstream `@bsv` message-box-server (deliberate product contract: MBS is a
+//! drop-in-compatible open-source messagebox).
+//!
+//! This is a COMPAT SURFACE, NOT an enforced ACL. Two realities a reader must
+//! not mistake for a live access control:
+//! - The primary MPC delivery path — WS `sendMessage` (`ws.rs`) — carries no
+//!   fee/permission/payment check at all, so any `blocked`/`fee` row here can
+//!   be bypassed by sending over WS.
+//! - All default fees are zeroed by migration (`20260413210000_zero_default_fees`),
+//!   and every in-stack caller sends with `check_permissions: false`.
+//!
+//! Do not build authorization or monetization on this plane without new work
+//! (see the mbs-enterprise-production design; owner decision O1 keeps it).
+
 use std::collections::HashMap;
 
 use axum::{
@@ -101,7 +116,7 @@ pub async fn set_permission(
         .into_response();
     }
 
-    // ── Build description matching Go output ──────────────────────────
+    // ── Build description matching the upstream TS server's output ────
     let is_box_wide = sender.is_none();
     let (sender_text, action_text) = if is_box_wide {
         ("all senders".to_string(), "Box-wide default for")

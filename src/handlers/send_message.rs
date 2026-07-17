@@ -235,6 +235,9 @@ pub async fn send_message(
     }
 
     // ── Fee evaluation ────────────────────────────────────────────────
+    // @bsv wire-parity compat surface, NOT an enforced ACL: the WS sendMessage
+    // path bypasses this entirely and all default fees are zeroed by migration.
+    // See the module doc on handlers::permissions.
     let delivery_fee = match queries::get_server_delivery_fee(&state.db, &box_type).await {
         Ok(f) => f,
         Err(e) => {
