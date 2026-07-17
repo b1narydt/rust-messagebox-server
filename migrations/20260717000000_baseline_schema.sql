@@ -1,8 +1,20 @@
--- Initial schema mirroring TS message-box-server final state (post all 5 Knex migrations).
--- Idempotent via IF NOT EXISTS so this migration is safe on a fresh DB or on a DB
--- previously migrated by the TS Knex chain.
+-- Fresh-deploy baseline (squash of the previous 4 migrations — design decision D2).
+-- No prod data exists, so this is the single migration a new deployment runs.
+--
+-- Schema tracks the TS message-box-server final state (post all 5 Knex
+-- migrations) with one deliberate divergence, per design decision D1:
+-- `messages` gets a REAL PRIMARY KEY. The TS 2024-03-05 migration dropped the
+-- messages PK and left only `messageId` UNIQUE — an InnoDB anti-pattern (hidden
+-- row id; no stable row identity for replication/online DDL). We restore a
+-- surrogate AUTO_INCREMENT PK and keep `messageId` UNIQUE as the dedup
+-- constraint (`INSERT IGNORE` semantics unchanged). DB schema is not part of
+-- the @bsv wire contract, so this does not affect TS parity (audit row D2†).
+--
+-- `device_registrations` is intentionally ABSENT here: W1 cut the broken
+-- devices+FCM subsystem; the Phase-5 parity rebuild re-adds the table to the
+-- exact TS DDL (parity audit §4 / row D5).
 
-CREATE TABLE IF NOT EXISTS messageBox (
+CREATE TABLE messageBox (
   messageBoxId INT UNSIGNED NOT NULL AUTO_INCREMENT,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -12,10 +24,8 @@ CREATE TABLE IF NOT EXISTS messageBox (
   UNIQUE KEY uq_messagebox_type_identity (type, identityKey)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- messages has no PRIMARY KEY: the 2024-03-05 TS migration dropped the original
--- INT AUTO_INCREMENT PK and re-added messageId as VARCHAR UNIQUE. Parity requires
--- we do not add a surrogate PK here.
-CREATE TABLE IF NOT EXISTS messages (
+CREATE TABLE messages (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
   messageId VARCHAR(255) NOT NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -23,6 +33,7 @@ CREATE TABLE IF NOT EXISTS messages (
   sender VARCHAR(255) NOT NULL,
   recipient VARCHAR(255) NOT NULL,
   body LONGTEXT NOT NULL,
+  PRIMARY KEY (id),
   UNIQUE KEY uq_messages_messageid (messageId),
   KEY idx_messages_recipient_box_created (recipient, messageBoxId, created_at),
   KEY idx_messages_box (messageBoxId),
@@ -30,7 +41,7 @@ CREATE TABLE IF NOT EXISTS messages (
     FOREIGN KEY (messageBoxId) REFERENCES messageBox (messageBoxId) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS message_permissions (
+CREATE TABLE message_permissions (
   id INT UNSIGNED NOT NULL AUTO_INCREMENT,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -46,7 +57,7 @@ CREATE TABLE IF NOT EXISTS message_permissions (
   KEY idx_permissions_sender (sender)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE IF NOT EXISTS server_fees (
+CREATE TABLE server_fees (
   id INT UNSIGNED NOT NULL AUTO_INCREMENT,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -56,26 +67,14 @@ CREATE TABLE IF NOT EXISTS server_fees (
   UNIQUE KEY uq_server_fees_box (message_box)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Seed default delivery fees. INSERT IGNORE so re-running against a populated DB
--- (e.g. one already seeded by the TS migration) is a no-op.
-INSERT IGNORE INTO server_fees (message_box, delivery_fee) VALUES
-  ('notifications', 10),
+-- Delivery fees default to 0: operators opt into fees per box via the
+-- MESSAGEBOX_FEES env var (upserted at boot after migrations). This carries
+-- forward the pre-squash end state (the zero_default_fees migration). Note
+-- the TS server seeds notifications=10; whether the out-of-box default flips
+-- back to 10 for behavioral parity is a Phase-5 decision (parity audit D3
+-- follow-on — "finalize at Phase-5 build time"). The smart-default RECIPIENT
+-- fee for `notifications` (=10) lives in code and already matches TS.
+INSERT INTO server_fees (message_box, delivery_fee) VALUES
+  ('notifications', 0),
   ('inbox', 0),
   ('payment_inbox', 0);
-
-CREATE TABLE IF NOT EXISTS device_registrations (
-  id INT UNSIGNED NOT NULL AUTO_INCREMENT,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  identity_key VARCHAR(255) NOT NULL,
-  fcm_token VARCHAR(500) NOT NULL,
-  device_id VARCHAR(255) NULL,
-  platform VARCHAR(50) NULL,
-  last_used TIMESTAMP NULL,
-  active TINYINT(1) NOT NULL DEFAULT 1,
-  PRIMARY KEY (id),
-  UNIQUE KEY uq_devices_fcm_token (fcm_token),
-  KEY idx_devices_identity (identity_key),
-  KEY idx_devices_identity_active (identity_key, active),
-  KEY idx_devices_last_used (last_used)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

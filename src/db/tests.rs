@@ -137,7 +137,7 @@ async fn test_get_server_delivery_fee_default() {
     let fee = get_server_delivery_fee(&pool, "notifications")
         .await
         .unwrap();
-    assert_eq!(fee, 0, "notifications default delivery fee should be 0 (zeroed by the zero_default_fees migration; opt-in via MESSAGEBOX_FEES)");
+    assert_eq!(fee, 0, "notifications default delivery fee should be 0 (baseline seeds all fees at 0; opt-in via MESSAGEBOX_FEES)");
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
     assert_eq!(fee, 0, "inbox box default delivery fee should be 0");
@@ -316,14 +316,14 @@ async fn test_list_permissions_with_pagination() {
 async fn test_delivery_fee_cache() {
     let pool = fresh_pool().await;
     // After init_delivery_fee_cache (called in fresh_pool), fees should come from cache.
-    // The zero_default_fees migration zeroes every seeded fee (incl. notifications),
-    // so the cached value is 0 unless an operator opts in via MESSAGEBOX_FEES.
+    // The baseline migration seeds every fee at 0 (incl. notifications), so the
+    // cached value is 0 unless an operator opts in via MESSAGEBOX_FEES.
     let fee = get_server_delivery_fee(&pool, "notifications")
         .await
         .unwrap();
     assert_eq!(
         fee, 0,
-        "notifications delivery fee should be 0 after zero_default_fees"
+        "notifications delivery fee should be 0 out of the box"
     );
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
@@ -555,5 +555,89 @@ async fn test_concurrent_message_operations() {
         remaining.len(),
         20,
         "20 messages should remain after acknowledging 20"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Baseline schema (migration squash, design D1/D2)
+// ---------------------------------------------------------------------------
+
+/// Fresh deploy produces exactly the 4 baseline tables — `device_registrations`
+/// is gone until the Phase-5 parity rebuild re-adds it.
+#[tokio::test]
+async fn test_baseline_schema_tables() {
+    let pool = fresh_pool().await;
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT CAST(table_name AS CHAR) FROM information_schema.tables \
+         WHERE table_schema = DATABASE() AND table_name <> '_sqlx_migrations' \
+         ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tables,
+        vec![
+            "messageBox".to_string(),
+            "message_permissions".to_string(),
+            "messages".to_string(),
+            "server_fees".to_string(),
+        ],
+        "baseline must create exactly messageBox, message_permissions, messages, server_fees"
+    );
+}
+
+/// `messages` has a REAL primary key (design D1 — fixes the TS no-PK artifact)
+/// while `messageId` stays UNIQUE so INSERT IGNORE dedup semantics are unchanged.
+#[tokio::test]
+async fn test_baseline_messages_has_real_primary_key() {
+    let pool = fresh_pool().await;
+
+    let pk_cols: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.key_column_usage \
+         WHERE table_schema = DATABASE() AND table_name = 'messages' \
+         AND constraint_name = 'PRIMARY' ORDER BY ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pk_cols,
+        vec!["id".to_string()],
+        "messages must have a real PRIMARY KEY on id"
+    );
+
+    let unique_msgid: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.table_constraints \
+         WHERE table_schema = DATABASE() AND table_name = 'messages' \
+         AND constraint_type = 'UNIQUE' AND constraint_name = 'uq_messages_messageid'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unique_msgid, 1,
+        "messageId must remain UNIQUE (dedup constraint)"
+    );
+}
+
+/// Baseline seeds the three canonical boxes with delivery_fee = 0 (operator
+/// opts into fees via MESSAGEBOX_FEES; TS-parity default is a Phase-5 call).
+#[tokio::test]
+async fn test_baseline_server_fees_seed() {
+    let pool = fresh_pool().await;
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT message_box, delivery_fee FROM server_fees ORDER BY message_box")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("inbox".to_string(), 0),
+            ("notifications".to_string(), 0),
+            ("payment_inbox".to_string(), 0),
+        ],
+        "baseline seed must be exactly the 3 canonical boxes at fee 0"
     );
 }
