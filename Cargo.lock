@@ -99,6 +99,8 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 [[package]]
 name = "authsocket"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffdb85d90d02291fccd06bb7c50020e5c466be48273af95c75d01d58e9a4b0fa"
 dependencies = [
  "async-trait",
  "bsv-sdk",
