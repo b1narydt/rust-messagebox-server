@@ -175,7 +175,9 @@ async fn main() {
         .expect("auth middleware config");
 
     let auth_layer =
-        bsv_auth_axum_middleware::AuthLayer::from_config(auth_config, peer, transport).await;
+        bsv_auth_axum_middleware::AuthLayer::from_config(auth_config, peer, transport)
+            .await
+            .expect("auth middleware layer");
 
     let app_state = handlers::helpers::AppState {
         db: pool,

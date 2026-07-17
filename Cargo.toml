@@ -25,20 +25,19 @@ form_urlencoded = "1"
 async-trait = "0.1"
 socketioxide = { version = "0.15", features = ["state"] }
 
-# BRC-31 auth middleware — crates.io release
-bsv-auth-axum-middleware = "0.1"
+# BRC-103/104 auth middleware — git dep (0.1.3, WS-first connect + connect-ack
+# gate), same rev as rust-mpc bins/backend + bins/cosigner. Requires bsv-sdk 0.3.
+bsv-auth-axum-middleware = { git = "https://github.com/b1narydt/bsv-auth-axum-middleware", rev = "18a39db0f0ef1042e7eca8cf4c602f0be9ecf0a2" }
 
-# bsv-sdk — sole SDK for all auth and wallet operations. The concurrency-safe
-# Arc<Peer> build (Type-42 ECDH shared-secret cache) is published as 0.2.87 on
-# crates.io, so no patch is needed. bsv-auth-axum-middleware and bsv-wallet-toolbox
-# both depend on bsv-sdk ^0.2, so all three resolve a single crates.io 0.2.87 copy.
-bsv-sdk = { version = "0.2.87", features = ["network"] }
+# bsv-sdk — sole SDK for all auth and wallet operations. Declared as a registry
+# version and redirected graph-wide to the shared 0.3 git rev via
+# [patch.crates-io] below, so this crate, authsocket, the middleware, and
+# bsv-wallet-toolbox all resolve ONE bsv-sdk copy (WalletInterface/AuthMessage
+# unify across the auth boundary). Verify with `cargo tree -i bsv-sdk`.
+bsv-sdk = { version = "0.3", features = ["network"] }
 
-# Bumped to 0.2.24 (latest 0.2.x). Older 0.2.16 predates the SDK's
-# CertificateResult.keyring change (bare HashMap -> Option<HashMap>) and fails to
-# compile against 0.2.86+. 0.2.24 targets the newer shape and requires bsv-sdk
-# "0.2" (satisfied by crates.io 0.2.87).
-bsv-wallet-toolbox = "0.2.24"
+# 0.3.x — the line that targets bsv-sdk 0.3 (matches the rust-mpc workspace).
+bsv-wallet-toolbox = "0.3"
 
 getrandom = "0.4"
 http-body-util = "0.1"
@@ -61,13 +60,11 @@ lto = true
 # Without this, cargo walks up to rust-mpc/Cargo.toml and refuses to build.
 [workspace]
 
-# bsv-auth-axum-middleware 0.1.2 is not yet on crates.io, so it is sourced from
-# git. This server is the build root, so its [patch] applies graph-wide. The
-# middleware carries the lock-free Arc<Peer> verify/create, the cert-exchange
-# empty-certifiers fix, and SessionNotFound -> 401; it requires bsv-sdk "0.2.87",
-# which resolves from crates.io (no bsv-sdk patch needed) so every crate shares
-# one bsv-sdk copy. Pinned to an immutable rev (not a branch) so a force-push
-# can't silently change this payment-adjacent build; bump the rev when it moves,
-# and drop this [patch] entirely once 0.1.2 publishes to crates.io.
+# bsv-sdk pinned graph-wide to the same 0.3 git rev as rust-mpc, rust-authsocket,
+# and rust-messagebox-client (crates.io 0.3.0 rejects protocol/basket names
+# starting with 'p', which breaks the payment-request-auth protocol; the pinned
+# rev reserves the "p " namespace instead). This server is the build root, so the
+# [patch] applies graph-wide: every crate (incl. bsv-wallet-toolbox and the auth
+# middleware) shares one bsv-sdk copy. Pinned to an immutable rev, not a branch.
 [patch.crates-io]
-bsv-auth-axum-middleware = { git = "https://github.com/b1narydt/bsv-auth-axum-middleware", rev = "a12649f8d5f03e8756497274e3136362df04e8b7" }
+bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5" }

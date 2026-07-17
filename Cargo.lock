@@ -269,8 +269,8 @@ dependencies = [
 
 [[package]]
 name = "bsv-auth-axum-middleware"
-version = "0.1.2"
-source = "git+https://github.com/b1narydt/bsv-auth-axum-middleware?rev=a12649f8d5f03e8756497274e3136362df04e8b7#a12649f8d5f03e8756497274e3136362df04e8b7"
+version = "0.1.3"
+source = "git+https://github.com/b1narydt/bsv-auth-axum-middleware?rev=18a39db0f0ef1042e7eca8cf4c602f0be9ecf0a2#18a39db0f0ef1042e7eca8cf4c602f0be9ecf0a2"
 dependencies = [
  "async-trait",
  "axum",
@@ -292,9 +292,8 @@ dependencies = [
 
 [[package]]
 name = "bsv-sdk"
-version = "0.2.87"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05ee3fa3906f958c53f661b142517772d641bfb858717de7f16d4d735d45332"
+version = "0.3.1"
+source = "git+https://github.com/b1narydt/bsv-rust-sdk.git?rev=102abf703289ea8459167c4b2954e5cd94fce8d5#102abf703289ea8459167c4b2954e5cd94fce8d5"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -309,9 +308,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-wallet-toolbox"
-version = "0.2.24"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bccc0bd0a1d318c50816dd8f269749b7beefd67f878aaf90177b3c483a5f741"
+checksum = "4b0199a324c09b39439961267c1425e99e96369e6f45a5c08b579d4ca6b4004b"
 dependencies = [
  "async-trait",
  "base64",
