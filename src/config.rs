@@ -28,9 +28,6 @@ pub struct Config {
     pub bsv_network: String,
     pub enable_websockets: bool,
     pub wallet_storage_url: String,
-    pub firebase_project_id: Option<String>,
-    pub firebase_service_account_json: Option<String>,
-    pub firebase_service_account_path: Option<String>,
     /// Parsed from `MESSAGEBOX_FEES=chat=10,priority=100` — applied at boot.
     pub message_box_fees: Vec<(String, i64)>,
     /// Parse warnings from `MESSAGEBOX_FEES` — emitted after the logger is up.
@@ -104,15 +101,6 @@ impl Config {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "https://storage.babbage.systems".to_string());
-        let firebase_project_id = env::var("FIREBASE_PROJECT_ID")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let firebase_service_account_json = env::var("FIREBASE_SERVICE_ACCOUNT_JSON")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let firebase_service_account_path = env::var("FIREBASE_SERVICE_ACCOUNT_PATH")
-            .ok()
-            .filter(|s| !s.is_empty());
 
         // Parse MESSAGEBOX_FEES=chat=10,priority=100
         // Format: comma-separated box_name=satoshis pairs. Whitespace is trimmed.
@@ -131,9 +119,6 @@ impl Config {
             bsv_network,
             enable_websockets,
             wallet_storage_url,
-            firebase_project_id,
-            firebase_service_account_json,
-            firebase_service_account_path,
             message_box_fees,
             message_box_fees_warnings,
         })
@@ -243,15 +228,6 @@ impl fmt::Debug for Config {
             .field("bsv_network", &self.bsv_network)
             .field("enable_websockets", &self.enable_websockets)
             .field("wallet_storage_url", &self.wallet_storage_url)
-            .field("firebase_project_id", &self.firebase_project_id)
-            .field(
-                "firebase_service_account_json",
-                &self.firebase_service_account_json,
-            )
-            .field(
-                "firebase_service_account_path",
-                &self.firebase_service_account_path,
-            )
             .field("message_box_fees", &self.message_box_fees)
             // message_box_fees_warnings are transient — omitted from Debug output.
             .finish()

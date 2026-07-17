@@ -34,9 +34,6 @@ fn test_config() -> Config {
         bsv_network: "testnet".to_string(),
         enable_websockets: false,
         wallet_storage_url: "https://storage.babbage.systems".to_string(),
-        firebase_project_id: None,
-        firebase_service_account_json: None,
-        firebase_service_account_path: None,
         message_box_fees: Vec::new(),
         message_box_fees_warnings: Vec::new(),
     }
@@ -95,11 +92,6 @@ async fn setup_app() -> Router {
             "/acknowledgeMessage",
             post(crate::handlers::acknowledge_message::acknowledge_message),
         )
-        .route(
-            "/registerDevice",
-            post(crate::handlers::devices::register_device),
-        )
-        .route("/devices", get(crate::handlers::devices::list_devices))
         .route(
             "/permissions/set",
             post(crate::handlers::permissions::set_permission),
@@ -563,89 +555,6 @@ async fn test_acknowledge_success() {
 }
 
 // ===========================================================================
-// devices tests
-// ===========================================================================
-
-#[tokio::test]
-async fn test_register_device_missing_token() {
-    let app = setup_app().await;
-    let (status, body) = post_json(&app, "/registerDevice", json!({})).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "ERR_INVALID_FCM_TOKEN");
-}
-
-#[tokio::test]
-async fn test_register_device_invalid_platform() {
-    let app = setup_app().await;
-    let (status, body) = post_json(
-        &app,
-        "/registerDevice",
-        json!({
-            "fcmToken": "valid-token-123",
-            "platform": "windows"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "ERR_INVALID_PLATFORM");
-}
-
-#[tokio::test]
-async fn test_register_device_success() {
-    let app = setup_app().await;
-    let (status, body) = post_json(
-        &app,
-        "/registerDevice",
-        json!({
-            "fcmToken": "fcm-token-12345",
-            "platform": "android"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "success");
-    assert!(body["deviceId"].as_i64().unwrap() > 0);
-}
-
-#[tokio::test]
-async fn test_list_devices_empty() {
-    let app = setup_app().await;
-    let (status, body) = get_path(&app, "/devices").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "success");
-    assert!(body["devices"].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn test_list_devices_with_registered() {
-    let app = setup_app().await;
-
-    // Register a device first
-    let (status, _) = post_json(
-        &app,
-        "/registerDevice",
-        json!({
-            "fcmToken": "a]very-long-fcm-token-that-gets-masked",
-            "platform": "ios"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // List devices
-    let (status, body) = get_path(&app, "/devices").await;
-    assert_eq!(status, StatusCode::OK);
-    let devices = body["devices"].as_array().unwrap();
-    assert_eq!(devices.len(), 1);
-    // Token should be masked (only last 10 chars shown)
-    let token = devices[0]["fcmToken"].as_str().unwrap();
-    assert!(
-        token.starts_with("..."),
-        "fcm token should be masked: {token}"
-    );
-}
-
-// ===========================================================================
 // permissions tests
 // ===========================================================================
 
@@ -782,11 +691,6 @@ async fn test_no_auth_returns_401() {
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    // Test GET endpoint without auth
-    let app = setup_app().await;
-    let (status, _) = get_path_no_auth(&app, "/devices").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     // Test permissions GET without auth

@@ -45,38 +45,6 @@ pub struct SendMessageResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct DeviceOut {
-    pub id: i64,
-    #[serde(rename = "deviceId", skip_serializing_if = "Option::is_none")]
-    pub device_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub platform: Option<String>,
-    #[serde(rename = "fcmToken")]
-    pub fcm_token: String,
-    pub active: bool,
-    #[serde(rename = "createdAt")]
-    pub created_at: String,
-    #[serde(rename = "updatedAt")]
-    pub updated_at: String,
-    #[serde(rename = "lastUsed")]
-    pub last_used: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct ListDevicesResponse {
-    pub status: String,
-    pub devices: Vec<DeviceOut>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RegisterDeviceResponse {
-    pub status: String,
-    pub message: String,
-    #[serde(rename = "deviceId")]
-    pub device_id: i64,
-}
-
-#[derive(Debug, Serialize)]
 pub struct SetPermissionResponse {
     pub status: String,
     pub description: String,

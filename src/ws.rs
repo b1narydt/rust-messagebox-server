@@ -438,8 +438,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_skips_member_without_authenticated_session() {
         let ws = test_ws();
-        let wallet =
-            SdkProtoWallet::new(PrivateKey::from_hex(TEST_SERVER_KEY).expect("test key"));
+        let wallet = SdkProtoWallet::new(PrivateKey::from_hex(TEST_SERVER_KEY).expect("test key"));
         ws.core.add_connection("sock1", wallet);
         ws.core.join_room("sock1", "keyA-inbox");
 

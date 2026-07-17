@@ -71,15 +71,6 @@ pub struct AcknowledgeMessageRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RegisterDeviceRequest {
-    #[serde(rename = "fcmToken")]
-    pub fcm_token: Option<String>,
-    #[serde(rename = "deviceId")]
-    pub device_id: Option<String>,
-    pub platform: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct SetPermissionRequest {
     pub sender: Option<String>,
     #[serde(rename = "messageBox")]

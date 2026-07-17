@@ -7,7 +7,6 @@ use serde_json::Value;
 use tracing::{debug, error, warn};
 
 use crate::db::queries;
-use crate::firebase::send_fcm_notification::{send_fcm_notification, FcmPayload};
 use crate::handlers::helpers::{
     build_per_recipient_outputs, error_response, is_valid_pub_key, AppState, AuthIdentity, FeeRow,
 };
@@ -554,34 +553,6 @@ pub async fn send_message(
                 msg_id = %msg_id, recipient = %fr.recipient,
                 "persist: inline write hit a permanent error — dead-lettered to disk; row NOT in MySQL"
             ),
-        }
-
-        // FCM notification for "notifications" box.
-        if queries::should_use_fcm_delivery(&box_type) {
-            let pool = state.db.clone();
-            let recipient = fr.recipient.clone();
-            let msg_id_for_fcm = msg_id.clone();
-            let payload = FcmPayload {
-                title: "New Message".to_string(),
-                message_id: msg_id.clone(),
-                originator: sender_key.clone(),
-            };
-            // Fire-and-forget, but don't rely on a dropped JoinHandle to surface
-            // problems. `send_fcm_notification` logs its own per-device errors
-            // internally and returns a result summary; we inspect that summary so
-            // a total delivery failure is observable at this call site too (it is
-            // best-effort — message durability does not depend on FCM).
-            tokio::spawn(async move {
-                let result = send_fcm_notification(&pool, &recipient, payload).await;
-                if !result.success {
-                    warn!(
-                        msg_id = %msg_id_for_fcm,
-                        recipient = %recipient,
-                        error = result.error.as_deref().unwrap_or("unknown"),
-                        "FCM notification not delivered (best-effort; live push + persistence are unaffected)"
-                    );
-                }
-            });
         }
 
         results.push(SendMessageResult {

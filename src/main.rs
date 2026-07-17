@@ -21,7 +21,7 @@ use bsv_wallet_toolbox::types::Chain;
 use bsv_wallet_toolbox::wallet::types::WalletArgs;
 use bsv_wallet_toolbox::wallet::wallet::Wallet;
 
-use messagebox_server::{cloneable_wallet, config, db, firebase, handlers, logger, ws};
+use messagebox_server::{cloneable_wallet, config, db, handlers, logger, ws};
 
 #[tokio::main]
 async fn main() {
@@ -61,13 +61,6 @@ async fn main() {
     db::queries::init_delivery_fee_cache(&pool)
         .await
         .expect("Failed to prime delivery-fee cache");
-
-    firebase::initialize(
-        config.firebase_project_id.as_deref(),
-        config.firebase_service_account_json.as_deref(),
-        config.firebase_service_account_path.as_deref(),
-    )
-    .await;
 
     // Create bsv-sdk wallet from server private key
     let sdk_private_key = match PrivateKey::from_hex(&config.server_private_key) {
@@ -174,10 +167,9 @@ async fn main() {
         .build()
         .expect("auth middleware config");
 
-    let auth_layer =
-        bsv_auth_axum_middleware::AuthLayer::from_config(auth_config, peer, transport)
-            .await
-            .expect("auth middleware layer");
+    let auth_layer = bsv_auth_axum_middleware::AuthLayer::from_config(auth_config, peer, transport)
+        .await
+        .expect("auth middleware layer");
 
     let app_state = handlers::helpers::AppState {
         db: pool,
@@ -228,8 +220,6 @@ async fn main() {
             "/acknowledgeMessage",
             post(handlers::acknowledge_message::acknowledge_message),
         )
-        .route("/registerDevice", post(handlers::devices::register_device))
-        .route("/devices", get(handlers::devices::list_devices))
         .route(
             "/permissions/set",
             post(handlers::permissions::set_permission),
