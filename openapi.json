@@ -1,0 +1,133 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "BSV MessageBox Server",
+    "description": "Rust reimplementation of @bsv/messagebox-server (Parity++: TS public API + intended behavior, with the TS bugs fixed). All API routes require BRC-103/104 mutual authentication via x-bsv-auth-* headers; /docs, /openapi.json and the ops endpoints are pre-auth. Error responses share the shape {status:'error', code, description}.",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/sendMessage": {
+      "post": {
+        "summary": "Store a message for one or more recipients (and push it live)",
+        "description": "Body: {message: {recipient|recipients, messageBox, messageId (string|string[]), body (string|object)}, payment?}. One messageId per recipient. Boxes with a delivery/recipient fee require a BRC-29 payment. Errors: 400 ERR_MESSAGE_REQUIRED | ERR_INVALID_MESSAGEBOX | ERR_INVALID_MESSAGE_BODY | ERR_RECIPIENT_REQUIRED | ERR_INVALID_RECIPIENT_KEY | ERR_MESSAGEID_REQUIRED | ERR_INVALID_MESSAGEID | ERR_MESSAGEID_COUNT_MISMATCH | ERR_MISSING_PAYMENT_TX | ERR_MISSING_DELIVERY_OUTPUT | ERR_INSUFFICIENT_PAYMENT, 403 ERR_DELIVERY_BLOCKED (+blockedRecipients), 500 ERR_INTERNALIZE_FAILED | ERR_INTERNAL_ERROR.",
+        "responses": {
+          "200": {
+            "description": "{status:'success', message:'Your message has been sent to N recipient(s).', results:[{recipient, messageId}]}"
+          }
+        }
+      }
+    },
+    "/listMessages": {
+      "post": {
+        "summary": "List all messages in one of the caller's message boxes",
+        "description": "Body: {messageBox}. Unknown box returns an empty list. Errors: 400 ERR_MESSAGEBOX_REQUIRED, 500 ERR_INTERNAL_ERROR.",
+        "responses": {
+          "200": {
+            "description": "{status:'success', messages:[{messageId, body, sender, createdAt, updatedAt}]}"
+          }
+        }
+      }
+    },
+    "/acknowledgeMessage": {
+      "post": {
+        "summary": "Acknowledge (permanently delete) messages by id",
+        "description": "Body: {messageIds: string[]}. Deletes rows belonging to the authenticated recipient. Errors: 400 ERR_MESSAGE_ID_REQUIRED | ERR_INVALID_MESSAGE_ID | ERR_INVALID_ACKNOWLEDGMENT, 500 ERR_INTERNAL_ERROR.",
+        "responses": { "200": { "description": "{status:'success'}" } }
+      }
+    },
+    "/registerDevice": {
+      "post": {
+        "summary": "Register an FCM device token for push notifications",
+        "description": "Body: {fcmToken (required), deviceId?, platform? in ios|android|web}. Upserts on the unique fcmToken (re-assigns owner, reactivates, bumps lastUsed). Errors: 400 ERR_INVALID_FCM_TOKEN | ERR_INVALID_PLATFORM, 500 ERR_DATABASE_ERROR.",
+        "responses": {
+          "200": {
+            "description": "{status:'success', message:'Device registered successfully for push notifications', deviceId: <numeric row id>}"
+          }
+        }
+      }
+    },
+    "/devices": {
+      "get": {
+        "summary": "List the caller's registered devices",
+        "description": "Ordered updatedAt DESC. fcmToken is masked to '...'+last 10 chars; absent deviceId/platform/lastUsed serialize as null. Errors: 500 ERR_DATABASE_ERROR.",
+        "responses": {
+          "200": {
+            "description": "{status:'success', devices:[{id, deviceId, platform, fcmToken, active, createdAt, updatedAt, lastUsed}]}"
+          }
+        }
+      }
+    },
+    "/permissions/set": {
+      "post": {
+        "summary": "Set a recipient fee / block rule for a sender or box-wide",
+        "description": "Body: {sender?, messageBox, recipientFee} — -1 blocked, 0 always allow, >0 satoshis; omitted sender = box-wide. Errors: 400 ERR_INVALID_REQUEST | ERR_INVALID_PUBLIC_KEY.",
+        "responses": { "200": { "description": "{status:'success', description}" } }
+      }
+    },
+    "/permissions/get": {
+      "get": {
+        "summary": "Read one permission setting",
+        "description": "Query: sender? and messageBox. Errors: 400 ERR_MISSING_PARAMETERS | ERR_INVALID_PUBLIC_KEY.",
+        "responses": {
+          "200": {
+            "description": "{status:'success', description, permission?: {sender, messageBox, recipientFee, status: blocked|always_allow|payment_required, createdAt, updatedAt}}"
+          }
+        }
+      }
+    },
+    "/permissions/list": {
+      "get": {
+        "summary": "List the caller's permission rows (paginated)",
+        "description": "Query: message_box (or messageBox) filter, limit 1-1000 (default 100), offset >= 0, createdAtOrder asc|desc. Rows serialize snake_case (message_box, recipient_fee, created_at, updated_at) — pinned to @bsv/message-box-client 2.1.0, which reads snake_case (the TS server's camelCase here disagrees with its own client). Errors: 400 ERR_INVALID_LIMIT | ERR_INVALID_OFFSET, 500 ERR_LIST_PERMISSIONS_FAILED.",
+        "responses": {
+          "200": {
+            "description": "{status:'success', permissions:[{sender, message_box, recipient_fee, created_at, updated_at}], totalCount}"
+          }
+        }
+      }
+    },
+    "/permissions/quote": {
+      "get": {
+        "summary": "Quote the delivery + recipient fees before sending",
+        "description": "Query: recipient (repeatable) and messageBox. Single recipient returns {quote:{deliveryFee, recipientFee}}; multiple return {quotesByRecipient, totals, blockedRecipients}. Errors: 400 ERR_MISSING_PARAMETERS | ERR_INVALID_PUBLIC_KEY.",
+        "responses": { "200": { "description": "Quote response (single or multi shape)" } }
+      }
+    },
+    "/docs": {
+      "get": {
+        "summary": "This documentation (Swagger UI, pre-auth)",
+        "responses": { "200": { "description": "HTML" } }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "summary": "This OpenAPI document (pre-auth)",
+        "responses": { "200": { "description": "OpenAPI 3.0 JSON" } }
+      }
+    },
+    "/": {
+      "get": {
+        "summary": "Health banner (Rust extension; the TS server has no health route)",
+        "responses": { "200": { "description": "text/plain 'BSV MessageBox Server'" } }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "summary": "Liveness probe (Rust extension)",
+        "responses": { "200": { "description": "{status:'alive'}" } }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "summary": "Readiness probe — DB (and Redis in Model B) reachable, not draining (Rust extension)",
+        "responses": { "200": { "description": "ready" }, "503": { "description": "not ready" } }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus metrics (Rust extension)",
+        "responses": { "200": { "description": "text/plain; version=0.0.4" } }
+      }
+    }
+  }
+}

@@ -269,6 +269,9 @@ async fn main() {
                     )
                 }),
             )
+            // API docs (H19): pre-auth, like the TS server's swagger mount.
+            .route("/docs", get(messagebox_server::docs::docs_page))
+            .route("/openapi.json", get(messagebox_server::docs::openapi_json))
             .route(
                 "/health/live",
                 get(|| async { axum::Json(serde_json::json!({"status": "alive"})) }),
