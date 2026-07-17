@@ -57,6 +57,8 @@ SERVER_PRIVATE_KEY="<64-hex-private-key>" PORT=3322 cargo run --release --bin me
 | `ROUTING_PREFIX` | *(empty)* | Optional URL prefix for all API routes |
 | `BSV_NETWORK` | `mainnet` | BSV network |
 | `REDIS_URL` | *(none)* | Unset → **Model A** (single instance, in-process routing — the default). Set → **Model B**: Redis pub/sub backplane for cross-instance live push; run N replicas behind a **sticky** LB. See below. |
+| `MAX_CONNECTIONS` | `0` (unlimited) | Per-instance WebSocket connection ceiling (admission control). Past it, NEW connections get `503` + `Retry-After` (Model B: the LB sheds to another instance; Model A: the client retries). In-flight sessions are never affected. |
+| `DRAIN_TIMEOUT_SECS` | `30` | Per-phase bound on the SIGTERM graceful drain (in-flight send quiesce, persist-queue flush). |
 
 ## Topology: Model A / Model B
 
@@ -84,6 +86,28 @@ Redis is live-push only, **never durability**: if Redis is down, local
 delivery keeps working, cross-instance recipients fall back to the durable
 mailbox (`/listMessages` from any instance), and the degradation is logged +
 counted — the server never fails or blocks a send on Redis.
+
+## Operations (unauthenticated, at the root — never under `ROUTING_PREFIX`)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Plain-text banner (legacy uptime check) |
+| `GET` | `/health/live` | Liveness: the event loop answered — always `200` |
+| `GET` | `/health/ready` | Readiness: `200` when routable, `503` + JSON `{ready, db, redis, draining}` on DB loss, on Redis-subscription loss in Model B (Model A skips the check), or while draining |
+| `GET` | `/metrics` | Prometheus text: connections/rooms, fan-out + sign-latency histograms, persist queue depth / inline-fallback / dead-letter counters, Model B publish/drop/lag, admission + drain gauges. Operational counts only — no identities, no message data, no key material. Bind to a scrape network in production. |
+
+**Admission control** (`MAX_CONNECTIONS`): gates only *new* WS handshakes
+(engine.io requests without a `sid`). Established sessions, all API routes,
+and the ops endpoints are never gated — an in-flight ceremony's sends are
+never nacked by capacity pressure. Rejections are `503` + `Retry-After: 5`
+with `ERR_SERVER_AT_CAPACITY` / `ERR_SERVER_DRAINING`.
+
+**Graceful drain** (SIGTERM, each phase bounded by `DRAIN_TIMEOUT_SECS`):
+stop admission and flip readiness (the LB deregisters) → wait for in-flight
+sends → disconnect sockets (clients re-handshake against another instance;
+the MySQL mailbox covers the gap) → flush the persist queue → exit. Zero
+message loss: every accepted message ends durably stored, a confirmed
+duplicate, or dead-lettered to disk.
 
 ## Auth stack
 
@@ -113,5 +137,7 @@ Incoming WebSocket (Socket.IO)
 | `handlers` | HTTP handlers: send, list, acknowledge, permissions |
 | `ws` | MessageBox app layer over the shared `authsocket` crate (BRC-103 sessions, rooms, signed broadcast) |
 | `backplane` | Model B Redis pub/sub backplane: unsigned cross-instance envelopes, sign-on-owner delivery, degrade-don't-fail |
+| `ops` | Operational floor: admission control (connection ceiling), structured liveness/readiness, graceful drain |
+| `metrics` | Prometheus text exposition for `GET /metrics` (histograms + scrape-time counter sampling) |
 | `cloneable_wallet` | `CloneableProtoWallet` wrapper for `bsv-sdk` `ProtoWallet` (needed for `Peer<W: Clone>`) |
 | `logger` | Tracing/logging initialization |
