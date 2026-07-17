@@ -137,7 +137,10 @@ async fn test_get_server_delivery_fee_default() {
     let fee = get_server_delivery_fee(&pool, "notifications")
         .await
         .unwrap();
-    assert_eq!(fee, 0, "notifications default delivery fee should be 0 (baseline seeds all fees at 0; opt-in via MESSAGEBOX_FEES)");
+    assert_eq!(
+        fee, 10,
+        "notifications default delivery fee is 10 — TS parity (D3); override via MESSAGEBOX_FEES"
+    );
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
     assert_eq!(fee, 0, "inbox box default delivery fee should be 0");
@@ -315,15 +318,15 @@ async fn test_list_permissions_with_pagination() {
 #[tokio::test]
 async fn test_delivery_fee_cache() {
     let pool = fresh_pool().await;
-    // After init_delivery_fee_cache (called in fresh_pool), fees should come from cache.
-    // The baseline migration seeds every fee at 0 (incl. notifications), so the
-    // cached value is 0 unless an operator opts in via MESSAGEBOX_FEES.
+    // After init_delivery_fee_cache (called in fresh_pool), fees come from the
+    // cache. The baseline seed matches TS (D3): notifications=10, others 0;
+    // operators override via MESSAGEBOX_FEES (applied before cache priming).
     let fee = get_server_delivery_fee(&pool, "notifications")
         .await
         .unwrap();
     assert_eq!(
-        fee, 0,
-        "notifications delivery fee should be 0 out of the box"
+        fee, 10,
+        "notifications delivery fee is 10 out of the box (TS parity)"
     );
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
@@ -738,8 +741,9 @@ async fn test_baseline_messages_has_real_primary_key() {
     );
 }
 
-/// Baseline seeds the three canonical boxes with delivery_fee = 0 (operator
-/// opts into fees via MESSAGEBOX_FEES; TS-parity default is a Phase-5 call).
+/// Baseline seed matches the TS server exactly (Phase-5 D3 decision):
+/// notifications=10, inbox=0, payment_inbox=0. Operators override per box
+/// via MESSAGEBOX_FEES (upserted at boot before the cache is primed).
 #[tokio::test]
 async fn test_baseline_server_fees_seed() {
     let pool = fresh_pool().await;
@@ -752,9 +756,9 @@ async fn test_baseline_server_fees_seed() {
         rows,
         vec![
             ("inbox".to_string(), 0),
-            ("notifications".to_string(), 0),
+            ("notifications".to_string(), 10),
             ("payment_inbox".to_string(), 0),
         ],
-        "baseline seed must be exactly the 3 canonical boxes at fee 0"
+        "baseline seed must match the TS seed: notifications=10, inbox=0, payment_inbox=0"
     );
 }

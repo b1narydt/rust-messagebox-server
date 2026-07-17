@@ -675,6 +675,440 @@ async fn test_get_quote_missing_params() {
 }
 
 // ===========================================================================
+// Payment-path tests (parity audit H3/H4 — TS status codes + error codes)
+//
+// The `notifications` box carries the TS-parity delivery fee of 10 sats out
+// of the box (baseline seed, D3), which is what arms the payment plane here.
+// A stub WalletInterface pins the internalize outcomes (accepted / rejected /
+// exception) without a remote storage backend.
+// ===========================================================================
+
+mod stub_wallet {
+    use async_trait::async_trait;
+    use bsv::wallet::error::WalletError;
+    use bsv::wallet::interfaces::*;
+
+    /// What the stub's `internalize_action` does.
+    #[derive(Clone, Copy)]
+    pub enum Internalize {
+        Accept,
+        Reject,
+        Fail,
+    }
+
+    /// Minimal `WalletInterface` for the sendMessage payment path — only
+    /// `internalize_action` is ever exercised by the handler.
+    pub struct StubWallet(pub Internalize);
+
+    #[async_trait]
+    impl WalletInterface for StubWallet {
+        async fn internalize_action(
+            &self,
+            _args: InternalizeActionArgs,
+            _originator: Option<&str>,
+        ) -> Result<InternalizeActionResult, WalletError> {
+            match self.0 {
+                Internalize::Accept => Ok(InternalizeActionResult { accepted: true }),
+                Internalize::Reject => Ok(InternalizeActionResult { accepted: false }),
+                Internalize::Fail => Err(WalletError::InvalidParameter(
+                    "stubbed internalize failure".into(),
+                )),
+            }
+        }
+
+        async fn create_action(
+            &self,
+            _args: CreateActionArgs,
+            _o: Option<&str>,
+        ) -> Result<CreateActionResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn sign_action(
+            &self,
+            _args: SignActionArgs,
+            _o: Option<&str>,
+        ) -> Result<SignActionResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn abort_action(
+            &self,
+            _args: AbortActionArgs,
+            _o: Option<&str>,
+        ) -> Result<AbortActionResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn list_actions(
+            &self,
+            _args: ListActionsArgs,
+            _o: Option<&str>,
+        ) -> Result<ListActionsResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn list_outputs(
+            &self,
+            _args: ListOutputsArgs,
+            _o: Option<&str>,
+        ) -> Result<ListOutputsResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn relinquish_output(
+            &self,
+            _args: RelinquishOutputArgs,
+            _o: Option<&str>,
+        ) -> Result<RelinquishOutputResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_public_key(
+            &self,
+            _args: GetPublicKeyArgs,
+            _o: Option<&str>,
+        ) -> Result<GetPublicKeyResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn reveal_counterparty_key_linkage(
+            &self,
+            _args: RevealCounterpartyKeyLinkageArgs,
+            _o: Option<&str>,
+        ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn reveal_specific_key_linkage(
+            &self,
+            _args: RevealSpecificKeyLinkageArgs,
+            _o: Option<&str>,
+        ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn encrypt(
+            &self,
+            _args: EncryptArgs,
+            _o: Option<&str>,
+        ) -> Result<EncryptResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn decrypt(
+            &self,
+            _args: DecryptArgs,
+            _o: Option<&str>,
+        ) -> Result<DecryptResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn create_hmac(
+            &self,
+            _args: CreateHmacArgs,
+            _o: Option<&str>,
+        ) -> Result<CreateHmacResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn verify_hmac(
+            &self,
+            _args: VerifyHmacArgs,
+            _o: Option<&str>,
+        ) -> Result<VerifyHmacResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn create_signature(
+            &self,
+            _args: CreateSignatureArgs,
+            _o: Option<&str>,
+        ) -> Result<CreateSignatureResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn verify_signature(
+            &self,
+            _args: VerifySignatureArgs,
+            _o: Option<&str>,
+        ) -> Result<VerifySignatureResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn acquire_certificate(
+            &self,
+            _args: AcquireCertificateArgs,
+            _o: Option<&str>,
+        ) -> Result<Certificate, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn list_certificates(
+            &self,
+            _args: ListCertificatesArgs,
+            _o: Option<&str>,
+        ) -> Result<ListCertificatesResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn prove_certificate(
+            &self,
+            _args: ProveCertificateArgs,
+            _o: Option<&str>,
+        ) -> Result<ProveCertificateResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn relinquish_certificate(
+            &self,
+            _args: RelinquishCertificateArgs,
+            _o: Option<&str>,
+        ) -> Result<RelinquishCertificateResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn discover_by_identity_key(
+            &self,
+            _args: DiscoverByIdentityKeyArgs,
+            _o: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn discover_by_attributes(
+            &self,
+            _args: DiscoverByAttributesArgs,
+            _o: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_header_for_height(
+            &self,
+            _args: GetHeaderArgs,
+            _o: Option<&str>,
+        ) -> Result<GetHeaderResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+
+        async fn is_authenticated(
+            &self,
+            _o: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn wait_for_authentication(
+            &self,
+            _o: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_height(&self, _o: Option<&str>) -> Result<GetHeightResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_network(&self, _o: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_version(&self, _o: Option<&str>) -> Result<GetVersionResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+    }
+}
+
+/// App with a stubbed funded wallet (payment-path tests).
+async fn setup_app_with_wallet(
+    wallet: Arc<dyn bsv::wallet::interfaces::WalletInterface>,
+) -> Router {
+    let pool = fresh_pool().await;
+    let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
+    io.ns("/", |_: socketioxide::extract::SocketRef| {});
+    let ws_broadcast = crate::ws::WsBroadcast::new(
+        io,
+        "a".repeat(64),
+        pool.clone(),
+        None,
+        crate::ops::OpsState::new(0),
+    );
+    let state = AppState {
+        db: pool,
+        config: Arc::new(test_config()),
+        funded_wallet: wallet,
+        ws: ws_broadcast,
+    };
+    Router::new()
+        .route(
+            "/sendMessage",
+            post(crate::handlers::send_message::send_message),
+        )
+        .layer(axum::middleware::from_fn(auth_middleware))
+        .with_state(state)
+}
+
+/// A payment body whose first output is a well-formed server delivery-fee
+/// output (index 0 + remittance) and whose second is the recipient's.
+fn valid_payment() -> Value {
+    json!({
+        "tx": [1, 2, 3],
+        "outputs": [
+            {
+                "outputIndex": 0,
+                "paymentRemittance": {
+                    "derivationPrefix": "prefix-a",
+                    "derivationSuffix": "suffix-a",
+                    "senderIdentityKey": TEST_KEY
+                }
+            },
+            { "outputIndex": 1 }
+        ]
+    })
+}
+
+fn notifications_send_body(message_id: &str, payment: Option<Value>) -> Value {
+    let mut body = json!({
+        "message": {
+            "recipient": RECIPIENT_KEY,
+            "messageBox": "notifications",
+            "messageId": message_id,
+            "body": "pay-to-deliver"
+        }
+    });
+    if let Some(p) = payment {
+        body["payment"] = p;
+    }
+    body
+}
+
+/// TS: payable box with no payment at all → 400 ERR_MISSING_PAYMENT_TX.
+#[tokio::test]
+async fn test_send_payable_without_payment_is_missing_payment_tx() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Accept,
+    )))
+    .await;
+    let (status, body) =
+        post_json(&app, "/sendMessage", notifications_send_body("pay-1", None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_MISSING_PAYMENT_TX");
+}
+
+/// H4 (TS): delivery fee due but `payment.outputs` empty →
+/// 400 ERR_MISSING_DELIVERY_OUTPUT (not ERR_MISSING_PAYMENT_TX).
+#[tokio::test]
+async fn test_send_payment_empty_outputs_is_missing_delivery_output() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Accept,
+    )))
+    .await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        notifications_send_body("pay-2", Some(json!({"tx": [1, 2, 3], "outputs": []}))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_MISSING_DELIVERY_OUTPUT");
+}
+
+/// H3 (TS): internalize returns accepted=false →
+/// 400 ERR_INSUFFICIENT_PAYMENT (was a Rust-only 500).
+#[tokio::test]
+async fn test_send_payment_not_accepted_is_insufficient_payment_400() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Reject,
+    )))
+    .await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        notifications_send_body("pay-3", Some(valid_payment())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INSUFFICIENT_PAYMENT");
+}
+
+/// H3 (TS): internalize throws → 500 ERR_INTERNALIZE_FAILED
+/// (code renamed from the drifted ERR_INTERNALIZATION_FAILED).
+#[tokio::test]
+async fn test_send_payment_internalize_exception_is_500_internalize_failed() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Fail,
+    )))
+    .await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        notifications_send_body("pay-4", Some(valid_payment())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["code"], "ERR_INTERNALIZE_FAILED");
+}
+
+/// Accepted payment with a server output + a recipient output → 200 success.
+#[tokio::test]
+async fn test_send_payment_accepted_succeeds() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Accept,
+    )))
+    .await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        notifications_send_body("pay-5", Some(valid_payment())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["status"], "success");
+}
+
+// ===========================================================================
+// H10 — whitespace-only body rejected (TS trims before the emptiness check)
+// ===========================================================================
+
+#[tokio::test]
+async fn test_send_message_whitespace_only_body_rejected() {
+    let app = setup_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageBox": "inbox",
+                "messageId": "ws-body-1",
+                "body": "   "
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INVALID_MESSAGE_BODY");
+}
+
+// ===========================================================================
+// H17 — /permissions/list pinned to the CLIENT: snake_case rows + both
+// `message_box` and `messageBox` filter params accepted
+// ===========================================================================
+
+#[tokio::test]
+async fn test_list_permissions_accepts_both_box_params_and_snake_case_rows() {
+    let app = setup_app().await;
+
+    post_json(
+        &app,
+        "/permissions/set",
+        json!({"messageBox": "inbox", "recipientFee": 10}),
+    )
+    .await;
+    post_json(
+        &app,
+        "/permissions/set",
+        json!({"messageBox": "other_box", "recipientFee": 20}),
+    )
+    .await;
+
+    // Client 2.1.0 spelling: message_box (silently dead against TS servers).
+    let (status, body) = get_path(&app, "/permissions/list?message_box=inbox").await;
+    assert_eq!(status, StatusCode::OK);
+    let perms = body["permissions"].as_array().unwrap();
+    assert_eq!(perms.len(), 1, "message_box filter must apply: {body}");
+    let row = perms[0].as_object().unwrap();
+    // Snake_case row shape — what client 2.1.0 reads (H17 pin).
+    assert_eq!(row["message_box"], "inbox");
+    assert!(row.contains_key("recipient_fee"));
+    assert!(row.contains_key("created_at"));
+    assert!(row.contains_key("updated_at"));
+
+    // TS-server spelling: messageBox — also accepted.
+    let (status, body) = get_path(&app, "/permissions/list?messageBox=other_box").await;
+    assert_eq!(status, StatusCode::OK);
+    let perms = body["permissions"].as_array().unwrap();
+    assert_eq!(perms.len(), 1, "messageBox filter must apply: {body}");
+    assert_eq!(perms[0]["message_box"], "other_box");
+}
+
+// ===========================================================================
 // Device registration tests (parity audit §4.1/§4.2 — the TS contract)
 // ===========================================================================
 

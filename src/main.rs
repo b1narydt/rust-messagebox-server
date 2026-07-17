@@ -117,13 +117,14 @@ async fn main() {
         settings_manager: None,
         lookup_resolver: None,
     };
-    let funded_wallet = match Wallet::new(wallet_args) {
-        Ok(w) => Arc::new(w),
-        Err(e) => {
-            tracing::error!("Failed to construct funded wallet: {e}");
-            std::process::exit(1);
-        }
-    };
+    let funded_wallet: Arc<dyn bsv::wallet::interfaces::WalletInterface> =
+        match Wallet::new(wallet_args) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                tracing::error!("Failed to construct funded wallet: {e}");
+                std::process::exit(1);
+            }
+        };
     tracing::info!("Wallet storage backend: {}", config.wallet_storage_url);
 
     // Log server identity key via bsv-sdk

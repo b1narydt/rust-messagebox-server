@@ -67,14 +67,13 @@ CREATE TABLE server_fees (
   UNIQUE KEY uq_server_fees_box (message_box)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Delivery fees default to 0: operators opt into fees per box via the
--- MESSAGEBOX_FEES env var (upserted at boot after migrations). This carries
--- forward the pre-squash end state (the zero_default_fees migration). Note
--- the TS server seeds notifications=10; whether the out-of-box default flips
--- back to 10 for behavioral parity is a Phase-5 decision (parity audit D3
--- follow-on — "finalize at Phase-5 build time"). The smart-default RECIPIENT
--- fee for `notifications` (=10) lives in code and already matches TS.
+-- Out-of-box seed matches the TS server exactly (Phase-5 decision, parity
+-- audit D3 follow-on): notifications=10, inbox=0, payment_inbox=0 — so
+-- notifications are pay-to-deliver by default, like TS. Operators override
+-- per box via the MESSAGEBOX_FEES env var (upserted at boot after
+-- migrations, before the delivery-fee cache is primed). The smart-default
+-- RECIPIENT fee for `notifications` (=10) lives in code and also matches TS.
 INSERT INTO server_fees (message_box, delivery_fee) VALUES
-  ('notifications', 0),
+  ('notifications', 10),
   ('inbox', 0),
   ('payment_inbox', 0);

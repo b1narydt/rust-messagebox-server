@@ -5,7 +5,7 @@ use axum::{
     http::{request::Parts, StatusCode},
     Json,
 };
-use bsv_wallet_toolbox::wallet::wallet::Wallet;
+use bsv::wallet::interfaces::WalletInterface;
 
 use crate::config::Config;
 use crate::db::DbPool;
@@ -18,9 +18,11 @@ use crate::ws::WsBroadcast;
 pub struct AppState {
     pub db: DbPool,
     pub config: Arc<Config>,
-    /// Funded wallet connected to the remote storage backend.
-    /// Used to internalize incoming delivery-fee payments via `internalize_action`.
-    pub funded_wallet: Arc<Wallet>,
+    /// Funded wallet connected to the remote storage backend. Used to
+    /// internalize incoming delivery-fee payments via `internalize_action`.
+    /// Trait object so tests can pin the H3 payment-outcome contract
+    /// (accepted=false vs exception) without a remote backend.
+    pub funded_wallet: Arc<dyn WalletInterface>,
     pub ws: WsBroadcast,
 }
 

@@ -276,6 +276,12 @@ pub async fn get_permission(
 // GET /permissions/list
 // ───────────────────────────────────────────────────────────────────────────
 
+/// H17 — pinned to the CLIENT (Parity++ decision): the response rows stay
+/// **snake_case** (`message_box`, `recipient_fee`, `created_at`, `updated_at`),
+/// which is what `@bsv/message-box-client` 2.1.0 actually reads — the TS
+/// *server* returns camelCase here and disagrees with its own client. The box
+/// filter accepts BOTH `message_box` (what client 2.1.0 sends — silently dead
+/// against both TS servers) and `messageBox` (the TS-server spelling).
 pub async fn list_permissions(
     State(state): State<AppState>,
     auth: AuthIdentity,
@@ -283,7 +289,11 @@ pub async fn list_permissions(
 ) -> impl IntoResponse {
     let identity_key = auth.0;
 
-    let message_box = params.get("messageBox").filter(|s| !s.is_empty()).cloned();
+    let message_box = params
+        .get("message_box")
+        .or_else(|| params.get("messageBox"))
+        .filter(|s| !s.is_empty())
+        .cloned();
 
     // ── Parse limit ───────────────────────────────────────────────────
     let limit: i64 = match params.get("limit") {

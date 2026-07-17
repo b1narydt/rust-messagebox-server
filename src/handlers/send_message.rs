@@ -1,8 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bsv::primitives::public_key::PublicKey;
-use bsv::wallet::interfaces::{
-    InternalizeActionArgs, InternalizeOutput, Payment as SdkPayment, WalletInterface,
-};
+use bsv::wallet::interfaces::{InternalizeActionArgs, InternalizeOutput, Payment as SdkPayment};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -80,7 +78,9 @@ pub async fn send_message(
             )
             .into_response();
         }
-        Some(Value::String(s)) if s.is_empty() => {
+        // H10 (TS parity): a whitespace-only string body is rejected exactly
+        // like an empty one (TS checks `.trim() === ''`).
+        Some(Value::String(s)) if s.trim().is_empty() => {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "ERR_INVALID_MESSAGE_BODY",
@@ -317,20 +317,12 @@ pub async fn send_message(
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     let per_recipient_outputs = if requires_payment {
+        // Missing payment (or payment without transaction bytes) → the TS
+        // ERR_MISSING_PAYMENT_TX. Empty outputs are handled per-case below so
+        // the delivery-fee case can return the distinct TS code (H4).
         let pay = match &payment {
-            Some(p)
-                if p.tx.as_ref().is_none_or(|t| t.is_empty())
-                    || p.outputs.as_ref().is_none_or(|o| o.is_empty()) =>
-            {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "ERR_MISSING_PAYMENT_TX",
-                    "Payment transaction data is required for payable delivery.",
-                )
-                .into_response();
-            }
-            Some(p) => p,
-            None => {
+            Some(p) if p.tx.as_ref().is_some_and(|t| !t.is_empty()) => p,
+            _ => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "ERR_MISSING_PAYMENT_TX",
@@ -339,6 +331,18 @@ pub async fn send_message(
                 .into_response();
             }
         };
+
+        // H4 (TS parity): a delivery fee is due but the payment carries no
+        // outputs at all → 400 ERR_MISSING_DELIVERY_OUTPUT (previously
+        // collapsed into ERR_MISSING_PAYMENT_TX).
+        if delivery_fee > 0 && pay.outputs.as_ref().is_none_or(|o| o.is_empty()) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "ERR_MISSING_DELIVERY_OUTPUT",
+                "Payment is missing the server delivery-fee output.",
+            )
+            .into_response();
+        }
 
         // Internalize the server's delivery-fee output so the payment is credited
         // to the server's wallet at the remote storage backend.
@@ -349,8 +353,8 @@ pub async fn send_message(
                 None => {
                     return error_response(
                         StatusCode::BAD_REQUEST,
-                        "ERR_MISSING_PAYMENT_TX",
-                        "Payment transaction data is required for payable delivery.",
+                        "ERR_MISSING_DELIVERY_OUTPUT",
+                        "Payment is missing the server delivery-fee output.",
                     )
                     .into_response();
                 }
@@ -434,6 +438,10 @@ pub async fn send_message(
                 seek_permission: Some(false).into(),
             };
 
+            // H3 (TS parity): internalize NOT ACCEPTED → 400
+            // ERR_INSUFFICIENT_PAYMENT; internalize EXCEPTION → 500
+            // ERR_INTERNALIZE_FAILED. (Previously both collapsed into a
+            // Rust-only 500 ERR_INTERNALIZATION_FAILED.)
             match state
                 .funded_wallet
                 .internalize_action(internalize_args, None)
@@ -443,9 +451,9 @@ pub async fn send_message(
                     if !result.accepted {
                         error!("internalize_action rejected delivery fee payment");
                         return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "ERR_INTERNALIZATION_FAILED",
-                            "The server could not internalize the delivery fee payment.",
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INSUFFICIENT_PAYMENT",
+                            "The delivery fee payment was not accepted.",
                         )
                         .into_response();
                     }
@@ -454,7 +462,7 @@ pub async fn send_message(
                     error!("internalize_action failed: {e}");
                     return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "ERR_INTERNALIZATION_FAILED",
+                        "ERR_INTERNALIZE_FAILED",
                         "The server failed to process the delivery fee payment.",
                     )
                     .into_response();
