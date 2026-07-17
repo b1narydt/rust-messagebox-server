@@ -44,6 +44,13 @@ bsv-wallet-toolbox = "0.3"
 
 getrandom = "0.4"
 http-body-util = "0.1"
+
+# Firebase/FCM rebuild (parity §4.3): reqwest for the FCM v1 + OAuth2 HTTP
+# calls, rsa+sha2+base64 for the RS256 service-account JWT.
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+rsa = { version = "0.9", features = ["sha2"] }
+sha2 = "0.10"
 redis = { version = "1.4.1", default-features = false, features = ["tokio-comp"] }
 futures-util = "0.3.32"
 

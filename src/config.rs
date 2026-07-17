@@ -43,6 +43,18 @@ pub struct Config {
     pub message_box_fees: Vec<(String, i64)>,
     /// Parse warnings from `MESSAGEBOX_FEES` — emitted after the logger is up.
     pub message_box_fees_warnings: Vec<String>,
+    /// `ENABLE_FIREBASE=true` — explicit opt-in for FCM push notifications
+    /// (TS parity §4.3: TS gates on this flag BEFORE looking at the project
+    /// id; the earlier Rust auto-enabled on project-id presence, which was a
+    /// fail-open drift).
+    pub enable_firebase: bool,
+    /// `FIREBASE_PROJECT_ID` — required when Firebase is enabled.
+    pub firebase_project_id: Option<String>,
+    /// `FIREBASE_SERVICE_ACCOUNT_JSON` — the service-account key material.
+    /// SECRET: never logged, never in `Debug` output (E2 must not return).
+    pub firebase_service_account_json: Option<String>,
+    /// `FIREBASE_SERVICE_ACCOUNT_PATH` — file alternative to the inline JSON.
+    pub firebase_service_account_path: Option<String>,
 }
 
 impl Config {
@@ -129,6 +141,21 @@ impl Config {
         let (message_box_fees, message_box_fees_warnings) =
             parse_message_box_fees(&env::var("MESSAGEBOX_FEES").unwrap_or_default());
 
+        // Firebase (§4.3): explicit ENABLE_FIREBASE=true, then project id +
+        // one of the credential sources. Resolution happens in main().
+        let enable_firebase = env::var("ENABLE_FIREBASE")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+        let firebase_project_id = env::var("FIREBASE_PROJECT_ID")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let firebase_service_account_json = env::var("FIREBASE_SERVICE_ACCOUNT_JSON")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let firebase_service_account_path = env::var("FIREBASE_SERVICE_ACCOUNT_PATH")
+            .ok()
+            .filter(|s| !s.is_empty());
+
         Ok(Config {
             node_env,
             port,
@@ -143,6 +170,10 @@ impl Config {
             drain_timeout_secs,
             message_box_fees,
             message_box_fees_warnings,
+            enable_firebase,
+            firebase_project_id,
+            firebase_service_account_json,
+            firebase_service_account_path,
         })
     }
 
@@ -249,6 +280,60 @@ impl fmt::Debug for Config {
             .field("drain_timeout_secs", &self.drain_timeout_secs)
             .field("message_box_fees", &self.message_box_fees)
             // message_box_fees_warnings are transient — omitted from Debug output.
+            .field("enable_firebase", &self.enable_firebase)
+            .field("firebase_project_id", &self.firebase_project_id)
+            // E2 guard: the service-account JSON is key material and must
+            // NEVER appear in Debug output or logs — only its presence.
+            .field(
+                "firebase_service_account_json",
+                &self
+                    .firebase_service_account_json
+                    .as_ref()
+                    .map(|_| "***redacted***"),
+            )
+            .field(
+                "firebase_service_account_path",
+                &self.firebase_service_account_path,
+            )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// E2 must not return: the Firebase service-account key material never
+    /// appears in the config's Debug output (which is what boot logging and
+    /// error reports print).
+    #[test]
+    fn debug_never_leaks_firebase_service_account_json() {
+        let secret = r#"{"private_key":"-----BEGIN PRIVATE KEY-----SECRETMATERIAL"}"#;
+        let config = Config {
+            node_env: "production".into(),
+            port: 3000,
+            server_private_key: "b".repeat(64),
+            routing_prefix: String::new(),
+            db_source: "mysql://user:dbpass@host/db".into(),
+            db_max_connections: 10,
+            bsv_network: "mainnet".into(),
+            wallet_storage_url: "https://storage.example".into(),
+            redis_url: None,
+            max_connections: 0,
+            drain_timeout_secs: 30,
+            message_box_fees: Vec::new(),
+            message_box_fees_warnings: Vec::new(),
+            enable_firebase: true,
+            firebase_project_id: Some("proj-1".into()),
+            firebase_service_account_json: Some(secret.into()),
+            firebase_service_account_path: None,
+        };
+        let out = format!("{config:?}");
+        assert!(!out.contains("SECRETMATERIAL"), "E2: key material leaked");
+        assert!(!out.contains("PRIVATE KEY"), "E2: key material leaked");
+        assert!(out.contains("***redacted***"));
+        // The pre-existing redactions still hold.
+        assert!(!out.contains(&"b".repeat(64)), "server key leaked");
+        assert!(!out.contains("dbpass"), "db password leaked");
     }
 }

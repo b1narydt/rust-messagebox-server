@@ -62,6 +62,21 @@ async fn main() {
         .await
         .expect("Failed to prime delivery-fee cache");
 
+    // Firebase (§4.3): EXPLICIT opt-in — ENABLE_FIREBASE=true, then
+    // FIREBASE_PROJECT_ID + one credential source. Init failure is non-fatal
+    // (the server runs without push). The service-account key material is
+    // never logged (E2).
+    if config.enable_firebase {
+        messagebox_server::firebase::initialize(
+            config.firebase_project_id.as_deref(),
+            config.firebase_service_account_json.as_deref(),
+            config.firebase_service_account_path.as_deref(),
+        )
+        .await;
+    } else {
+        tracing::info!("Firebase disabled (ENABLE_FIREBASE not 'true') — no push notifications");
+    }
+
     // Create bsv-sdk wallet from server private key
     let sdk_private_key = match PrivateKey::from_hex(&config.server_private_key) {
         Ok(k) => k,

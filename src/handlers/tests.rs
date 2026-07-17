@@ -37,6 +37,10 @@ fn test_config() -> Config {
         drain_timeout_secs: 30,
         message_box_fees: Vec::new(),
         message_box_fees_warnings: Vec::new(),
+        enable_firebase: false,
+        firebase_project_id: None,
+        firebase_service_account_json: None,
+        firebase_service_account_path: None,
     }
 }
 
