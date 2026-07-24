@@ -276,83 +276,102 @@ async fn main() {
     // only — no identities, no message data, no key material);
     // `/health/live` + `/health/ready` are the structured probes (readiness
     // fails on DB loss, Redis loss in Model B, and while draining).
+    // Public pre-auth surface. `/` + `/health/live` are harmless liveness
+    // probes; `/docs` + `/openapi.json` are pre-auth in the TS and Go references
+    // too (their swagger mounts sit before the auth middleware), so they stay
+    // public here. The operational surface that leaks live counts — `/metrics`
+    // and `/health/ready` — is NOT here; it moves to a private ops listener
+    // below (no reference exposes those on the public port).
+    let openapi_prefix = prefix.clone();
+    let public_routes = Router::new()
+        .route(
+            "/",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                    "BSV MessageBox Server",
+                )
+            }),
+        )
+        .route("/docs", get(messagebox_server::docs::docs_page))
+        .route(
+            "/openapi.json",
+            get(move || {
+                let prefix = openapi_prefix.clone();
+                async move { messagebox_server::docs::openapi_json(&prefix) }
+            }),
+        )
+        .route(
+            "/health/live",
+            get(|| async { axum::Json(serde_json::json!({"status": "alive"})) }),
+        );
+
+    // Private ops surface (Prometheus scrape + readiness). Bound to OPS_BIND
+    // (default 127.0.0.1:9091) on its own listener so an internet-facing
+    // deployment never exposes connection/identity/queue/admission counts or the
+    // dependency-health readiness probe. Scrapers and orchestrators reach it over
+    // the private/internal network. Use OPS_BIND=0.0.0.0:<port> to deliberately
+    // publish it. `/health/live` stays public for platform health checks.
     let metrics_ws = ws_broadcast.clone();
     let metrics_backplane = backplane.clone();
     let metrics_ops = ops.clone();
     let ready_pool = pool.clone();
     let ready_backplane = backplane.clone();
     let ready_ops = ops.clone();
-    let health_routes =
-        Router::new()
-            .route(
-                "/",
-                get(|| async {
+    let ops_routes = Router::new()
+        .route(
+            "/health/ready",
+            get(move || {
+                let pool = ready_pool.clone();
+                let backplane = ready_backplane.clone();
+                let ops = ready_ops.clone();
+                async move {
+                    messagebox_server::ops::readiness(&pool, backplane.as_deref(), &ops).await
+                }
+            }),
+        )
+        .route(
+            "/metrics",
+            get(move || {
+                let ws = metrics_ws.clone();
+                let backplane = metrics_backplane.clone();
+                let ops = metrics_ops.clone();
+                async move {
+                    let (connections, identities) = ws.live_counts();
+                    let (depth, capacity) = ws.persist_queue();
+                    let persist = ws.persist_stats();
+                    let page = messagebox_server::metrics::render(
+                        &messagebox_server::metrics::Snapshot {
+                            connections,
+                            authenticated_identities: identities,
+                            persist_queue_depth: depth,
+                            persist_queue_capacity: capacity,
+                            persist: &persist,
+                            backplane: backplane.as_ref().map(|bp| {
+                                messagebox_server::metrics::BackplaneSnapshot {
+                                    published: bp.published(),
+                                    dropped: bp.dropped(),
+                                    subscribed: bp.is_subscribed(),
+                                }
+                            }),
+                            ops: Some(messagebox_server::metrics::OpsSnapshot {
+                                draining: ops.is_draining(),
+                                in_flight_sends: ops.in_flight_sends(),
+                                admission_rejected: ops.admission_rejected(),
+                                max_connections: ops.max_connections() as u64,
+                            }),
+                        },
+                    );
                     (
-                        [(axum::http::header::CONTENT_TYPE, "text/plain")],
-                        "BSV MessageBox Server",
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
+                        page,
                     )
-                }),
-            )
-            // API docs (H19): pre-auth, like the TS server's swagger mount.
-            .route("/docs", get(messagebox_server::docs::docs_page))
-            .route("/openapi.json", get(messagebox_server::docs::openapi_json))
-            .route(
-                "/health/live",
-                get(|| async { axum::Json(serde_json::json!({"status": "alive"})) }),
-            )
-            .route(
-                "/health/ready",
-                get(move || {
-                    let pool = ready_pool.clone();
-                    let backplane = ready_backplane.clone();
-                    let ops = ready_ops.clone();
-                    async move {
-                        messagebox_server::ops::readiness(&pool, backplane.as_deref(), &ops).await
-                    }
-                }),
-            )
-            .route(
-                "/metrics",
-                get(move || {
-                    let ws = metrics_ws.clone();
-                    let backplane = metrics_backplane.clone();
-                    let ops = metrics_ops.clone();
-                    async move {
-                        let (connections, identities) = ws.live_counts();
-                        let (depth, capacity) = ws.persist_queue();
-                        let persist = ws.persist_stats();
-                        let page = messagebox_server::metrics::render(
-                            &messagebox_server::metrics::Snapshot {
-                                connections,
-                                authenticated_identities: identities,
-                                persist_queue_depth: depth,
-                                persist_queue_capacity: capacity,
-                                persist: &persist,
-                                backplane: backplane.as_ref().map(|bp| {
-                                    messagebox_server::metrics::BackplaneSnapshot {
-                                        published: bp.published(),
-                                        dropped: bp.dropped(),
-                                        subscribed: bp.is_subscribed(),
-                                    }
-                                }),
-                                ops: Some(messagebox_server::metrics::OpsSnapshot {
-                                    draining: ops.is_draining(),
-                                    in_flight_sends: ops.in_flight_sends(),
-                                    admission_rejected: ops.admission_rejected(),
-                                    max_connections: ops.max_connections() as u64,
-                                }),
-                            },
-                        );
-                        (
-                            [(
-                                axum::http::header::CONTENT_TYPE,
-                                "text/plain; version=0.0.4",
-                            )],
-                            page,
-                        )
-                    }
-                }),
-            );
+                }
+            }),
+        );
 
     // Protected API routes — BRC-103/104 auth via bsv-sdk Peer middleware
     let api_routes = Router::new()
@@ -411,13 +430,38 @@ async fn main() {
     );
 
     let app = if prefix.is_empty() {
-        Router::new().merge(health_routes).merge(api_routes)
+        Router::new().merge(public_routes).merge(api_routes)
     } else {
-        Router::new().merge(health_routes).nest(&prefix, api_routes)
+        Router::new().merge(public_routes).nest(&prefix, api_routes)
     }
     .layer(sio_layer)
     .layer(admission)
     .layer(cors);
+
+    // Private ops listener (Prometheus + readiness). Bind failure is non-fatal:
+    // the main server still serves; only /metrics + /health/ready are then
+    // unavailable. Bound to loopback by default so it is never internet-exposed.
+    let ops_bind = std::env::var("OPS_BIND")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1:9091".to_string());
+    match tokio::net::TcpListener::bind(&ops_bind).await {
+        Ok(ops_listener) => {
+            tracing::info!(
+                "ops endpoints (/metrics, /health/ready) on private {ops_bind} (set OPS_BIND to change; 0.0.0.0:<port> to publish)"
+            );
+            tokio::spawn(async move {
+                if let Err(e) = axum::serve(ops_listener, ops_routes).await {
+                    tracing::error!("ops server error: {e}");
+                }
+            });
+        }
+        Err(e) => {
+            tracing::error!(
+                "failed to bind OPS_BIND={ops_bind}: {e} — /metrics and /health/ready are unavailable"
+            );
+        }
+    }
 
     let addr = format!("0.0.0.0:{port}");
     tracing::info!("MessageBox server listening on {}", addr);

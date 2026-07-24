@@ -2,8 +2,24 @@
   "openapi": "3.0.3",
   "info": {
     "title": "BSV MessageBox Server",
-    "description": "Rust reimplementation of @bsv/messagebox-server (Parity++: TS public API + intended behavior, with the TS bugs fixed). All API routes require BRC-103/104 mutual authentication via x-bsv-auth-* headers; /docs, /openapi.json and the ops endpoints are pre-auth. Error responses share the shape {status:'error', code, description}.",
+    "description": "Rust reimplementation of @bsv/messagebox-server (Parity++: TS public API + intended behavior, with the TS bugs fixed). All API routes require BRC-103/104 mutual authentication via x-bsv-auth-* headers (see the BRC103Auth security scheme). GET / , /docs, /openapi.json and /health/live are pre-auth; the Prometheus /metrics and /health/ready probes are served on a separate private ops listener (OPS_BIND), not on the public port. Error responses share the shape {status:'error', code, description}.",
     "version": "1.0.0"
+  },
+  "servers": [
+    { "url": "/", "description": "Public base (overridden at render time from ROUTING_PREFIX)." }
+  ],
+  "security": [
+    { "BRC103Auth": [] }
+  ],
+  "components": {
+    "securitySchemes": {
+      "BRC103Auth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-bsv-auth-identity-key",
+        "description": "BRC-103/104 mutual authentication. Every API route requires the BRC-103 handshake headers (x-bsv-auth-*); this apiKey entry documents the identity-key header, since OpenAPI 3.0 cannot natively model the full mutual-auth handshake. The pre-auth surface (GET /, /docs, /openapi.json, /health/live) does not require it."
+      }
+    }
   },
   "paths": {
     "/sendMessage": {
