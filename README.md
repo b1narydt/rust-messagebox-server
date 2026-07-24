@@ -53,6 +53,18 @@ The server runs a Socket.IO layer (via `socketioxide`) for real-time message del
 SERVER_PRIVATE_KEY="<64-hex-private-key>" PORT=3322 cargo run --release --bin messagebox-server
 ```
 
+### Database: fresh deploys only
+
+The migration chain was squashed to a single fresh-deploy baseline
+(`20260717000000_baseline_schema.sql`, design decision D2). **Point this server at
+an empty database.**
+
+Against a database that ran the older 4-migration chain, `sqlx` finds
+`_sqlx_migrations` rows whose versions no longer exist in the source and returns
+`VersionMissing`; `main()` treats that as fatal, so the process panics on every
+start (crash loop). There is no in-place upgrade path — drop and recreate the
+schema, or provision a new database.
+
 ## Environment variables
 
 | Variable | Default | Description |
