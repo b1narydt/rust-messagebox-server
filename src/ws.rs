@@ -282,7 +282,7 @@ impl WsBroadcast {
 async fn backplane_delivery_task(
     ws: WsBroadcast,
     bp: Arc<crate::backplane::Backplane>,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    mut rx: tokio::sync::mpsc::Receiver<String>,
 ) {
     while let Some(raw) = rx.recv().await {
         let envelope: crate::backplane::BackplaneEnvelope = match serde_json::from_str(&raw) {

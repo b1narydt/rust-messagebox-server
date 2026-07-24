@@ -251,11 +251,33 @@ async fn main() {
         ws: ws_broadcast.clone(),
     };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_headers(Any)
-        .allow_methods(Any)
-        .expose_headers(Any);
+    // CORS. Auth is BRC-103 request-signature based (no cookies, no
+    // credentials), so a permissive default is not a CSRF vector, but an
+    // internet-facing operator can lock the browser origin down:
+    // CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+    // restricts to an explicit allowlist; unset keeps the permissive default.
+    let cors = match std::env::var("CORS_ALLOWED_ORIGINS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        Some(list) => {
+            let origins: Vec<axum::http::HeaderValue> = list
+                .split(',')
+                .filter_map(|o| o.trim().parse().ok())
+                .collect();
+            tracing::info!(count = origins.len(), "CORS restricted to an explicit origin allowlist");
+            CorsLayer::new()
+                .allow_origin(origins)
+                .allow_headers(Any)
+                .allow_methods(Any)
+                .expose_headers(Any)
+        }
+        None => CorsLayer::new()
+            .allow_origin(Any)
+            .allow_headers(Any)
+            .allow_methods(Any)
+            .expose_headers(Any),
+    };
 
     // Request timeout + body size limits — applied only to API routes,
     // NOT to the health endpoint (uptime checks stay fast, GET / avoids

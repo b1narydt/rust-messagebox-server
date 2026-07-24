@@ -523,7 +523,20 @@ pub async fn send_message(
             }
         }
 
-        let body_bytes = serde_json::to_string(&stored_body).unwrap_or_default();
+        // Never persist/broadcast a silently-empty body: a serialization error
+        // must surface as a 500, not store "" as a successful send.
+        let body_bytes = match serde_json::to_string(&stored_body) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("failed to serialize stored message body: {e}");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ERR_INTERNAL_ERROR",
+                    "The server could not encode the message body.",
+                )
+                .into_response();
+            }
+        };
 
         // Push-live-first: broadcast to the connected recipient before the DB write.
         let room = crate::ws::room_id(&fr.recipient, &box_type);

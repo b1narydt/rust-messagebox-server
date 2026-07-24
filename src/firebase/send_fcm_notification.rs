@@ -10,6 +10,9 @@ use crate::db::DbPool;
 use serde_json::json;
 use std::time::Duration;
 
+/// Max concurrent in-flight FCM HTTP requests per notification fan-out.
+const MAX_CONCURRENT_FCM_SENDS: usize = 16;
+
 /// Payload describing the push notification to send via FCM.
 #[derive(Clone, Debug)]
 pub struct FcmPayload {
@@ -73,7 +76,10 @@ pub async fn send_fcm_notification(
 
     let url = format!("https://fcm.googleapis.com/v1/projects/{project_id}/messages:send");
 
-    // Spawn one task per device, collect join handles.
+    // Spawn one task per device, but cap concurrent in-flight FCM requests: a
+    // recipient with hundreds of devices (times a burst of notifications sends)
+    // must not open an unbounded number of sockets to FCM at once.
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FCM_SENDS));
     let mut handles = Vec::with_capacity(devices.len());
 
     for device in devices {
@@ -83,8 +89,11 @@ pub async fn send_fcm_notification(
         let http = http.clone();
         let access_token = access_token.clone();
         let token_tail = truncate_token(&device.fcm_token);
+        let sem = sem.clone();
 
         let handle = tokio::spawn(async move {
+            // Held for the request's lifetime; bounds concurrency to the cap.
+            let _permit = sem.acquire_owned().await.expect("FCM semaphore");
             let body = build_fcm_body(&device.fcm_token, &payload);
 
             let result = tokio::time::timeout(

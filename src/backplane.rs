@@ -55,6 +55,13 @@ pub const CHANNEL: &str = "mbs:backplane:v1";
 /// live push is best-effort; the mailbox stays durable.
 const PUBLISH_QUEUE_CAPACITY: usize = 1024;
 
+/// Bounded queue between the Redis subscription and the local signed-delivery
+/// task. The delivery task does per-message BRC-103 fan-out signing, so under a
+/// burst it is slower than the subscription can enqueue; a bound turns that
+/// backpressure into bounded, counted drops (the recipient still gets the
+/// message from the mailbox) instead of unbounded memory growth (Model B OOM).
+const DELIVERY_QUEUE_CAPACITY: usize = 2048;
+
 /// Don't re-attempt a failed Redis connect more than once per interval while
 /// messages are flowing (avoids a connect storm when Redis is down).
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -100,7 +107,7 @@ pub struct Backplane {
     publish_tx: mpsc::Sender<String>,
     /// Raw envelope JSON received from the channel (all origins, unfiltered).
     /// Taken exactly once by `WsBroadcast` to drive local signed delivery.
-    delivery_rx: parking_lot::Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    delivery_rx: parking_lot::Mutex<Option<mpsc::Receiver<String>>>,
     published: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     subscribed: Arc<AtomicBool>,
@@ -113,7 +120,7 @@ impl Backplane {
     /// [`Self::dropped`] and warn logs.
     pub fn new(redis_url: &str) -> Arc<Self> {
         let (publish_tx, publish_rx) = mpsc::channel(PUBLISH_QUEUE_CAPACITY);
-        let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+        let (delivery_tx, delivery_rx) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
 
         let published = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
@@ -185,7 +192,7 @@ impl Backplane {
 
     /// Take the raw subscription stream (exactly once). `WsBroadcast` drains
     /// it and delivers remote-origin envelopes to local room members.
-    pub fn take_delivery_rx(&self) -> Option<mpsc::UnboundedReceiver<String>> {
+    pub fn take_delivery_rx(&self) -> Option<mpsc::Receiver<String>> {
         self.delivery_rx.lock().take()
     }
 
@@ -305,7 +312,7 @@ async fn publisher_task(
 /// delivery receiver is gone (owner dropped).
 async fn subscriber_task(
     redis_url: String,
-    delivery_tx: mpsc::UnboundedSender<String>,
+    delivery_tx: mpsc::Sender<String>,
     subscribed: Arc<AtomicBool>,
 ) {
     use futures_util::StreamExt;
@@ -329,12 +336,19 @@ async fn subscriber_task(
                     let mut stream = pubsub.into_on_message();
                     while let Some(msg) = stream.next().await {
                         match msg.get_payload::<String>() {
-                            Ok(payload) => {
-                                if delivery_tx.send(payload).is_err() {
+                            Ok(payload) => match delivery_tx.try_send(payload) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                    // Delivery task is behind (signing fan-out
+                                    // backpressure): drop this live push — the
+                                    // mailbox still delivers it. Bounded, never OOM.
+                                    warn!("backplane: local delivery queue full — dropping cross-instance push (mailbox fallback covers delivery)");
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
                                     subscribed.store(false, Ordering::Relaxed);
                                     return; // consumer gone — shut down
                                 }
-                            }
+                            },
                             Err(e) => {
                                 warn!(error = %e, "backplane: non-UTF8 payload on channel — skipped")
                             }
