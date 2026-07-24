@@ -21,7 +21,7 @@ use bsv_wallet_toolbox::types::Chain;
 use bsv_wallet_toolbox::wallet::types::WalletArgs;
 use bsv_wallet_toolbox::wallet::wallet::Wallet;
 
-use messagebox_server::{cloneable_wallet, config, db, firebase, handlers, logger, ws};
+use messagebox_server::{cloneable_wallet, config, db, handlers, logger, ws};
 
 #[tokio::main]
 async fn main() {
@@ -62,12 +62,20 @@ async fn main() {
         .await
         .expect("Failed to prime delivery-fee cache");
 
-    firebase::initialize(
-        config.firebase_project_id.as_deref(),
-        config.firebase_service_account_json.as_deref(),
-        config.firebase_service_account_path.as_deref(),
-    )
-    .await;
+    // Firebase (§4.3): EXPLICIT opt-in — ENABLE_FIREBASE=true, then
+    // FIREBASE_PROJECT_ID + one credential source. Init failure is non-fatal
+    // (the server runs without push). The service-account key material is
+    // never logged (E2).
+    if config.enable_firebase {
+        messagebox_server::firebase::initialize(
+            config.firebase_project_id.as_deref(),
+            config.firebase_service_account_json.as_deref(),
+            config.firebase_service_account_path.as_deref(),
+        )
+        .await;
+    } else {
+        tracing::info!("Firebase disabled (ENABLE_FIREBASE not 'true') — no push notifications");
+    }
 
     // Create bsv-sdk wallet from server private key
     let sdk_private_key = match PrivateKey::from_hex(&config.server_private_key) {
@@ -109,13 +117,14 @@ async fn main() {
         settings_manager: None,
         lookup_resolver: None,
     };
-    let funded_wallet = match Wallet::new(wallet_args) {
-        Ok(w) => Arc::new(w),
-        Err(e) => {
-            tracing::error!("Failed to construct funded wallet: {e}");
-            std::process::exit(1);
-        }
-    };
+    let funded_wallet: Arc<dyn bsv::wallet::interfaces::WalletInterface> =
+        match Wallet::new(wallet_args) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                tracing::error!("Failed to construct funded wallet: {e}");
+                std::process::exit(1);
+            }
+        };
     tracing::info!("Wallet storage backend: {}", config.wallet_storage_url);
 
     // Log server identity key via bsv-sdk
@@ -148,11 +157,44 @@ async fn main() {
 
     let port = config.port;
     let prefix = config.routing_prefix.clone();
+    let drain_timeout = std::time::Duration::from_secs(config.drain_timeout_secs);
+
+    // Admission/drain state (Phase 3, D3): per-instance connection ceiling +
+    // the draining flag + in-flight send tracking. Shared by the admission
+    // middleware, both send paths, health, /metrics, and shutdown.
+    let ops = messagebox_server::ops::OpsState::new(config.max_connections);
+    if config.max_connections > 0 {
+        tracing::info!(
+            max_connections = config.max_connections,
+            "admission control: per-instance connection ceiling enabled"
+        );
+    }
+
+    // Topology (transport-architecture WS2-3): no REDIS_URL → Model A
+    // (single instance, in-process routing). REDIS_URL set → Model B
+    // (Redis pub/sub backplane; N replicas behind a sticky LB). Same binary,
+    // config decides. Redis is live-push only — durability stays in MySQL.
+    let backplane = config
+        .redis_url
+        .as_deref()
+        .map(messagebox_server::backplane::Backplane::new);
+    match &backplane {
+        Some(bp) => tracing::info!(
+            instance = %bp.instance_id(),
+            "topology: Model B — Redis backplane enabled (cross-instance live push)"
+        ),
+        None => tracing::info!("topology: Model A — single instance, in-process routing"),
+    }
 
     // Set up Socket.IO for WebSocket live message push
     let (sio_layer, io) = socketioxide::SocketIo::new_layer();
-    let ws_broadcast =
-        ws::WsBroadcast::new(io.clone(), config.server_private_key.clone(), pool.clone());
+    let ws_broadcast = ws::WsBroadcast::new(
+        io.clone(),
+        config.server_private_key.clone(),
+        pool.clone(),
+        backplane.clone(),
+        ops.clone(),
+    );
     ws::setup_handlers(&io, ws_broadcast.clone());
     tracing::info!("Socket.IO WebSocket server ready");
 
@@ -174,17 +216,15 @@ async fn main() {
         .build()
         .expect("auth middleware config");
 
-    let auth_layer =
-        bsv_auth_axum_middleware::AuthLayer::from_config(auth_config, peer, transport)
-            .await
-            .expect("auth middleware layer");
+    let auth_layer = bsv_auth_axum_middleware::AuthLayer::from_config(auth_config, peer, transport)
+        .await
+        .expect("auth middleware layer");
 
     let app_state = handlers::helpers::AppState {
-        db: pool,
+        db: pool.clone(),
         config: Arc::new(config),
-        wallet: sdk_wallet,
         funded_wallet,
-        ws: ws_broadcast,
+        ws: ws_broadcast.clone(),
     };
 
     let cors = CorsLayer::new()
@@ -205,17 +245,90 @@ async fn main() {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(10 * 1024 * 1024);
 
-    // Unauthenticated health endpoint — always at `/`, never under the
-    // routing prefix, never behind BRC-103/104 auth. Returns plain text.
-    let health_routes = Router::new().route(
-        "/",
-        get(|| async {
-            (
-                [(axum::http::header::CONTENT_TYPE, "text/plain")],
-                "BSV MessageBox Server",
+    // Unauthenticated ops endpoints — always at the root, never under the
+    // routing prefix, never behind BRC-103/104 auth. `GET /` returns plain
+    // text (the pre-existing extension over TS, which has no health route);
+    // `GET /metrics` is the Prometheus scrape target (operational counts
+    // only — no identities, no message data, no key material);
+    // `/health/live` + `/health/ready` are the structured probes (readiness
+    // fails on DB loss, Redis loss in Model B, and while draining).
+    let metrics_ws = ws_broadcast.clone();
+    let metrics_backplane = backplane.clone();
+    let metrics_ops = ops.clone();
+    let ready_pool = pool.clone();
+    let ready_backplane = backplane.clone();
+    let ready_ops = ops.clone();
+    let health_routes =
+        Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    (
+                        [(axum::http::header::CONTENT_TYPE, "text/plain")],
+                        "BSV MessageBox Server",
+                    )
+                }),
             )
-        }),
-    );
+            // API docs (H19): pre-auth, like the TS server's swagger mount.
+            .route("/docs", get(messagebox_server::docs::docs_page))
+            .route("/openapi.json", get(messagebox_server::docs::openapi_json))
+            .route(
+                "/health/live",
+                get(|| async { axum::Json(serde_json::json!({"status": "alive"})) }),
+            )
+            .route(
+                "/health/ready",
+                get(move || {
+                    let pool = ready_pool.clone();
+                    let backplane = ready_backplane.clone();
+                    let ops = ready_ops.clone();
+                    async move {
+                        messagebox_server::ops::readiness(&pool, backplane.as_deref(), &ops).await
+                    }
+                }),
+            )
+            .route(
+                "/metrics",
+                get(move || {
+                    let ws = metrics_ws.clone();
+                    let backplane = metrics_backplane.clone();
+                    let ops = metrics_ops.clone();
+                    async move {
+                        let (connections, identities) = ws.live_counts();
+                        let (depth, capacity) = ws.persist_queue();
+                        let persist = ws.persist_stats();
+                        let page = messagebox_server::metrics::render(
+                            &messagebox_server::metrics::Snapshot {
+                                connections,
+                                authenticated_identities: identities,
+                                persist_queue_depth: depth,
+                                persist_queue_capacity: capacity,
+                                persist: &persist,
+                                backplane: backplane.as_ref().map(|bp| {
+                                    messagebox_server::metrics::BackplaneSnapshot {
+                                        published: bp.published(),
+                                        dropped: bp.dropped(),
+                                        subscribed: bp.is_subscribed(),
+                                    }
+                                }),
+                                ops: Some(messagebox_server::metrics::OpsSnapshot {
+                                    draining: ops.is_draining(),
+                                    in_flight_sends: ops.in_flight_sends(),
+                                    admission_rejected: ops.admission_rejected(),
+                                    max_connections: ops.max_connections() as u64,
+                                }),
+                            },
+                        );
+                        (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4",
+                            )],
+                            page,
+                        )
+                    }
+                }),
+            );
 
     // Protected API routes — BRC-103/104 auth via bsv-sdk Peer middleware
     let api_routes = Router::new()
@@ -251,12 +364,35 @@ async fn main() {
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(app_state);
 
+    // Admission control (D3): gates ONLY new WS handshakes (engine.io
+    // requests without a `sid`). In-flight sessions, all API routes, and the
+    // ops endpoints pass untouched. Sits inside CORS so preflights are still
+    // answered, outside socketioxide so a rejected handshake never reaches it.
+    let admission_ops = ops.clone();
+    let admission_io = io.clone();
+    let admission = axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let ops = admission_ops.clone();
+            let io = admission_io.clone();
+            async move {
+                messagebox_server::ops::gate_admission(
+                    &ops,
+                    move || io.sockets().map(|s| s.len()).unwrap_or(0),
+                    req,
+                    next,
+                )
+                .await
+            }
+        },
+    );
+
     let app = if prefix.is_empty() {
         Router::new().merge(health_routes).merge(api_routes)
     } else {
         Router::new().merge(health_routes).nest(&prefix, api_routes)
     }
     .layer(sio_layer)
+    .layer(admission)
     .layer(cors);
 
     let addr = format!("0.0.0.0:{port}");
@@ -266,8 +402,19 @@ async fn main() {
         .await
         .expect("Failed to bind TCP listener");
 
+    // Graceful drain (Phase-3 HA): on SIGTERM/ctrl-c, run the drain sequence
+    // (stop admission → quiesce in-flight sends → disconnect sockets → flush
+    // the persist queue, each phase bounded by DRAIN_TIMEOUT_SECS) and only
+    // then let axum stop accepting — zero message loss across a rolling
+    // deploy.
+    let drain_ops = ops.clone();
+    let drain_ws = ws_broadcast.clone();
+    let drain_io = io.clone();
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            messagebox_server::ops::drain(&drain_ops, &drain_ws, &drain_io, drain_timeout).await;
+        })
         .await
         .expect("Server error");
 

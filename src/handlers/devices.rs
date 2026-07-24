@@ -1,3 +1,13 @@
+//! `POST /registerDevice` + `GET /devices` — the device-registration half of
+//! the notification system (parity audit §4.1/§4.2, rows H13/H14).
+//!
+//! Contract-faithful to the TS `@bsv/messagebox-server` with two deliberate
+//! fixes kept from the previous Rust implementation:
+//! - the upsert returns the EXISTING row id on re-registration (TS's knex
+//!   `.onConflict().merge()` insert-id on update is driver-defined);
+//! - absent `deviceId`/`platform`/`lastUsed` serialize as `null` exactly like
+//!   TS (H14 — the earlier Rust omitted the keys / sent `""`).
+
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde_json::Value;
 use tracing::error;
@@ -14,7 +24,7 @@ pub async fn register_device(
 ) -> impl IntoResponse {
     let identity_key = auth.0;
 
-    // ── Parse fcmToken ────────────────────────────────────────────────
+    // ── fcmToken: required, trimmed, non-empty ────────────────────────
     let fcm_token = match body.get("fcmToken").and_then(|v| v.as_str()) {
         Some(s) if !s.trim().is_empty() => s.trim().to_string(),
         _ => {
@@ -27,13 +37,13 @@ pub async fn register_device(
         }
     };
 
-    // ── Parse optional deviceId ───────────────────────────────────────
+    // ── optional deviceId ─────────────────────────────────────────────
     let device_id = body
         .get("deviceId")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // ── Parse and validate optional platform ──────────────────────────
+    // ── optional platform ∈ ios | android | web ───────────────────────
     let platform = body
         .get("platform")
         .and_then(|v| v.as_str())
@@ -50,7 +60,7 @@ pub async fn register_device(
         }
     }
 
-    // ── Register device ───────────────────────────────────────────────
+    // ── Upsert on UNIQUE fcm_token ────────────────────────────────────
     let id = match queries::register_device(
         &state.db,
         &identity_key,
@@ -102,24 +112,15 @@ pub async fn list_devices(State(state): State<AppState>, auth: AuthIdentity) -> 
 
     let out: Vec<DeviceOut> = devices
         .into_iter()
-        .map(|d| {
-            // Mask the FCM token: show only last 10 chars.
-            let masked_token = if d.fcm_token.len() > 10 {
-                format!("...{}", &d.fcm_token[d.fcm_token.len() - 10..])
-            } else {
-                d.fcm_token
-            };
-
-            DeviceOut {
-                id: d.id,
-                device_id: d.device_id,
-                platform: d.platform,
-                fcm_token: masked_token,
-                active: d.active,
-                created_at: d.created_at,
-                updated_at: d.updated_at,
-                last_used: d.last_used.unwrap_or_default(),
-            }
+        .map(|d| DeviceOut {
+            id: d.id,
+            device_id: d.device_id,
+            platform: d.platform,
+            fcm_token: mask_fcm_token(&d.fcm_token),
+            active: d.active,
+            created_at: d.created_at,
+            updated_at: d.updated_at,
+            last_used: d.last_used,
         })
         .collect();
 
@@ -131,4 +132,25 @@ pub async fn list_devices(State(state): State<AppState>, auth: AuthIdentity) -> 
         }),
     )
         .into_response()
+}
+
+/// `fcmToken` MUST be masked in listings: `'...' + last 10 chars` (§4.2).
+fn mask_fcm_token(token: &str) -> String {
+    if token.len() > 10 {
+        format!("...{}", &token[token.len() - 10..])
+    } else {
+        token.to_string()
+    }
+}
+
+#[cfg(test)]
+mod unit {
+    use super::mask_fcm_token;
+
+    #[test]
+    fn masks_to_last_10() {
+        assert_eq!(mask_fcm_token("abcdefghijKLMNOPQRST"), "...KLMNOPQRST");
+        assert_eq!(mask_fcm_token("short"), "short");
+        assert_eq!(mask_fcm_token("exactly10c"), "exactly10c");
+    }
 }

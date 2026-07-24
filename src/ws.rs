@@ -1,17 +1,20 @@
 //! WebSocket (Socket.IO) support for the MessageBox server, over the shared
 //! [`authsocket`] crate.
 //!
-//! The BRC-103 protocol plumbing that used to live here — per-socket Peer
-//! sessions (`ChannelTransport`/`SocketPeer`), the verified-sender identity
-//! registry, room membership, the signed emit/broadcast primitives, and the
-//! generic room verbs (`authenticated`/`joinRoom`/`leaveRoom`, including the
-//! "a client may only join its own room" check) — moved into the `authsocket`
-//! crate (`AuthSocketServer` core + `server_io` socketioxide adapter). This
-//! module keeps only the MessageBox **application** logic:
+//! The BRC-103 protocol core — per-socket Peer sessions, the verified-sender
+//! identity registry, room membership, and the signed emit/broadcast
+//! primitives — lives in the `authsocket` crate (`AuthSocketServer` +
+//! `server_io` helpers). This module keeps:
 //!
-//! - [`RoomMessage`] — the room-delivery payload shape.
+//! - the **socket wiring** ([`setup_handlers`]) — a fork of the crate's
+//!   `attach` that adds the TS-parity failure events
+//!   (`authenticationFailed`/`joinFailed`/`leaveFailed`; parity audit
+//!   W1/W2/W3) the 0.1.0 adapter swallows, while preserving its security
+//!   invariants verbatim (see the function doc);
+//! - [`RoomMessage`] — the room-delivery payload shape;
 //! - the `sendMessage` app verb ([`handle_ws_send_message`]): push-live-first
-//!   signed broadcast, async persistence, signed room-scoped ack.
+//!   signed broadcast, async persistence, signed room-scoped ack, and
+//!   `messageFailed` on invalid payloads (W5);
 //! - [`WsBroadcast`] — the app-facing handle the HTTP handlers use
 //!   (`broadcast_to_room` + `persist_async`).
 //!
@@ -29,17 +32,29 @@
 //! `Arc`-clone-out locks — the crate carries forward the design this server
 //! adopted after a documented 100%→15% delivery collapse under a single
 //! global session lock.
+//!
+//! ## Topology: Model A / Model B (one code path)
+//!
+//! [`WsBroadcast::broadcast_to_room`] always runs the same signed
+//! local-delivery leg ([`WsBroadcast::deliver_local`]). With a
+//! [`crate::backplane::Backplane`] attached (Model B, `REDIS_URL` set) it
+//! *additionally* enqueues the UNSIGNED [`RoomMessage`] to Redis so the
+//! instances owning the recipient's sockets can sign and deliver to their
+//! local members — carry-unsigned/sign-on-owner. Model A simply skips that
+//! publish; the delivery path itself never diverges. Redis is live-push
+//! only: durability is always the MySQL mailbox + HTTP `/listMessages`.
 
 use std::sync::Arc;
 
 use serde::Serialize;
-use socketioxide::extract::SocketRef;
+use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use authsocket::server::{AuthSocketServer, SharedAuthSocketServer};
-use authsocket::server_io::{attach, emit_signed_to_room, emit_signed_to_socket, AppDispatcher};
-use authsocket::VerifiedEvent;
+use authsocket::server_io::{emit_signed_to_room, emit_signed_to_socket};
+use authsocket::{VerifiedEvent, AUTH_MESSAGE_EVENT};
+use bsv::auth::types::AuthMessage;
 use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
 
 use crate::db::DbPool;
@@ -53,7 +68,10 @@ pub use authsocket::room_id;
 /// Includes `created_at` and `updated_at` fields required by the client's
 /// `ServerPeerMessage` parser. Without these, the client's handler fails to
 /// deserialize the broadcast and the callback never fires.
-#[derive(Serialize, Clone, Debug)]
+///
+/// `Deserialize` exists for the Model B backplane, which carries this exact
+/// (unsigned) shape between instances — see [`crate::backplane`].
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
 pub struct RoomMessage {
     #[serde(rename = "messageId")]
     pub message_id: String,
@@ -81,20 +99,52 @@ pub struct WsBroadcast {
     /// and then hand the INSERT to this worker so MySQL latency never blocks
     /// live delivery. See [`crate::persist`].
     persist: crate::persist::PersistHandle,
+    /// Model B backplane (`REDIS_URL` set) — `None` means Model A: single
+    /// instance, in-process routing only. See [`crate::backplane`].
+    backplane: Option<Arc<crate::backplane::Backplane>>,
+    /// Admission/drain state (Phase 3, D3). Both send paths hold a
+    /// [`crate::ops::SendGuard`] for their duration so graceful drain can
+    /// wait for real in-flight work, never nacking it.
+    ops: Arc<crate::ops::OpsState>,
 }
 
 impl WsBroadcast {
-    pub fn new(io: SocketIo, server_private_key_hex: String, db: DbPool) -> Self {
+    /// `backplane: None` → Model A (the default). `Some` → Model B: local
+    /// broadcasts are additionally published (unsigned) to Redis, and a
+    /// background task delivers remote-origin envelopes to local room
+    /// members through the same signed path.
+    pub fn new(
+        io: SocketIo,
+        server_private_key_hex: String,
+        db: DbPool,
+        backplane: Option<Arc<crate::backplane::Backplane>>,
+        ops: Arc<crate::ops::OpsState>,
+    ) -> Self {
         let persist = crate::persist::PersistHandle::spawn(
             db.clone(),
             crate::persist::PersistConfig::default(),
         );
-        Self {
+        let ws = Self {
             io,
             core: Arc::new(AuthSocketServer::new()),
             server_private_key_hex,
             persist,
+            backplane,
+            ops,
+        };
+        if let Some(bp) = &ws.backplane {
+            match bp.take_delivery_rx() {
+                Some(rx) => {
+                    tokio::spawn(backplane_delivery_task(ws.clone(), bp.clone(), rx));
+                }
+                None => {
+                    // A Backplane is single-consumer; a second WsBroadcast on
+                    // the same handle would split the subscription stream.
+                    warn!("backplane delivery stream already taken — this WsBroadcast will not receive cross-instance pushes");
+                }
+            }
         }
+        ws
     }
 
     /// Enqueue a message for asynchronous, durable persistence (off the hot
@@ -122,71 +172,403 @@ impl WsBroadcast {
     /// initiate a handshake). The message is already persisted, so failures
     /// never propagate to the caller.
     ///
-    /// Returns the number of room members the signed frame was successfully
-    /// emitted to; a non-empty room delivering to zero members is logged at
-    /// `warn` inside the adapter as a degradation signal.
+    /// Returns the number of **local** room members the signed frame was
+    /// successfully emitted to (in Model B, remote deliveries happen on the
+    /// instances owning those sockets and are not counted here); a non-empty
+    /// room delivering to zero members is logged at `warn` inside the adapter
+    /// as a degradation signal.
+    ///
+    /// One code path across topologies: the signed local leg
+    /// ([`Self::deliver_local`]) is identical in Model A and Model B; Model B
+    /// only *adds* a non-blocking publish of the UNSIGNED message so owner
+    /// instances elsewhere can run the same local leg for their members
+    /// (carry-unsigned/sign-on-owner). Model A skips the publish.
     pub async fn broadcast_to_room(&self, room_id: &str, event: &str, msg: &RoomMessage) -> usize {
-        let data = match serde_json::to_value(msg) {
-            Ok(v) => v,
+        let span = tracing::debug_span!(
+            "broadcast",
+            room = %room_id,
+            event = %event,
+            msg_id = %msg.message_id,
+            delivered = tracing::field::Empty,
+        );
+        async {
+            let data = match serde_json::to_value(msg) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "failed to serialize room message");
+                    return 0;
+                }
+            };
+            // Model B: hand the unsigned message to the backplane first (a
+            // non-blocking enqueue) so the cross-instance hop overlaps with the
+            // local signing below. Best-effort by design — Redis down degrades
+            // to persist + HTTP /listMessages, never fails the send.
+            if let Some(bp) = &self.backplane {
+                bp.publish(room_id, event, msg);
+            }
+            // Local leg — identical in Model A and Model B.
+            let delivered = self.deliver_local(room_id, event, &data).await;
+            tracing::Span::current().record("delivered", delivered);
+            delivered
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// The one signed local-delivery path: sign for every authenticated local
+    /// member of `room_id` (this instance's Peer sessions — the per-instance
+    /// room registry) and emit over their sockets. Used by both the direct
+    /// broadcast path and the Model B backplane delivery task; keeping them
+    /// on one function is what keeps Model A and Model B from diverging.
+    ///
+    /// Because every delivery goes through here, this is also the single
+    /// observation point for the fan-out + sign-latency metrics.
+    async fn deliver_local(&self, room_id: &str, event: &str, data: &serde_json::Value) -> usize {
+        let start = std::time::Instant::now();
+        let delivered = emit_signed_to_room(&self.io, &self.core, room_id, event, data).await;
+        crate::metrics::BROADCAST_SIGN_SECONDS.observe(start.elapsed().as_secs_f64());
+        crate::metrics::BROADCAST_FANOUT.observe(delivered as f64);
+        delivered
+    }
+
+    /// Scrape-time sample: (connected sockets, distinct verified identities).
+    /// Identities are the room owners (own-room enforcement means one identity
+    /// ⇔ one room family) — the `mbs_rooms` lower bound; authsocket 0.1.0
+    /// exposes no room enumeration.
+    pub fn live_counts(&self) -> (usize, usize) {
+        let sockets = self.io.sockets().unwrap_or_default();
+        let mut identities = std::collections::HashSet::new();
+        for s in &sockets {
+            if let Some(key) = self.core.identity_key(&s.id.to_string()) {
+                identities.insert(key);
+            }
+        }
+        (sockets.len(), identities.len())
+    }
+
+    /// Admission/drain state — shared with the HTTP handlers (send guards),
+    /// the admission middleware, health routes, and `/metrics`.
+    pub fn ops(&self) -> &Arc<crate::ops::OpsState> {
+        &self.ops
+    }
+
+    /// Persist-pipeline counters (shared with the background worker).
+    pub fn persist_stats(&self) -> Arc<crate::persist::PersistStats> {
+        Arc::clone(self.persist.stats())
+    }
+
+    /// Scrape-time sample of the persist queue: (depth, capacity).
+    pub fn persist_queue(&self) -> (usize, usize) {
+        (self.persist.queue_depth(), self.persist.queue_capacity())
+    }
+
+    /// Bounded wait for the persist queue to fully drain (graceful shutdown).
+    /// See [`crate::persist::PersistHandle::flush`].
+    pub async fn flush_persist(&self, timeout: std::time::Duration) -> bool {
+        self.persist.flush(timeout).await
+    }
+}
+
+/// Model B: drain the backplane subscription and deliver every
+/// **remote-origin** envelope to local room members via the same signed
+/// local-delivery path the direct broadcast uses. Own-origin envelopes are
+/// skipped — the publishing instance already ran its local leg at publish
+/// time (skipping prevents double delivery, not a correctness gate: the
+/// client also dedupes on messageId).
+///
+/// Only this instance holds the authsocket `Peer` sessions for its sockets,
+/// so only it can sign for them — the envelope arrives UNSIGNED and signing
+/// happens here, on the connection owner.
+async fn backplane_delivery_task(
+    ws: WsBroadcast,
+    bp: Arc<crate::backplane::Backplane>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    while let Some(raw) = rx.recv().await {
+        let envelope: crate::backplane::BackplaneEnvelope = match serde_json::from_str(&raw) {
+            Ok(e) => e,
             Err(e) => {
-                warn!(error = %e, "failed to serialize room message");
-                return 0;
+                warn!(error = %e, "backplane: undecodable envelope — skipped");
+                continue;
             }
         };
-        emit_signed_to_room(&self.io, &self.core, room_id, event, &data).await
+        if envelope.origin == bp.instance_id() {
+            // Own envelope back off the channel: skip delivery (the local leg
+            // already ran at publish time), but use it to measure pub/sub
+            // round-trip lag on a single clock (publisher == observer).
+            if envelope.published_at_us > 0 {
+                let lag_us =
+                    crate::backplane::now_epoch_us().saturating_sub(envelope.published_at_us);
+                crate::metrics::BACKPLANE_LAG_SECONDS.observe(lag_us as f64 / 1e6);
+            }
+            continue;
+        }
+        // subscribe → sign → deliver: the owner-side leg of the Model B path.
+        let span = tracing::debug_span!(
+            "backplane_deliver",
+            origin = %envelope.origin,
+            room = %envelope.room_id,
+            msg_id = %envelope.message.message_id,
+        );
+        async {
+            let data = match serde_json::to_value(&envelope.message) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(error = %e, "backplane: envelope message failed to re-serialize — skipped");
+                    return;
+                }
+            };
+            let delivered = ws
+                .deliver_local(&envelope.room_id, &envelope.event, &data)
+                .await;
+            debug!(
+                delivered,
+                "backplane: remote-origin message delivered to local members"
+            );
+        }
+        .instrument(span)
+        .await;
     }
+    debug!("backplane delivery task ended (subscription stream closed)");
 }
 
 // ---------------------------------------------------------------------------
 // Socket.IO event handlers
 // ---------------------------------------------------------------------------
 
-/// MessageBox application dispatcher: receives verified events the authsocket
-/// adapter does not handle itself (everything except the generic room verbs).
-struct MbsDispatcher {
-    ws: WsBroadcast,
+/// Set up Socket.IO event handlers for the default namespace.
+///
+/// This is a **fork of `authsocket::server_io::attach`** (same protocol, same
+/// public API of the crate's core) that adds the TS-parity **failure events**
+/// the 0.1.0 adapter swallows (parity audit rows W1/W2/W3/W5):
+/// `authenticationFailed`, `joinFailed`, `leaveFailed` — plus the app-level
+/// `messageFailed` in [`handle_ws_send_message`] — so clients see WHY an
+/// action failed instead of a silent server-side log. Candidate to upstream
+/// into authsocket 0.1.1, at which point this reverts to `attach` + an
+/// `AppDispatcher`.
+///
+/// Every security invariant of the crate adapter is preserved verbatim:
+/// - `authMessage` is the ONLY inbound event; everything else is dropped.
+/// - The socket identity is the **cryptographically verified** sender
+///   recorded by `on_auth_message` — never a client-claimed key.
+/// - Own-room enforcement: a client may only join `{itsIdentityKey}-…`.
+/// - Every server→client emit (failure events included) is a SIGNED general
+///   message; a socket without an authenticated session gets nothing
+///   (signing fails closed and can never initiate a handshake).
+pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
+    let key_hex = ws_broadcast.server_private_key_hex.clone();
+    let core = ws_broadcast.core.clone();
+
+    io.ns("/", move |socket: SocketRef| {
+        let sid = socket.id.to_string();
+        info!(sid = %sid, "authsocket: new Socket.IO connection");
+
+        // Register the BRC-103 session for this socket up front, so the first
+        // inbound frame always finds its PeerHandle.
+        match bsv::primitives::private_key::PrivateKey::from_hex(&key_hex) {
+            Ok(pk) => core.add_connection(&sid, SdkProtoWallet::new(pk)),
+            Err(e) => {
+                warn!(sid = %sid, error = %e, "authsocket: server key parse failed — closing socket");
+                socket.disconnect().ok();
+                return;
+            }
+        }
+
+        let core_msg = core.clone();
+        let core_dc = core.clone();
+        let ws = ws_broadcast.clone();
+
+        // --- authMessage (BRC-103 mutual auth + general message routing) ---
+        socket.on(
+            AUTH_MESSAGE_EVENT,
+            move |socket: SocketRef, Data(data): Data<serde_json::Value>| {
+                let core = core_msg.clone();
+                let ws = ws.clone();
+                async move {
+                    let sid = socket.id.to_string();
+                    let incoming: AuthMessage = match serde_json::from_value(data) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            warn!(sid = %sid, error = %e, "authsocket: invalid authMessage payload");
+                            // TS-surface parity (W1): tell the client its auth
+                            // frame was rejected. Signed — a socket that never
+                            // completed a handshake has no session to sign
+                            // with, so this fails closed (log-only) for it.
+                            emit_signed_to_socket(
+                                &socket,
+                                &core,
+                                "authenticationFailed",
+                                &serde_json::json!({"reason": "Invalid authMessage payload"}),
+                            )
+                            .await;
+                            return;
+                        }
+                    };
+
+                    // Drive the Peer: verifies signatures, runs handshake
+                    // steps. The socket identity is recorded from the
+                    // VERIFIED sender inside on_auth_message, before events
+                    // are returned.
+                    let driven = core.on_auth_message(&sid, incoming).await;
+
+                    // Handshake responses / signed replies back over this socket.
+                    for msg in driven.outbound {
+                        emit_frame(&socket, &sid, &msg);
+                    }
+
+                    // Verified app events: room verbs + MessageBox app verbs.
+                    for ev in driven.events {
+                        handle_verified_event(&core, &socket, &sid, &ws, ev).await;
+                    }
+                }
+            },
+        );
+
+        // --- disconnect ---
+        socket.on_disconnect(
+            move |socket: SocketRef, reason: socketioxide::socket::DisconnectReason| {
+                let core = core_dc.clone();
+                async move {
+                    let sid = socket.id.to_string();
+                    core.remove_connection(&sid);
+                    info!(sid = %sid, reason = ?reason, "authsocket: client disconnected");
+                }
+            },
+        );
+    });
+
+    info!("authsocket handlers attached (BRC-103 over Socket.IO, TS-parity failure events)");
 }
 
-#[async_trait::async_trait]
-impl AppDispatcher<SdkProtoWallet> for MbsDispatcher {
-    async fn dispatch(
-        &self,
-        _io: &SocketIo,
-        _server: &AuthSocketServer<SdkProtoWallet>,
-        socket: &SocketRef,
-        event: VerifiedEvent,
-    ) {
-        let sid = socket.id.to_string();
-        match event.event_name.as_str() {
-            "sendMessage" => {
-                handle_ws_send_message(socket, &self.ws, &sid, &event.sender, event.data).await;
+/// Serialize one signed frame and emit it as `authMessage` (the fork of the
+/// crate's private `emit_frame`).
+fn emit_frame(socket: &SocketRef, sid: &str, msg: &AuthMessage) {
+    match serde_json::to_value(msg) {
+        Ok(json) => {
+            if let Err(e) = socket.emit(AUTH_MESSAGE_EVENT, &json) {
+                warn!(sid = %sid, error = %e, "authsocket: emit failed — signed frame not delivered");
             }
-            other => {
-                debug!(sid = %sid, event = %other, "BRC-103 general message: unhandled event");
-            }
+        }
+        Err(e) => {
+            warn!(sid = %sid, error = %e, "authsocket: failed to serialize signed frame");
         }
     }
 }
 
-/// Set up Socket.IO event handlers for the default namespace.
-///
-/// Wires the authsocket adapter: connect → per-socket BRC-103 session
-/// (`ProtoWallet` over the server key), `authMessage` → verify + generic room
-/// verbs in the crate, app events → [`MbsDispatcher`], disconnect → teardown.
-pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
-    let key_hex = ws_broadcast.server_private_key_hex.clone();
-    let core = ws_broadcast.core.clone();
-    attach(
-        io,
-        core,
-        move || {
-            let pk = bsv::primitives::private_key::PrivateKey::from_hex(&key_hex)
-                .map_err(|e| format!("parse server key: {e}"))?;
-            Ok(SdkProtoWallet::new(pk))
-        },
-        Arc::new(MbsDispatcher { ws: ws_broadcast }),
-    );
-    info!("authsocket handlers attached (BRC-103 over Socket.IO)");
+/// Route one verified event: generic room verbs (with TS-parity failure
+/// events) here, MessageBox app verbs below.
+async fn handle_verified_event(
+    core: &AuthSocketServer<SdkProtoWallet>,
+    socket: &SocketRef,
+    sid: &str,
+    ws: &WsBroadcast,
+    ev: VerifiedEvent,
+) {
+    match ev.event_name.as_str() {
+        "authenticated" => {
+            // Identity was recorded from the verified sender before dispatch;
+            // the claimed key in the payload is deliberately ignored (unlike
+            // TS, which stores it — the spoofable-claimed-sender bug).
+            match core.identity_key(sid) {
+                Some(identity) => {
+                    emit_signed_to_socket(
+                        socket,
+                        core,
+                        "authenticationSuccess",
+                        &serde_json::json!({ "status": "success", "identityKey": identity }),
+                    )
+                    .await;
+                    debug!(sid = %sid, "authsocket: signed authenticationSuccess sent");
+                }
+                None => {
+                    // Unreachable in practice (a verified event always records
+                    // its sender), but if it ever happens the client must not
+                    // be left waiting on its 5s timeout (W1).
+                    warn!(sid = %sid, "authsocket: authenticated event without a verified identity");
+                    emit_signed_to_socket(
+                        socket,
+                        core,
+                        "authenticationFailed",
+                        &serde_json::json!({"reason": "Authentication failed"}),
+                    )
+                    .await;
+                }
+            }
+        }
+        "joinRoom" => {
+            let room_id = ev.data.as_str().unwrap_or("").to_string();
+            if room_id.is_empty() {
+                warn!(sid = %sid, "authsocket: joinRoom with empty room id");
+                emit_signed_to_socket(
+                    socket,
+                    core,
+                    "joinFailed",
+                    &serde_json::json!({"reason": "Invalid room ID"}),
+                )
+                .await;
+                return;
+            }
+            // A client may only join its OWN room ({identityKey}-{messageBox}).
+            // Fail closed: no verified identity -> no join. (`ev.sender` is that
+            // identity, but read it back from the server so the check can never
+            // drift from what emit_to_room will trust.)
+            let owns_room = core
+                .identity_key(sid)
+                .is_some_and(|key| room_id.starts_with(&key));
+            if !owns_room {
+                warn!(sid = %sid, room = %room_id,
+                    "authsocket: joinRoom rejected — identity mismatch");
+                // W2: the rejection is no longer silent — but it stays a
+                // rejection (the own-room hardening is a keep, not a revert).
+                emit_signed_to_socket(
+                    socket,
+                    core,
+                    "joinFailed",
+                    &serde_json::json!({"reason": "You may only join your own room"}),
+                )
+                .await;
+                return;
+            }
+            core.join_room(sid, &room_id);
+            debug!(sid = %sid, room = %room_id, "authsocket: joined room");
+            emit_signed_to_socket(
+                socket,
+                core,
+                "joinedRoom",
+                &serde_json::json!({ "roomId": room_id }),
+            )
+            .await;
+        }
+        "leaveRoom" => {
+            let room_id = ev.data.as_str().unwrap_or("").to_string();
+            if room_id.is_empty() {
+                // W3: was a silent return.
+                emit_signed_to_socket(
+                    socket,
+                    core,
+                    "leaveFailed",
+                    &serde_json::json!({"reason": "Invalid room ID"}),
+                )
+                .await;
+                return;
+            }
+            core.leave_room(sid, &room_id);
+            debug!(sid = %sid, room = %room_id, "authsocket: left room");
+            emit_signed_to_socket(
+                socket,
+                core,
+                "leftRoom",
+                &serde_json::json!({ "roomId": room_id }),
+            )
+            .await;
+        }
+        "sendMessage" => {
+            handle_ws_send_message(socket, ws, sid, &ev.sender, ev.data).await;
+        }
+        other => {
+            debug!(sid = %sid, event = %other, "BRC-103 general message: unhandled event");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +621,15 @@ const MAX_MESSAGE_BODY_BYTES: usize = 1024 * 1024;
 /// crate records it as the socket identity before dispatch).
 ///
 /// Pushes the message live to the target room, enqueues the durable INSERT,
-/// and emits a signed `sendMessageAck-{roomId}` back to the sender.
+/// and emits a signed `sendMessageAck-{roomId}` back to the sender. Invalid
+/// payloads emit a signed `messageFailed {reason}` to the sender (parity
+/// audit W5 — TS surface; previously a silent log meant the client only
+/// discovered the failure via ack-timeout → HTTP fallback).
+#[tracing::instrument(
+    name = "ws_send_message",
+    skip_all,
+    fields(sid = %sid, sender = %sender, msg_id = tracing::field::Empty, room = tracing::field::Empty)
+)]
 async fn handle_ws_send_message(
     socket: &SocketRef,
     ws: &WsBroadcast,
@@ -247,11 +637,27 @@ async fn handle_ws_send_message(
     sender: &str,
     data: serde_json::Value,
 ) {
+    // In-flight marker for graceful drain: this send belongs to a connected
+    // session and is never nacked — drain waits for it (bounded) instead.
+    let _send_guard = ws.ops.begin_send();
+
+    /// Signed `messageFailed {reason}` back to the sender (W5).
+    async fn message_failed(socket: &SocketRef, ws: &WsBroadcast, reason: &str) {
+        emit_signed_to_socket(
+            socket,
+            &ws.core,
+            "messageFailed",
+            &serde_json::json!({ "reason": reason }),
+        )
+        .await;
+    }
+
     // Parse the sendMessage payload
     let room_id_str = match data.get("roomId").and_then(|v| v.as_str()) {
         Some(r) if !r.is_empty() => r.to_string(),
         _ => {
             warn!(sid = %sid, "BRC-103 sendMessage: missing roomId");
+            message_failed(socket, ws, "Missing roomId").await;
             return;
         }
     };
@@ -260,6 +666,7 @@ async fn handle_ws_send_message(
         Some(m) if !m.is_null() => m,
         _ => {
             warn!(sid = %sid, "BRC-103 sendMessage: missing message object");
+            message_failed(socket, ws, "Missing message object").await;
             return;
         }
     };
@@ -268,14 +675,20 @@ async fn handle_ws_send_message(
         Some(id) if !id.is_empty() => id.to_string(),
         _ => {
             warn!(sid = %sid, "BRC-103 sendMessage: missing messageId");
+            message_failed(socket, ws, "Missing messageId").await;
             return;
         }
     };
+    // Backfill the span fields declared Empty on the instrument attribute.
+    let span = tracing::Span::current();
+    span.record("msg_id", tracing::field::display(&message_id));
+    span.record("room", tracing::field::display(&room_id_str));
 
     let recipient = match message.get("recipient").and_then(|v| v.as_str()) {
         Some(r) if !r.is_empty() => r.to_string(),
         _ => {
             warn!(sid = %sid, "BRC-103 sendMessage: missing recipient");
+            message_failed(socket, ws, "Missing recipient").await;
             return;
         }
     };
@@ -290,17 +703,22 @@ async fn handle_ws_send_message(
         }
         _ => {
             warn!(sid = %sid, "BRC-103 sendMessage: missing body");
+            message_failed(socket, ws, "Missing message body").await;
             return;
         }
     };
 
     if body.len() > MAX_MESSAGE_BODY_BYTES {
         warn!(sid = %sid, size = body.len(), "BRC-103 sendMessage: body exceeds size limit");
+        message_failed(socket, ws, "Message body exceeds size limit").await;
         return;
     }
 
     if sender.is_empty() {
         warn!(sid = %sid, "BRC-103 sendMessage: no verified sender identity");
+        // No verified identity ⇒ no session to sign a failure event with;
+        // the emit below fails closed, which is the correct posture.
+        message_failed(socket, ws, "No verified sender identity").await;
         return;
     }
 
@@ -309,6 +727,7 @@ async fn handle_ws_send_message(
         Some((_key, mb)) => mb,
         None => {
             warn!(sid = %sid, room = %room_id_str, "BRC-103 sendMessage: invalid roomId format");
+            message_failed(socket, ws, "Invalid roomId format").await;
             return;
         }
     };
@@ -408,7 +827,13 @@ mod tests {
         let pool = sqlx::mysql::MySqlPoolOptions::new()
             .connect_lazy("mysql://test@127.0.0.1/test")
             .expect("build lazy MySQL pool");
-        WsBroadcast::new(io, TEST_SERVER_KEY.to_string(), pool)
+        WsBroadcast::new(
+            io,
+            TEST_SERVER_KEY.to_string(),
+            pool,
+            None,
+            crate::ops::OpsState::new(0),
+        )
     }
 
     fn test_room_message() -> RoomMessage {
@@ -438,8 +863,7 @@ mod tests {
     #[tokio::test]
     async fn broadcast_skips_member_without_authenticated_session() {
         let ws = test_ws();
-        let wallet =
-            SdkProtoWallet::new(PrivateKey::from_hex(TEST_SERVER_KEY).expect("test key"));
+        let wallet = SdkProtoWallet::new(PrivateKey::from_hex(TEST_SERVER_KEY).expect("test key"));
         ws.core.add_connection("sock1", wallet);
         ws.core.join_room("sock1", "keyA-inbox");
 

@@ -1,3 +1,21 @@
+//! `/permissions/*` — fee/permission plane, kept for wire-parity with the
+//! upstream `@bsv` message-box-server (deliberate product contract: MBS is a
+//! drop-in-compatible open-source messagebox).
+//!
+//! This is a COMPAT SURFACE, NOT an enforced ACL. Two realities a reader must
+//! not mistake for a live access control:
+//! - The primary MPC delivery path — WS `sendMessage` (`ws.rs`) — carries no
+//!   fee/permission/payment check at all, so any `blocked`/`fee` row here can
+//!   be bypassed by sending over WS.
+//! - All boxes seed at delivery fee 0 (owner decision — free delivery, a
+//!   deviation from the TS `notifications=10` default), and every in-stack
+//!   caller sends with `check_permissions: false`. Operators can arm a fee per
+//!   box via `MESSAGEBOX_FEES`, at which point HTTP sends to that box require
+//!   payment (the WS path still bypasses it).
+//!
+//! Do not build authorization or monetization on this plane without new work
+//! (see the mbs-enterprise-production design; owner decision O1 keeps it).
+
 use std::collections::HashMap;
 
 use axum::{
@@ -101,7 +119,7 @@ pub async fn set_permission(
         .into_response();
     }
 
-    // ── Build description matching Go output ──────────────────────────
+    // ── Build description matching the upstream TS server's output ────
     let is_box_wide = sender.is_none();
     let (sender_text, action_text) = if is_box_wide {
         ("all senders".to_string(), "Box-wide default for")
@@ -261,6 +279,12 @@ pub async fn get_permission(
 // GET /permissions/list
 // ───────────────────────────────────────────────────────────────────────────
 
+/// H17 — pinned to the CLIENT (Parity++ decision): the response rows stay
+/// **snake_case** (`message_box`, `recipient_fee`, `created_at`, `updated_at`),
+/// which is what `@bsv/message-box-client` 2.1.0 actually reads — the TS
+/// *server* returns camelCase here and disagrees with its own client. The box
+/// filter accepts BOTH `message_box` (what client 2.1.0 sends — silently dead
+/// against both TS servers) and `messageBox` (the TS-server spelling).
 pub async fn list_permissions(
     State(state): State<AppState>,
     auth: AuthIdentity,
@@ -268,7 +292,11 @@ pub async fn list_permissions(
 ) -> impl IntoResponse {
     let identity_key = auth.0;
 
-    let message_box = params.get("messageBox").filter(|s| !s.is_empty()).cloned();
+    let message_box = params
+        .get("message_box")
+        .or_else(|| params.get("messageBox"))
+        .filter(|s| !s.is_empty())
+        .cloned();
 
     // ── Parse limit ───────────────────────────────────────────────────
     let limit: i64 = match params.get("limit") {

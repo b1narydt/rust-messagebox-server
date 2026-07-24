@@ -137,7 +137,10 @@ async fn test_get_server_delivery_fee_default() {
     let fee = get_server_delivery_fee(&pool, "notifications")
         .await
         .unwrap();
-    assert_eq!(fee, 0, "notifications default delivery fee should be 0 (zeroed by the zero_default_fees migration; opt-in via MESSAGEBOX_FEES)");
+    assert_eq!(
+        fee, 0,
+        "delivery is free out of the box for every box (owner decision); arm via MESSAGEBOX_FEES"
+    );
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
     assert_eq!(fee, 0, "inbox box default delivery fee should be 0");
@@ -191,7 +194,7 @@ async fn test_get_recipient_fee_auto_create_default() {
     let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "notifications")
         .await
         .unwrap();
-    assert_eq!(fee, 10, "notifications box smart default should be 10");
+    assert_eq!(fee, 0, "every box smart-defaults to a 0 recipient fee (free delivery)");
 
     let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
         .await
@@ -309,129 +312,22 @@ async fn test_list_permissions_with_pagination() {
 }
 
 // ---------------------------------------------------------------------------
-// Devices
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_register_device() {
-    let pool = fresh_pool().await;
-    let id = register_device(
-        &pool,
-        TEST_KEY,
-        "fcm-token-abc",
-        Some("dev-1"),
-        Some("android"),
-    )
-    .await
-    .unwrap();
-    assert!(id > 0);
-}
-
-#[tokio::test]
-async fn test_register_device_upsert() {
-    let pool = fresh_pool().await;
-    register_device(
-        &pool,
-        TEST_KEY,
-        "fcm-token-abc",
-        Some("dev-1"),
-        Some("android"),
-    )
-    .await
-    .unwrap();
-    // Same fcm_token, different identity_key should upsert
-    register_device(
-        &pool,
-        TEST_KEY2,
-        "fcm-token-abc",
-        Some("dev-2"),
-        Some("ios"),
-    )
-    .await
-    .unwrap();
-
-    let devices = list_devices(&pool, TEST_KEY2).await.unwrap();
-    assert_eq!(devices.len(), 1, "upsert should update, not duplicate");
-    assert_eq!(devices[0].platform.as_deref(), Some("ios"));
-    assert_eq!(devices[0].device_id.as_deref(), Some("dev-2"));
-}
-
-#[tokio::test]
-async fn test_list_devices() {
-    let pool = fresh_pool().await;
-    register_device(&pool, TEST_KEY, "token-1", None, Some("android"))
-        .await
-        .unwrap();
-    register_device(&pool, TEST_KEY, "token-2", None, Some("ios"))
-        .await
-        .unwrap();
-
-    let devices = list_devices(&pool, TEST_KEY).await.unwrap();
-    assert_eq!(devices.len(), 2);
-}
-
-#[tokio::test]
-async fn test_list_active_devices() {
-    let pool = fresh_pool().await;
-    let id1 = register_device(&pool, TEST_KEY, "token-1", None, Some("android"))
-        .await
-        .unwrap();
-    register_device(&pool, TEST_KEY, "token-2", None, Some("ios"))
-        .await
-        .unwrap();
-
-    // Deactivate the first one
-    deactivate_device(&pool, id1).await.unwrap();
-
-    let active = list_active_devices(&pool, TEST_KEY).await.unwrap();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].fcm_token, "token-2");
-}
-
-#[tokio::test]
-async fn test_deactivate_device() {
-    let pool = fresh_pool().await;
-    let id = register_device(&pool, TEST_KEY, "token-1", None, None)
-        .await
-        .unwrap();
-    deactivate_device(&pool, id).await.unwrap();
-
-    let devices = list_devices(&pool, TEST_KEY).await.unwrap();
-    assert_eq!(devices.len(), 1);
-    assert!(
-        !devices[0].active,
-        "device should be inactive after deactivation"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// FCM delivery check
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_should_use_fcm_delivery() {
-    assert!(should_use_fcm_delivery("notifications"));
-    assert!(!should_use_fcm_delivery("inbox"));
-    assert!(!should_use_fcm_delivery("payment_inbox"));
-    assert!(!should_use_fcm_delivery("random"));
-}
-
-// ---------------------------------------------------------------------------
 // Delivery fee cache
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_delivery_fee_cache() {
     let pool = fresh_pool().await;
-    // After init_delivery_fee_cache (called in fresh_pool), fees should come from cache.
-    // The zero_default_fees migration zeroes every seeded fee (incl. notifications),
-    // so the cached value is 0 unless an operator opts in via MESSAGEBOX_FEES.
+    // After init_delivery_fee_cache (called in fresh_pool), fees come from the
+    // cache. The baseline seed is 0 for every box (free delivery — owner
+    // decision); operators arm a fee via MESSAGEBOX_FEES (applied before cache
+    // priming).
     let fee = get_server_delivery_fee(&pool, "notifications")
         .await
         .unwrap();
     assert_eq!(
         fee, 0,
-        "notifications delivery fee should be 0 after zero_default_fees"
+        "notifications delivery fee is 0 out of the box (free delivery)"
     );
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
@@ -663,5 +559,208 @@ async fn test_concurrent_message_operations() {
         remaining.len(),
         20,
         "20 messages should remain after acknowledging 20"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Baseline schema (migration squash, design D1/D2)
+// ---------------------------------------------------------------------------
+
+/// Fresh deploy produces exactly the 4 baseline tables plus
+/// `device_registrations` (re-added by the Phase-5 parity rebuild, TS DDL).
+#[tokio::test]
+async fn test_baseline_schema_tables() {
+    let pool = fresh_pool().await;
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT CAST(table_name AS CHAR) FROM information_schema.tables \
+         WHERE table_schema = DATABASE() AND table_name <> '_sqlx_migrations' \
+         ORDER BY table_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        tables,
+        vec![
+            "device_registrations".to_string(),
+            "messageBox".to_string(),
+            "message_permissions".to_string(),
+            "messages".to_string(),
+            "server_fees".to_string(),
+        ],
+        "fresh deploy must create exactly the 4 baseline tables + device_registrations"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Device registrations (parity audit §4 — TS contract)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_register_device_insert_and_list() {
+    let pool = fresh_pool().await;
+    let id = register_device(
+        &pool,
+        TEST_KEY,
+        "token-abc-1234567890",
+        Some("dev1"),
+        Some("ios"),
+    )
+    .await
+    .unwrap();
+    assert!(id > 0);
+
+    let devices = list_devices(&pool, TEST_KEY).await.unwrap();
+    assert_eq!(devices.len(), 1);
+    let d = &devices[0];
+    assert_eq!(d.id, id);
+    assert_eq!(d.fcm_token, "token-abc-1234567890");
+    assert_eq!(d.device_id.as_deref(), Some("dev1"));
+    assert_eq!(d.platform.as_deref(), Some("ios"));
+    assert!(d.active);
+    assert!(d.last_used.is_some(), "registration bumps last_used");
+}
+
+/// Upsert on the UNIQUE fcm_token returns the EXISTING row id (H13 — the
+/// deterministic fix over TS's driver-defined knex insert-id on update).
+#[tokio::test]
+async fn test_register_device_upsert_returns_existing_id() {
+    let pool = fresh_pool().await;
+    let id1 = register_device(&pool, TEST_KEY, "token-upsert-1", Some("dev1"), Some("ios"))
+        .await
+        .unwrap();
+    let id2 = register_device(
+        &pool,
+        TEST_KEY,
+        "token-upsert-1",
+        Some("dev2"),
+        Some("android"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(id1, id2, "upsert must return the existing row's id");
+
+    let devices = list_devices(&pool, TEST_KEY).await.unwrap();
+    assert_eq!(devices.len(), 1, "upsert must not create a second row");
+    assert_eq!(devices[0].device_id.as_deref(), Some("dev2"));
+    assert_eq!(devices[0].platform.as_deref(), Some("android"));
+}
+
+/// Token moving owners re-points identity_key at the new caller (deliberate
+/// TS behavior — the token identifies the physical device).
+#[tokio::test]
+async fn test_register_device_token_reassignment_moves_owner() {
+    let pool = fresh_pool().await;
+    register_device(&pool, TEST_KEY, "token-moved-1", None, None)
+        .await
+        .unwrap();
+    register_device(&pool, TEST_KEY2, "token-moved-1", None, None)
+        .await
+        .unwrap();
+
+    assert!(list_devices(&pool, TEST_KEY).await.unwrap().is_empty());
+    let devices = list_devices(&pool, TEST_KEY2).await.unwrap();
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].identity_key, TEST_KEY2);
+}
+
+/// Deactivated devices drop out of the FCM fan-out set but still list; a
+/// re-registration reactivates.
+#[tokio::test]
+async fn test_deactivate_and_reactivate_device() {
+    let pool = fresh_pool().await;
+    let id = register_device(&pool, TEST_KEY, "token-deact-1", None, None)
+        .await
+        .unwrap();
+
+    deactivate_device(&pool, id).await.unwrap();
+    assert!(list_active_devices(&pool, TEST_KEY)
+        .await
+        .unwrap()
+        .is_empty());
+    let all = list_devices(&pool, TEST_KEY).await.unwrap();
+    assert_eq!(all.len(), 1);
+    assert!(!all[0].active);
+
+    // Re-registering the same token reactivates it.
+    register_device(&pool, TEST_KEY, "token-deact-1", None, None)
+        .await
+        .unwrap();
+    assert_eq!(list_active_devices(&pool, TEST_KEY).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_update_device_last_used() {
+    let pool = fresh_pool().await;
+    let id = register_device(&pool, TEST_KEY, "token-lu-1", None, None)
+        .await
+        .unwrap();
+    update_device_last_used(&pool, id).await.unwrap();
+    let devices = list_devices(&pool, TEST_KEY).await.unwrap();
+    assert!(devices[0].last_used.is_some());
+}
+
+#[test]
+fn test_should_use_fcm_delivery_gate() {
+    assert!(should_use_fcm_delivery("notifications"));
+    assert!(!should_use_fcm_delivery("inbox"));
+    assert!(!should_use_fcm_delivery("Notifications"));
+    assert!(!should_use_fcm_delivery("notifications2"));
+}
+
+/// `messages` has a REAL primary key (design D1 — fixes the TS no-PK artifact)
+/// while `messageId` stays UNIQUE so INSERT IGNORE dedup semantics are unchanged.
+#[tokio::test]
+async fn test_baseline_messages_has_real_primary_key() {
+    let pool = fresh_pool().await;
+
+    let pk_cols: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.key_column_usage \
+         WHERE table_schema = DATABASE() AND table_name = 'messages' \
+         AND constraint_name = 'PRIMARY' ORDER BY ordinal_position",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        pk_cols,
+        vec!["id".to_string()],
+        "messages must have a real PRIMARY KEY on id"
+    );
+
+    let unique_msgid: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.table_constraints \
+         WHERE table_schema = DATABASE() AND table_name = 'messages' \
+         AND constraint_type = 'UNIQUE' AND constraint_name = 'uq_messages_messageid'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        unique_msgid, 1,
+        "messageId must remain UNIQUE (dedup constraint)"
+    );
+}
+
+/// Baseline seed is free delivery for every box (owner decision — deviates
+/// from the TS `notifications=10` seed): notifications=0, inbox=0,
+/// payment_inbox=0. Operators arm a fee per box via MESSAGEBOX_FEES (upserted
+/// at boot before the cache is primed).
+#[tokio::test]
+async fn test_baseline_server_fees_seed() {
+    let pool = fresh_pool().await;
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT message_box, delivery_fee FROM server_fees ORDER BY message_box")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("inbox".to_string(), 0),
+            ("notifications".to_string(), 0),
+            ("payment_inbox".to_string(), 0),
+        ],
+        "baseline seed is free delivery for every box: notifications=0, inbox=0, payment_inbox=0"
     );
 }

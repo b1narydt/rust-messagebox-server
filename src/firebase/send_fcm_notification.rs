@@ -1,3 +1,11 @@
+//! FCM v1 delivery — parity audit §4.3.
+//!
+//! Trigger contract: every stored message whose box is exactly
+//! `notifications` (see `queries::should_use_fcm_delivery`), after the send,
+//! best-effort — FCM failure never fails the send. The visible notification
+//! body is the messageId (the content is E2E-encrypted; the ID lets the app
+//! fetch it), matching TS `sendFCMNotification` byte-for-byte.
+
 use crate::db::DbPool;
 use serde_json::json;
 use std::time::Duration;
@@ -5,8 +13,11 @@ use std::time::Duration;
 /// Payload describing the push notification to send via FCM.
 #[derive(Clone, Debug)]
 pub struct FcmPayload {
+    /// Visible notification title — the TS server always sends 'New Message'.
     pub title: String,
     pub message_id: String,
+    /// Sender identity key (TS passes 'unknown' when absent; the Rust send
+    /// path always has the verified/authenticated sender, so it passes it).
     pub originator: String,
 }
 
@@ -18,11 +29,10 @@ pub struct SendFcmNotificationResult {
 
 /// Send a push notification to all active devices registered for `recipient`.
 ///
-/// Devices are notified in parallel. Tokens that FCM reports as invalid
-/// (`NOT_FOUND` / `UNREGISTERED`) are automatically deactivated. On success the
-/// device's `last_used` timestamp is updated.
-///
-/// Returns success if at least one device was notified.
+/// Devices are notified in parallel. Tokens that FCM reports as permanently
+/// invalid (`NOT_FOUND` / `UNREGISTERED`) are automatically deactivated. On
+/// success the device's `last_used` timestamp is updated (§4.3 token
+/// lifecycle). Returns success if at least one device was notified.
 pub async fn send_fcm_notification(
     pool: &DbPool,
     recipient: &str,
@@ -75,7 +85,7 @@ pub async fn send_fcm_notification(
         let token_tail = truncate_token(&device.fcm_token);
 
         let handle = tokio::spawn(async move {
-            let body = build_fcm_body(&device.fcm_token, &payload, device.platform.as_deref());
+            let body = build_fcm_body(&device.fcm_token, &payload);
 
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
@@ -108,7 +118,7 @@ pub async fn send_fcm_notification(
                 return true;
             }
 
-            // Try to parse error body to decide whether to deactivate the token.
+            // Parse the error body to decide whether to deactivate the token.
             let body_text = resp.text().await.unwrap_or_default();
             tracing::warn!(
                 "FCM returned {} for device ...{}: {}",
@@ -158,16 +168,19 @@ pub async fn send_fcm_notification(
     }
 }
 
-/// Build the FCM v1 API request body with platform-specific overrides.
-fn build_fcm_body(token: &str, payload: &FcmPayload, platform: Option<&str>) -> serde_json::Value {
-    let body_text = format!("New message: {}", payload.message_id);
-
-    let message = json!({
+/// Build the FCM v1 API request body (§4.3 — mirrors TS `sendFCMNotification`).
+///
+/// The visible body is the RAW messageId (TS behavior; the earlier Rust
+/// prefixed `"New message: "` — a cosmetic drift, dropped for strict parity).
+/// FCM ignores inapplicable platform blocks, so android + apns are always
+/// both included — same as TS.
+fn build_fcm_body(token: &str, payload: &FcmPayload) -> serde_json::Value {
+    json!({
         "message": {
             "token": token,
             "notification": {
                 "title": payload.title,
-                "body": body_text
+                "body": payload.message_id
             },
             "android": {
                 "priority": "high",
@@ -186,7 +199,7 @@ fn build_fcm_body(token: &str, payload: &FcmPayload, platform: Option<&str>) -> 
                         "mutable-content": 1,
                         "alert": {
                             "title": payload.title,
-                            "body": body_text
+                            "body": payload.message_id
                         }
                     },
                     "messageId": payload.message_id,
@@ -194,21 +207,19 @@ fn build_fcm_body(token: &str, payload: &FcmPayload, platform: Option<&str>) -> 
                 }
             }
         }
-    });
-
-    // For a purely Android device we could strip the apns block and vice
-    // versa, but FCM already ignores inapplicable platform blocks, so
-    // including both is correct and simpler.
-    let _ = platform; // acknowledge parameter; no stripping needed
-
-    message
+    })
 }
 
-/// Return `true` if the FCM error response indicates the token is permanently
-/// invalid and should be deactivated.
+/// `true` if the FCM error response indicates the token is permanently
+/// invalid and should be deactivated (§4.3: v1 API `NOT_FOUND` /
+/// `UNREGISTERED`, plus the legacy SDK strings
+/// `registration-token-not-registered` / `invalid-registration-token`).
 fn should_deactivate(response_body: &str) -> bool {
     let upper = response_body.to_uppercase();
-    upper.contains("NOT_FOUND") || upper.contains("UNREGISTERED")
+    upper.contains("NOT_FOUND")
+        || upper.contains("UNREGISTERED")
+        || upper.contains("REGISTRATION-TOKEN-NOT-REGISTERED")
+        || upper.contains("INVALID-REGISTRATION-TOKEN")
 }
 
 /// Show only the last 10 characters of an FCM token for log safety.
@@ -226,5 +237,62 @@ fn truncate_key(key: &str) -> String {
         key.to_owned()
     } else {
         format!("{}...", &key[..12])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// §4.3: the FCM v1 body contract — title 'New Message', visible body is
+    /// the RAW messageId, android high-priority data block, apns alert block
+    /// with mutable-content, originator = sender key in both data blocks.
+    #[test]
+    fn fcm_body_matches_ts_contract() {
+        let body = build_fcm_body(
+            "tok-1",
+            &FcmPayload {
+                title: "New Message".into(),
+                message_id: "msg-42".into(),
+                originator: "02abc".into(),
+            },
+        );
+        let m = &body["message"];
+        assert_eq!(m["token"], "tok-1");
+        assert_eq!(m["notification"]["title"], "New Message");
+        assert_eq!(
+            m["notification"]["body"], "msg-42",
+            "body must be the RAW messageId (no 'New message: ' prefix)"
+        );
+        assert_eq!(m["android"]["priority"], "high");
+        assert_eq!(m["android"]["data"]["messageId"], "msg-42");
+        assert_eq!(m["android"]["data"]["originator"], "02abc");
+        assert_eq!(m["apns"]["headers"]["apns-push-type"], "alert");
+        assert_eq!(m["apns"]["headers"]["apns-priority"], "10");
+        assert_eq!(m["apns"]["payload"]["aps"]["mutable-content"], 1);
+        assert_eq!(m["apns"]["payload"]["aps"]["alert"]["title"], "New Message");
+        assert_eq!(m["apns"]["payload"]["aps"]["alert"]["body"], "msg-42");
+        assert_eq!(m["apns"]["payload"]["messageId"], "msg-42");
+        assert_eq!(m["apns"]["payload"]["originator"], "02abc");
+    }
+
+    /// §4.3 token lifecycle: v1 invalid-token signals deactivate; transient
+    /// errors do not.
+    #[test]
+    fn deactivation_signals() {
+        assert!(should_deactivate(r#"{"error":{"status":"NOT_FOUND"}}"#));
+        assert!(should_deactivate(
+            r#"{"error":{"details":[{"errorCode":"UNREGISTERED"}]}}"#
+        ));
+        assert!(should_deactivate("registration-token-not-registered"));
+        assert!(should_deactivate("invalid-registration-token"));
+        assert!(!should_deactivate(r#"{"error":{"status":"UNAVAILABLE"}}"#));
+        assert!(!should_deactivate(r#"{"error":{"status":"INTERNAL"}}"#));
+    }
+
+    #[test]
+    fn token_truncation_is_log_safe() {
+        assert_eq!(truncate_token("abcdefghijKLMNOPQRST"), "KLMNOPQRST");
+        assert_eq!(truncate_token("short"), "short");
     }
 }

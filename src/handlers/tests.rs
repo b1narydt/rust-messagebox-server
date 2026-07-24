@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tower::ServiceExt; // for .oneshot()
 
 use bsv::primitives::private_key::PrivateKey;
-use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
 use bsv_wallet_toolbox::types::Chain;
 use bsv_wallet_toolbox::wallet::setup::WalletBuilder;
 use bsv_wallet_toolbox::wallet::wallet::Wallet;
@@ -32,13 +31,16 @@ fn test_config() -> Config {
         db_source: "mysql://unused".to_string(),
         db_max_connections: 4,
         bsv_network: "testnet".to_string(),
-        enable_websockets: false,
         wallet_storage_url: "https://storage.babbage.systems".to_string(),
+        redis_url: None,
+        max_connections: 0,
+        drain_timeout_secs: 30,
+        message_box_fees: Vec::new(),
+        message_box_fees_warnings: Vec::new(),
+        enable_firebase: false,
         firebase_project_id: None,
         firebase_service_account_json: None,
         firebase_service_account_path: None,
-        message_box_fees: Vec::new(),
-        message_box_fees_warnings: Vec::new(),
     }
 }
 
@@ -64,20 +66,23 @@ async fn test_funded_wallet() -> Arc<Wallet> {
 async fn setup_app() -> Router {
     let pool = fresh_pool().await;
 
-    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
-    let wallet = Arc::new(SdkProtoWallet::new(pk));
     let funded_wallet = test_funded_wallet().await;
 
     // Create a minimal WsBroadcast for tests (Socket.IO is not exercised
     // but needs a default namespace registered to avoid panics on broadcast).
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
-    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
+    let ws_broadcast = crate::ws::WsBroadcast::new(
+        io,
+        "a".repeat(64),
+        pool.clone(),
+        None,
+        crate::ops::OpsState::new(0),
+    );
 
     let state = AppState {
         db: pool,
         config: Arc::new(test_config()),
-        wallet,
         funded_wallet,
         ws: ws_broadcast,
     };
@@ -563,89 +568,6 @@ async fn test_acknowledge_success() {
 }
 
 // ===========================================================================
-// devices tests
-// ===========================================================================
-
-#[tokio::test]
-async fn test_register_device_missing_token() {
-    let app = setup_app().await;
-    let (status, body) = post_json(&app, "/registerDevice", json!({})).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "ERR_INVALID_FCM_TOKEN");
-}
-
-#[tokio::test]
-async fn test_register_device_invalid_platform() {
-    let app = setup_app().await;
-    let (status, body) = post_json(
-        &app,
-        "/registerDevice",
-        json!({
-            "fcmToken": "valid-token-123",
-            "platform": "windows"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body["code"], "ERR_INVALID_PLATFORM");
-}
-
-#[tokio::test]
-async fn test_register_device_success() {
-    let app = setup_app().await;
-    let (status, body) = post_json(
-        &app,
-        "/registerDevice",
-        json!({
-            "fcmToken": "fcm-token-12345",
-            "platform": "android"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "success");
-    assert!(body["deviceId"].as_i64().unwrap() > 0);
-}
-
-#[tokio::test]
-async fn test_list_devices_empty() {
-    let app = setup_app().await;
-    let (status, body) = get_path(&app, "/devices").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["status"], "success");
-    assert!(body["devices"].as_array().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn test_list_devices_with_registered() {
-    let app = setup_app().await;
-
-    // Register a device first
-    let (status, _) = post_json(
-        &app,
-        "/registerDevice",
-        json!({
-            "fcmToken": "a]very-long-fcm-token-that-gets-masked",
-            "platform": "ios"
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    // List devices
-    let (status, body) = get_path(&app, "/devices").await;
-    assert_eq!(status, StatusCode::OK);
-    let devices = body["devices"].as_array().unwrap();
-    assert_eq!(devices.len(), 1);
-    // Token should be masked (only last 10 chars shown)
-    let token = devices[0]["fcmToken"].as_str().unwrap();
-    assert!(
-        token.starts_with("..."),
-        "fcm token should be masked: {token}"
-    );
-}
-
-// ===========================================================================
 // permissions tests
 // ===========================================================================
 
@@ -753,6 +675,594 @@ async fn test_get_quote_missing_params() {
 }
 
 // ===========================================================================
+// Payment-path tests (parity audit H3/H4 — TS status codes + error codes)
+//
+// All seeded boxes are free by default, so `setup_app_with_wallet` arms
+// `PAYABLE_BOX` with a per-test delivery fee to exercise the payment plane
+// (H3/H4 are all gated on `delivery_fee > 0`). A stub WalletInterface pins the
+// internalize outcomes (accepted / rejected / exception) without a remote
+// storage backend.
+// ===========================================================================
+
+mod stub_wallet {
+    use async_trait::async_trait;
+    use bsv::wallet::error::WalletError;
+    use bsv::wallet::interfaces::*;
+
+    /// What the stub's `internalize_action` does.
+    #[derive(Clone, Copy)]
+    pub enum Internalize {
+        Accept,
+        Reject,
+        Fail,
+    }
+
+    /// Minimal `WalletInterface` for the sendMessage payment path — only
+    /// `internalize_action` is ever exercised by the handler.
+    pub struct StubWallet(pub Internalize);
+
+    #[async_trait]
+    impl WalletInterface for StubWallet {
+        async fn internalize_action(
+            &self,
+            _args: InternalizeActionArgs,
+            _originator: Option<&str>,
+        ) -> Result<InternalizeActionResult, WalletError> {
+            match self.0 {
+                Internalize::Accept => Ok(InternalizeActionResult { accepted: true }),
+                Internalize::Reject => Ok(InternalizeActionResult { accepted: false }),
+                Internalize::Fail => Err(WalletError::InvalidParameter(
+                    "stubbed internalize failure".into(),
+                )),
+            }
+        }
+
+        async fn create_action(
+            &self,
+            _args: CreateActionArgs,
+            _o: Option<&str>,
+        ) -> Result<CreateActionResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn sign_action(
+            &self,
+            _args: SignActionArgs,
+            _o: Option<&str>,
+        ) -> Result<SignActionResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn abort_action(
+            &self,
+            _args: AbortActionArgs,
+            _o: Option<&str>,
+        ) -> Result<AbortActionResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn list_actions(
+            &self,
+            _args: ListActionsArgs,
+            _o: Option<&str>,
+        ) -> Result<ListActionsResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn list_outputs(
+            &self,
+            _args: ListOutputsArgs,
+            _o: Option<&str>,
+        ) -> Result<ListOutputsResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn relinquish_output(
+            &self,
+            _args: RelinquishOutputArgs,
+            _o: Option<&str>,
+        ) -> Result<RelinquishOutputResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_public_key(
+            &self,
+            _args: GetPublicKeyArgs,
+            _o: Option<&str>,
+        ) -> Result<GetPublicKeyResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn reveal_counterparty_key_linkage(
+            &self,
+            _args: RevealCounterpartyKeyLinkageArgs,
+            _o: Option<&str>,
+        ) -> Result<RevealCounterpartyKeyLinkageResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn reveal_specific_key_linkage(
+            &self,
+            _args: RevealSpecificKeyLinkageArgs,
+            _o: Option<&str>,
+        ) -> Result<RevealSpecificKeyLinkageResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn encrypt(
+            &self,
+            _args: EncryptArgs,
+            _o: Option<&str>,
+        ) -> Result<EncryptResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn decrypt(
+            &self,
+            _args: DecryptArgs,
+            _o: Option<&str>,
+        ) -> Result<DecryptResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn create_hmac(
+            &self,
+            _args: CreateHmacArgs,
+            _o: Option<&str>,
+        ) -> Result<CreateHmacResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn verify_hmac(
+            &self,
+            _args: VerifyHmacArgs,
+            _o: Option<&str>,
+        ) -> Result<VerifyHmacResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn create_signature(
+            &self,
+            _args: CreateSignatureArgs,
+            _o: Option<&str>,
+        ) -> Result<CreateSignatureResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn verify_signature(
+            &self,
+            _args: VerifySignatureArgs,
+            _o: Option<&str>,
+        ) -> Result<VerifySignatureResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn acquire_certificate(
+            &self,
+            _args: AcquireCertificateArgs,
+            _o: Option<&str>,
+        ) -> Result<Certificate, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn list_certificates(
+            &self,
+            _args: ListCertificatesArgs,
+            _o: Option<&str>,
+        ) -> Result<ListCertificatesResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn prove_certificate(
+            &self,
+            _args: ProveCertificateArgs,
+            _o: Option<&str>,
+        ) -> Result<ProveCertificateResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn relinquish_certificate(
+            &self,
+            _args: RelinquishCertificateArgs,
+            _o: Option<&str>,
+        ) -> Result<RelinquishCertificateResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn discover_by_identity_key(
+            &self,
+            _args: DiscoverByIdentityKeyArgs,
+            _o: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn discover_by_attributes(
+            &self,
+            _args: DiscoverByAttributesArgs,
+            _o: Option<&str>,
+        ) -> Result<DiscoverCertificatesResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_header_for_height(
+            &self,
+            _args: GetHeaderArgs,
+            _o: Option<&str>,
+        ) -> Result<GetHeaderResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+
+        async fn is_authenticated(
+            &self,
+            _o: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn wait_for_authentication(
+            &self,
+            _o: Option<&str>,
+        ) -> Result<AuthenticatedResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_height(&self, _o: Option<&str>) -> Result<GetHeightResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_network(&self, _o: Option<&str>) -> Result<GetNetworkResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+        async fn get_version(&self, _o: Option<&str>) -> Result<GetVersionResult, WalletError> {
+            unreachable!("StubWallet: only internalize_action is exercised")
+        }
+    }
+}
+
+/// App with a stubbed funded wallet (payment-path tests).
+/// The payable box the payment-path tests use. NOT one of the seeded boxes
+/// (all of which are free), so its fee is armed per-test in the DB below; the
+/// delivery-fee cache misses it and falls through to that live value. Kept off
+/// `notifications` on purpose so the FCM path stays out of these tests.
+const PAYABLE_BOX: &str = "priority";
+
+async fn setup_app_with_wallet(
+    wallet: Arc<dyn bsv::wallet::interfaces::WalletInterface>,
+) -> Router {
+    let pool = fresh_pool().await;
+    // Arm the payment plane: give PAYABLE_BOX a nonzero server delivery fee so
+    // the H3/H4 payment paths (all gated on `delivery_fee > 0`) are exercised.
+    // Defaults stay free — this is a per-test override, not the seed.
+    crate::db::queries::upsert_server_fee(&pool, PAYABLE_BOX, 10)
+        .await
+        .expect("arm payable-box delivery fee");
+    let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
+    io.ns("/", |_: socketioxide::extract::SocketRef| {});
+    let ws_broadcast = crate::ws::WsBroadcast::new(
+        io,
+        "a".repeat(64),
+        pool.clone(),
+        None,
+        crate::ops::OpsState::new(0),
+    );
+    let state = AppState {
+        db: pool,
+        config: Arc::new(test_config()),
+        funded_wallet: wallet,
+        ws: ws_broadcast,
+    };
+    Router::new()
+        .route(
+            "/sendMessage",
+            post(crate::handlers::send_message::send_message),
+        )
+        .layer(axum::middleware::from_fn(auth_middleware))
+        .with_state(state)
+}
+
+/// A payment body whose first output is a well-formed server delivery-fee
+/// output (index 0 + remittance) and whose second is the recipient's.
+fn valid_payment() -> Value {
+    json!({
+        "tx": [1, 2, 3],
+        "outputs": [
+            {
+                "outputIndex": 0,
+                "paymentRemittance": {
+                    "derivationPrefix": "prefix-a",
+                    "derivationSuffix": "suffix-a",
+                    "senderIdentityKey": TEST_KEY
+                }
+            },
+            { "outputIndex": 1 }
+        ]
+    })
+}
+
+fn payable_send_body(message_id: &str, payment: Option<Value>) -> Value {
+    let mut body = json!({
+        "message": {
+            "recipient": RECIPIENT_KEY,
+            "messageBox": PAYABLE_BOX,
+            "messageId": message_id,
+            "body": "pay-to-deliver"
+        }
+    });
+    if let Some(p) = payment {
+        body["payment"] = p;
+    }
+    body
+}
+
+/// TS: payable box with no payment at all → 400 ERR_MISSING_PAYMENT_TX.
+#[tokio::test]
+async fn test_send_payable_without_payment_is_missing_payment_tx() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Accept,
+    )))
+    .await;
+    let (status, body) =
+        post_json(&app, "/sendMessage", payable_send_body("pay-1", None)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_MISSING_PAYMENT_TX");
+}
+
+/// H4 (TS): delivery fee due but `payment.outputs` empty →
+/// 400 ERR_MISSING_DELIVERY_OUTPUT (not ERR_MISSING_PAYMENT_TX).
+#[tokio::test]
+async fn test_send_payment_empty_outputs_is_missing_delivery_output() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Accept,
+    )))
+    .await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        payable_send_body("pay-2", Some(json!({"tx": [1, 2, 3], "outputs": []}))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_MISSING_DELIVERY_OUTPUT");
+}
+
+/// H3 (TS): internalize returns accepted=false →
+/// 400 ERR_INSUFFICIENT_PAYMENT (was a Rust-only 500).
+#[tokio::test]
+async fn test_send_payment_not_accepted_is_insufficient_payment_400() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Reject,
+    )))
+    .await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        payable_send_body("pay-3", Some(valid_payment())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INSUFFICIENT_PAYMENT");
+}
+
+/// H3 (TS): internalize throws → 500 ERR_INTERNALIZE_FAILED
+/// (code renamed from the drifted ERR_INTERNALIZATION_FAILED).
+#[tokio::test]
+async fn test_send_payment_internalize_exception_is_500_internalize_failed() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Fail,
+    )))
+    .await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        payable_send_body("pay-4", Some(valid_payment())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["code"], "ERR_INTERNALIZE_FAILED");
+}
+
+/// Accepted payment with a server output + a recipient output → 200 success.
+#[tokio::test]
+async fn test_send_payment_accepted_succeeds() {
+    let app = setup_app_with_wallet(Arc::new(stub_wallet::StubWallet(
+        stub_wallet::Internalize::Accept,
+    )))
+    .await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        payable_send_body("pay-5", Some(valid_payment())),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert_eq!(body["status"], "success");
+}
+
+// ===========================================================================
+// H10 — whitespace-only body rejected (TS trims before the emptiness check)
+// ===========================================================================
+
+#[tokio::test]
+async fn test_send_message_whitespace_only_body_rejected() {
+    let app = setup_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageBox": "inbox",
+                "messageId": "ws-body-1",
+                "body": "   "
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INVALID_MESSAGE_BODY");
+}
+
+// ===========================================================================
+// H17 — /permissions/list pinned to the CLIENT: snake_case rows + both
+// `message_box` and `messageBox` filter params accepted
+// ===========================================================================
+
+#[tokio::test]
+async fn test_list_permissions_accepts_both_box_params_and_snake_case_rows() {
+    let app = setup_app().await;
+
+    post_json(
+        &app,
+        "/permissions/set",
+        json!({"messageBox": "inbox", "recipientFee": 10}),
+    )
+    .await;
+    post_json(
+        &app,
+        "/permissions/set",
+        json!({"messageBox": "other_box", "recipientFee": 20}),
+    )
+    .await;
+
+    // Client 2.1.0 spelling: message_box (silently dead against TS servers).
+    let (status, body) = get_path(&app, "/permissions/list?message_box=inbox").await;
+    assert_eq!(status, StatusCode::OK);
+    let perms = body["permissions"].as_array().unwrap();
+    assert_eq!(perms.len(), 1, "message_box filter must apply: {body}");
+    let row = perms[0].as_object().unwrap();
+    // Snake_case row shape — what client 2.1.0 reads (H17 pin).
+    assert_eq!(row["message_box"], "inbox");
+    assert!(row.contains_key("recipient_fee"));
+    assert!(row.contains_key("created_at"));
+    assert!(row.contains_key("updated_at"));
+
+    // TS-server spelling: messageBox — also accepted.
+    let (status, body) = get_path(&app, "/permissions/list?messageBox=other_box").await;
+    assert_eq!(status, StatusCode::OK);
+    let perms = body["permissions"].as_array().unwrap();
+    assert_eq!(perms.len(), 1, "messageBox filter must apply: {body}");
+    assert_eq!(perms[0]["message_box"], "other_box");
+}
+
+// ===========================================================================
+// Device registration tests (parity audit §4.1/§4.2 — the TS contract)
+// ===========================================================================
+
+/// §4.1: 200 `{status:'success', message:'Device registered successfully for
+/// push notifications', deviceId: <numeric row id>}`.
+#[tokio::test]
+async fn test_register_device_success_shape() {
+    let app = setup_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/registerDevice",
+        json!({
+            "fcmToken": "handler-token-1234567890",
+            "deviceId": "phone-1",
+            "platform": "ios"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
+    assert_eq!(
+        body["message"],
+        "Device registered successfully for push notifications"
+    );
+    assert!(
+        body["deviceId"].is_i64() && body["deviceId"].as_i64().unwrap() > 0,
+        "deviceId must be the numeric row id, got {:?}",
+        body["deviceId"]
+    );
+}
+
+/// §4.1: missing / empty / whitespace-only fcmToken → 400 ERR_INVALID_FCM_TOKEN.
+#[tokio::test]
+async fn test_register_device_invalid_fcm_token() {
+    let app = setup_app().await;
+    for bad in [
+        json!({}),
+        json!({"fcmToken": ""}),
+        json!({"fcmToken": "   "}),
+    ] {
+        let (status, body) = post_json(&app, "/registerDevice", bad.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {bad}");
+        assert_eq!(body["code"], "ERR_INVALID_FCM_TOKEN", "body: {bad}");
+    }
+}
+
+/// §4.1: platform outside ios|android|web → 400 ERR_INVALID_PLATFORM with the
+/// exact TS description.
+#[tokio::test]
+async fn test_register_device_invalid_platform() {
+    let app = setup_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/registerDevice",
+        json!({"fcmToken": "tok-x-1234567890", "platform": "windows"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INVALID_PLATFORM");
+    assert_eq!(
+        body["description"],
+        "platform must be one of: ios, android, web"
+    );
+}
+
+/// §4.1: re-registering the same token returns the SAME deviceId (upsert
+/// returns the existing row id — the deterministic fix over TS driver-luck).
+#[tokio::test]
+async fn test_register_device_upsert_same_device_id() {
+    let app = setup_app().await;
+    let (_, first) = post_json(
+        &app,
+        "/registerDevice",
+        json!({"fcmToken": "tok-upsert-h-1234567890"}),
+    )
+    .await;
+    let (status, second) = post_json(
+        &app,
+        "/registerDevice",
+        json!({"fcmToken": "tok-upsert-h-1234567890", "platform": "web"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(first["deviceId"], second["deviceId"]);
+}
+
+/// §4.2 (H14): `fcmToken` masked to `'...' + last 10`; absent
+/// `deviceId`/`platform` serialize as explicit `null` (TS shape — key present,
+/// value null); `lastUsed` present (registration bumps it).
+#[tokio::test]
+async fn test_list_devices_masked_token_and_null_serialization() {
+    let app = setup_app().await;
+    let (status, _) = post_json(
+        &app,
+        "/registerDevice",
+        json!({"fcmToken": "abcdefghijKLMNOPQRST"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get_path(&app, "/devices").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["status"], "success");
+    let devices = body["devices"].as_array().unwrap();
+    assert_eq!(devices.len(), 1);
+    let d = devices[0].as_object().unwrap();
+
+    assert_eq!(d["fcmToken"], "...KLMNOPQRST", "token masked to last 10");
+    assert!(
+        d.contains_key("deviceId") && d["deviceId"].is_null(),
+        "absent deviceId must serialize as null, got {:?}",
+        d.get("deviceId")
+    );
+    assert!(
+        d.contains_key("platform") && d["platform"].is_null(),
+        "absent platform must serialize as null, got {:?}",
+        d.get("platform")
+    );
+    assert!(d.contains_key("lastUsed"), "lastUsed key present");
+    assert!(
+        d["lastUsed"].is_string(),
+        "registration bumps last_used, got {:?}",
+        d["lastUsed"]
+    );
+    assert_eq!(d["active"], true);
+    assert!(d["createdAt"].is_string() && d["updatedAt"].is_string());
+}
+
+/// Devices are per-identity: 401 without auth on both routes.
+#[tokio::test]
+async fn test_device_routes_require_auth() {
+    let app = setup_app().await;
+    let (status, _) =
+        post_json_no_auth(&app, "/registerDevice", json!({"fcmToken": "t-1234567890"})).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = get_path_no_auth(&app, "/devices").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// ===========================================================================
 // auth tests
 // ===========================================================================
 
@@ -784,11 +1294,6 @@ async fn test_no_auth_returns_401() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // Test GET endpoint without auth
-    let app = setup_app().await;
-    let (status, _) = get_path_no_auth(&app, "/devices").await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
     // Test permissions GET without auth
     let app = setup_app().await;
     let (status, _) = get_path_no_auth(&app, "/permissions/get?messageBox=inbox").await;
@@ -808,17 +1313,20 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
     // app is using, so we build the Router inline here with a shared pool.
     let pool = fresh_pool().await;
 
-    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
-    let wallet = Arc::new(SdkProtoWallet::new(pk));
     let funded_wallet = test_funded_wallet().await;
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
-    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
+    let ws_broadcast = crate::ws::WsBroadcast::new(
+        io,
+        "a".repeat(64),
+        pool.clone(),
+        None,
+        crate::ops::OpsState::new(0),
+    );
 
     let state = AppState {
         db: pool.clone(),
         config: Arc::new(test_config()),
-        wallet,
         funded_wallet,
         ws: ws_broadcast,
     };
@@ -977,17 +1485,20 @@ async fn test_send_message_duplicate_writes_exactly_one_row() {
 async fn test_blocked_recipient_not_persisted_or_broadcast() {
     let pool = fresh_pool().await;
 
-    let pk = PrivateKey::from_hex(&"a".repeat(64)).unwrap();
-    let wallet = Arc::new(SdkProtoWallet::new(pk));
     let funded_wallet = test_funded_wallet().await;
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
-    let ws_broadcast = crate::ws::WsBroadcast::new(io, "a".repeat(64), pool.clone());
+    let ws_broadcast = crate::ws::WsBroadcast::new(
+        io,
+        "a".repeat(64),
+        pool.clone(),
+        None,
+        crate::ops::OpsState::new(0),
+    );
 
     let state = AppState {
         db: pool.clone(),
         config: Arc::new(test_config()),
-        wallet,
         funded_wallet,
         ws: ws_broadcast,
     };

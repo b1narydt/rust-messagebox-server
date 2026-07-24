@@ -1,8 +1,6 @@
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use bsv::primitives::public_key::PublicKey;
-use bsv::wallet::interfaces::{
-    InternalizeActionArgs, InternalizeOutput, Payment as SdkPayment, WalletInterface,
-};
+use bsv::wallet::interfaces::{InternalizeActionArgs, InternalizeOutput, Payment as SdkPayment};
 use serde_json::Value;
 use tracing::{debug, error, warn};
 
@@ -16,11 +14,21 @@ use crate::handlers::response_types::{
     DeliveryBlockedError, SendMessageResponse, SendMessageResult,
 };
 
+#[tracing::instrument(
+    name = "http_send_message",
+    skip_all,
+    fields(sender = %auth.0, message_box = tracing::field::Empty, recipients = tracing::field::Empty)
+)]
 pub async fn send_message(
     State(state): State<AppState>,
     auth: AuthIdentity,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    // In-flight marker for graceful drain: an authenticated client's HTTP
+    // send counts as in-flight work — drain waits for it (bounded), and
+    // admission control never gates this route.
+    let _send_guard = state.ws.ops().begin_send();
+
     let sender_key = auth.0;
 
     // ── Parse message object ──────────────────────────────────────────
@@ -49,6 +57,8 @@ pub async fn send_message(
         }
     };
 
+    tracing::Span::current().record("message_box", tracing::field::display(&box_type));
+
     // ── body ──────────────────────────────────────────────────────────
     let msg_body_val = msg.get("body");
     let body_str = match msg_body_val {
@@ -68,7 +78,9 @@ pub async fn send_message(
             )
             .into_response();
         }
-        Some(Value::String(s)) if s.is_empty() => {
+        // H10 (TS parity): a whitespace-only string body is rejected exactly
+        // like an empty one (TS checks `.trim() === ''`).
+        Some(Value::String(s)) if s.trim().is_empty() => {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "ERR_INVALID_MESSAGE_BODY",
@@ -132,6 +144,8 @@ pub async fn send_message(
         )
         .into_response();
     }
+
+    tracing::Span::current().record("recipients", recipients.len());
 
     // Validate recipient keys.
     for r in &recipients {
@@ -236,6 +250,10 @@ pub async fn send_message(
     }
 
     // ── Fee evaluation ────────────────────────────────────────────────
+    // @bsv wire-parity compat surface, NOT an enforced ACL: the WS sendMessage
+    // path bypasses this entirely. All boxes seed at fee 0 (free delivery), so
+    // this gate is inert until an operator arms a fee via MESSAGEBOX_FEES. See
+    // the module doc on handlers::permissions.
     let delivery_fee = match queries::get_server_delivery_fee(&state.db, &box_type).await {
         Ok(f) => f,
         Err(e) => {
@@ -300,20 +318,12 @@ pub async fn send_message(
         .and_then(|v| serde_json::from_value(v.clone()).ok());
 
     let per_recipient_outputs = if requires_payment {
+        // Missing payment (or payment without transaction bytes) → the TS
+        // ERR_MISSING_PAYMENT_TX. Empty outputs are handled per-case below so
+        // the delivery-fee case can return the distinct TS code (H4).
         let pay = match &payment {
-            Some(p)
-                if p.tx.as_ref().is_none_or(|t| t.is_empty())
-                    || p.outputs.as_ref().is_none_or(|o| o.is_empty()) =>
-            {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "ERR_MISSING_PAYMENT_TX",
-                    "Payment transaction data is required for payable delivery.",
-                )
-                .into_response();
-            }
-            Some(p) => p,
-            None => {
+            Some(p) if p.tx.as_ref().is_some_and(|t| !t.is_empty()) => p,
+            _ => {
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "ERR_MISSING_PAYMENT_TX",
@@ -322,6 +332,18 @@ pub async fn send_message(
                 .into_response();
             }
         };
+
+        // H4 (TS parity): a delivery fee is due but the payment carries no
+        // outputs at all → 400 ERR_MISSING_DELIVERY_OUTPUT (previously
+        // collapsed into ERR_MISSING_PAYMENT_TX).
+        if delivery_fee > 0 && pay.outputs.as_ref().is_none_or(|o| o.is_empty()) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "ERR_MISSING_DELIVERY_OUTPUT",
+                "Payment is missing the server delivery-fee output.",
+            )
+            .into_response();
+        }
 
         // Internalize the server's delivery-fee output so the payment is credited
         // to the server's wallet at the remote storage backend.
@@ -332,8 +354,8 @@ pub async fn send_message(
                 None => {
                     return error_response(
                         StatusCode::BAD_REQUEST,
-                        "ERR_MISSING_PAYMENT_TX",
-                        "Payment transaction data is required for payable delivery.",
+                        "ERR_MISSING_DELIVERY_OUTPUT",
+                        "Payment is missing the server delivery-fee output.",
                     )
                     .into_response();
                 }
@@ -417,6 +439,10 @@ pub async fn send_message(
                 seek_permission: Some(false).into(),
             };
 
+            // H3 (TS parity): internalize NOT ACCEPTED → 400
+            // ERR_INSUFFICIENT_PAYMENT; internalize EXCEPTION → 500
+            // ERR_INTERNALIZE_FAILED. (Previously both collapsed into a
+            // Rust-only 500 ERR_INTERNALIZATION_FAILED.)
             match state
                 .funded_wallet
                 .internalize_action(internalize_args, None)
@@ -426,9 +452,9 @@ pub async fn send_message(
                     if !result.accepted {
                         error!("internalize_action rejected delivery fee payment");
                         return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "ERR_INTERNALIZATION_FAILED",
-                            "The server could not internalize the delivery fee payment.",
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INSUFFICIENT_PAYMENT",
+                            "The delivery fee payment was not accepted.",
                         )
                         .into_response();
                     }
@@ -437,7 +463,7 @@ pub async fn send_message(
                     error!("internalize_action failed: {e}");
                     return error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "ERR_INTERNALIZATION_FAILED",
+                        "ERR_INTERNALIZE_FAILED",
                         "The server failed to process the delivery fee payment.",
                     )
                     .into_response();
@@ -556,7 +582,10 @@ pub async fn send_message(
             ),
         }
 
-        // FCM notification for "notifications" box.
+        // FCM push for the `notifications` box (§4.3): after the send,
+        // best-effort, never failing the response. Fire-and-forget, but the
+        // result summary is inspected so a total delivery failure is
+        // observable here — message durability does not depend on FCM.
         if queries::should_use_fcm_delivery(&box_type) {
             let pool = state.db.clone();
             let recipient = fr.recipient.clone();
@@ -566,11 +595,6 @@ pub async fn send_message(
                 message_id: msg_id.clone(),
                 originator: sender_key.clone(),
             };
-            // Fire-and-forget, but don't rely on a dropped JoinHandle to surface
-            // problems. `send_fcm_notification` logs its own per-device errors
-            // internally and returns a result summary; we inspect that summary so
-            // a total delivery failure is observable at this call site too (it is
-            // best-effort — message durability does not depend on FCM).
             tokio::spawn(async move {
                 let result = send_fcm_notification(&pool, &recipient, payload).await;
                 if !result.success {
