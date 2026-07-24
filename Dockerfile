@@ -21,12 +21,14 @@ RUN mkdir -p src \
         target/release/.fingerprint/messagebox-server-* \
         target/release/.fingerprint/messagebox_server-*
 
-# Step 2: copy the real sources and embedded migrations, then build for real.
-# `--locked` honors Cargo.lock byte-for-byte. `touch` on all .rs files
-# guards against Cargo's mtime-based staleness check preserving stale
-# dummy-build artifacts when COPY leaves older mtimes.
+# Step 2: copy the real sources, embedded migrations, and the OpenAPI spec
+# (src/docs.rs embeds it via include_str!("../openapi.json") — the build fails
+# without it), then build for real. `--locked` honors Cargo.lock byte-for-byte.
+# `touch` on all .rs files guards against Cargo's mtime-based staleness check
+# preserving stale dummy-build artifacts when COPY leaves older mtimes.
 COPY src ./src
 COPY migrations ./migrations
+COPY openapi.json ./
 RUN find src -name '*.rs' -exec touch {} + \
     && cargo build --release --locked
 
