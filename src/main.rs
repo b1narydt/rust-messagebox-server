@@ -261,11 +261,23 @@ async fn main() {
         .filter(|s| !s.trim().is_empty())
     {
         Some(list) => {
-            let origins: Vec<axum::http::HeaderValue> = list
-                .split(',')
-                .filter_map(|o| o.trim().parse().ok())
-                .collect();
-            tracing::info!(count = origins.len(), "CORS restricted to an explicit origin allowlist");
+            let mut origins: Vec<axum::http::HeaderValue> = Vec::new();
+            for raw in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                match raw.parse() {
+                    Ok(v) => origins.push(v),
+                    Err(e) => tracing::warn!(origin = %raw, error = %e, "CORS_ALLOWED_ORIGINS: dropping unparseable origin"),
+                }
+            }
+            if origins.is_empty() {
+                // Every entry failed to parse — allow_origin([]) would block ALL
+                // cross-origin requests while the log claimed an allowlist. Make
+                // the misconfiguration loud.
+                tracing::error!(
+                    "CORS_ALLOWED_ORIGINS was set but no entry parsed to a valid origin — ALL cross-origin requests will be blocked. Fix the values or unset the variable."
+                );
+            } else {
+                tracing::info!(count = origins.len(), "CORS restricted to an explicit origin allowlist");
+            }
             CorsLayer::new()
                 .allow_origin(origins)
                 .allow_headers(Any)

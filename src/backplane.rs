@@ -50,7 +50,7 @@ use std::time::Duration;
 use redis::{FromRedisValue, IntoConnectionInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::ws::RoomMessage;
 
@@ -114,21 +114,49 @@ enum RouteCmd {
     Unsubscribe(String),
 }
 
+/// Local membership: which sockets joined which rooms, and the derived
+/// per-room member count. These two MUST move together (the count is derived
+/// from `sid_rooms`), so they live under one mutex — updating them atomically
+/// prevents the count drifting from membership under concurrent same-sid
+/// join/leave/disconnect.
+#[derive(Default)]
+struct Membership {
+    /// room → count of local members (the desired-subscription set = keys).
+    counts: HashMap<String, usize>,
+    /// sid → the rooms that socket joined here (so disconnect can decrement).
+    sid_rooms: HashMap<String, HashSet<String>>,
+}
+
 /// Per-instance routing state: which rooms this instance owns local members of,
 /// and which room channels it has actually subscribed to.
 #[derive(Default)]
 struct RouteState {
-    /// room → count of local members (desired subscriptions).
-    counts: parking_lot::Mutex<HashMap<String, usize>>,
-    /// sid → the rooms that socket joined here (so disconnect can decrement).
-    sid_rooms: parking_lot::Mutex<HashMap<String, HashSet<String>>>,
+    /// Membership + derived counts, under one lock (atomic transitions).
+    members: parking_lot::Mutex<Membership>,
     /// room channels the subscriber task has confirmed SUBSCRIBEd (live).
+    /// Mutated ONLY by `subscriber_task`; reconciled against `members.counts`
+    /// on every reconnect, so it is eventually-consistent and self-healing.
     active: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl RouteState {
     fn rooms_snapshot(&self) -> Vec<String> {
-        self.counts.lock().keys().cloned().collect()
+        self.members.lock().counts.keys().cloned().collect()
+    }
+}
+
+/// Decrement a room's member count under the held `members` lock; on the 0
+/// transition remove the key and emit `Unsubscribe`. Sending the command inside
+/// the critical section makes command order match the count-transition order,
+/// so a concurrent join/leave on the same room can't end subscribed-vs-counts
+/// inconsistent.
+fn dec_member(m: &mut Membership, tx: &mpsc::UnboundedSender<RouteCmd>, room: &str) {
+    if let Some(c) = m.counts.get_mut(room) {
+        *c -= 1;
+        if *c == 0 {
+            m.counts.remove(room);
+            let _ = tx.send(RouteCmd::Unsubscribe(room.to_string()));
+        }
     }
 }
 
@@ -142,6 +170,10 @@ pub struct Backplane {
     published: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     subscribed: Arc<AtomicBool>,
+    /// Set when the subscriber gets a RESP3-not-supported error — the Redis is
+    /// < 6 and Model B cannot work against it. A misconfiguration, not a
+    /// transient, so it is surfaced distinctly (never as "down").
+    unsupported: Arc<AtomicBool>,
 }
 
 impl Backplane {
@@ -155,6 +187,7 @@ impl Backplane {
         let published = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
         let subscribed = Arc::new(AtomicBool::new(false));
+        let unsupported = Arc::new(AtomicBool::new(false));
         let route = Arc::new(RouteState::default());
 
         tokio::spawn(publisher_task(
@@ -167,6 +200,7 @@ impl Backplane {
             redis_url.to_string(),
             delivery_tx,
             subscribed.clone(),
+            unsupported.clone(),
             route.clone(),
             route_rx,
         ));
@@ -180,6 +214,7 @@ impl Backplane {
             published,
             dropped,
             subscribed,
+            unsupported,
         })
     }
 
@@ -220,25 +255,22 @@ impl Backplane {
     }
 
     /// A socket joined `room_id` on this instance. Subscribes to the room's
-    /// channel on the first local member.
+    /// channel on the first local member. Membership + count + the Subscribe
+    /// command are all done under one lock, so the command order matches the
+    /// count-transition order (no subscribe/unsubscribe inversion).
     pub fn on_room_join(&self, sid: &str, room_id: &str) {
-        let newly = self
-            .route
+        let mut m = self.route.members.lock();
+        let newly = m
             .sid_rooms
-            .lock()
             .entry(sid.to_string())
             .or_default()
             .insert(room_id.to_string());
         if !newly {
             return;
         }
-        let first = {
-            let mut counts = self.route.counts.lock();
-            let c = counts.entry(room_id.to_string()).or_insert(0);
-            *c += 1;
-            *c == 1
-        };
-        if first {
+        let c = m.counts.entry(room_id.to_string()).or_insert(0);
+        *c += 1;
+        if *c == 1 {
             let _ = self.route_tx.send(RouteCmd::Subscribe(room_id.to_string()));
         }
     }
@@ -246,46 +278,19 @@ impl Backplane {
     /// A socket left `room_id` on this instance. Unsubscribes on the last local
     /// member.
     pub fn on_room_leave(&self, sid: &str, room_id: &str) {
-        let removed = self
-            .route
-            .sid_rooms
-            .lock()
-            .get_mut(sid)
-            .is_some_and(|s| s.remove(room_id));
-        if !removed {
-            return;
+        let mut m = self.route.members.lock();
+        let removed = m.sid_rooms.get_mut(sid).is_some_and(|s| s.remove(room_id));
+        if removed {
+            dec_member(&mut m, &self.route_tx, room_id);
         }
-        self.decrement_and_maybe_unsub(room_id);
     }
 
     /// A socket disconnected: drop all of its local room memberships.
     pub fn on_socket_disconnect(&self, sid: &str) {
-        let rooms = self.route.sid_rooms.lock().remove(sid).unwrap_or_default();
+        let mut m = self.route.members.lock();
+        let rooms = m.sid_rooms.remove(sid).unwrap_or_default();
         for room in rooms {
-            self.decrement_and_maybe_unsub(&room);
-        }
-    }
-
-    fn decrement_and_maybe_unsub(&self, room_id: &str) {
-        let last = {
-            let mut counts = self.route.counts.lock();
-            match counts.get_mut(room_id) {
-                Some(c) => {
-                    *c -= 1;
-                    if *c == 0 {
-                        counts.remove(room_id);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                None => false,
-            }
-        };
-        if last {
-            let _ = self
-                .route_tx
-                .send(RouteCmd::Unsubscribe(room_id.to_string()));
+            dec_member(&mut m, &self.route_tx, &room);
         }
     }
 
@@ -309,6 +314,13 @@ impl Backplane {
     /// `true` while the subscriber holds a live Redis connection.
     pub fn is_subscribed(&self) -> bool {
         self.subscribed.load(Ordering::Relaxed)
+    }
+
+    /// `true` if the configured Redis is too old for Model B (no RESP3 — needs
+    /// Redis 6+). A permanent misconfiguration, distinct from a transient
+    /// "down".
+    pub fn is_unsupported(&self) -> bool {
+        self.unsupported.load(Ordering::Relaxed)
     }
 
     /// Envelopes successfully PUBLISHed to Redis.
@@ -446,6 +458,7 @@ async fn subscriber_task(
     redis_url: String,
     delivery_tx: mpsc::Sender<String>,
     subscribed: Arc<AtomicBool>,
+    unsupported: Arc<AtomicBool>,
     route: Arc<RouteState>,
     mut control_rx: mpsc::UnboundedReceiver<RouteCmd>,
 ) {
@@ -458,6 +471,7 @@ async fn subscriber_task(
     };
 
     let mut backoff = RECONNECT_MIN;
+    let mut logged_unsupported = false;
     loop {
         // Fresh push channel per connection.
         let (push_tx, mut push_rx) = mpsc::unbounded_channel::<redis::PushInfo>();
@@ -471,9 +485,22 @@ async fn subscriber_task(
         {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
-                // A "RESP3NotSupported"/HELLO error here means Redis < 6 — the
-                // directed-routing backplane requires RESP3 (Redis 6+).
-                debug!(error = %e, "backplane: subscriber connect failed — retrying");
+                // RESP3NotSupported means Redis < 6 — a permanent, actionable
+                // misconfiguration (directed routing needs RESP3). Surface it
+                // distinctly and loudly ONCE, not buried at debug like a
+                // transient blip; readiness reports it as "unsupported".
+                if e.kind() == redis::ErrorKind::RESP3NotSupported {
+                    unsupported.store(true, Ordering::Relaxed);
+                    if !logged_unsupported {
+                        error!(
+                            "backplane: Redis does not support RESP3 (HELLO) — Model B requires Redis 6+. Cross-instance live push is DISABLED until Redis is upgraded. {e}"
+                        );
+                        logged_unsupported = true;
+                    }
+                } else {
+                    unsupported.store(false, Ordering::Relaxed);
+                    debug!(error = %e, "backplane: subscriber connect failed — retrying");
+                }
                 if !reconnect_wait(&delivery_tx, &mut backoff).await {
                     return;
                 }
@@ -507,6 +534,8 @@ async fn subscriber_task(
         }
 
         subscribed.store(true, Ordering::Relaxed);
+        unsupported.store(false, Ordering::Relaxed);
+        logged_unsupported = false;
         backoff = RECONNECT_MIN;
         info!(
             rooms = route.active.lock().len(),
@@ -642,27 +671,27 @@ mod tests {
 
         // First join of a room → count 1.
         bp.on_room_join("sockA", "03bb-inbox");
-        assert_eq!(*bp.route.counts.lock().get("03bb-inbox").unwrap(), 1);
+        assert_eq!(*bp.route.members.lock().counts.get("03bb-inbox").unwrap(), 1);
         // Second local member of the same room → count 2 (no new subscribe).
         bp.on_room_join("sockB", "03bb-inbox");
-        assert_eq!(*bp.route.counts.lock().get("03bb-inbox").unwrap(), 2);
+        assert_eq!(*bp.route.members.lock().counts.get("03bb-inbox").unwrap(), 2);
         // A different room tracked independently.
         bp.on_room_join("sockA", "03cc-inbox");
-        assert_eq!(*bp.route.counts.lock().get("03cc-inbox").unwrap(), 1);
+        assert_eq!(*bp.route.members.lock().counts.get("03cc-inbox").unwrap(), 1);
 
         // One member leaves 03bb-inbox → count 1, still owned.
         bp.on_room_leave("sockA", "03bb-inbox");
-        assert_eq!(*bp.route.counts.lock().get("03bb-inbox").unwrap(), 1);
+        assert_eq!(*bp.route.members.lock().counts.get("03bb-inbox").unwrap(), 1);
 
         // Disconnect sockB → last member of 03bb-inbox gone → room dropped.
         bp.on_socket_disconnect("sockB");
-        assert!(bp.route.counts.lock().get("03bb-inbox").is_none());
+        assert!(!bp.route.members.lock().counts.contains_key("03bb-inbox"));
         // sockA still owns 03cc-inbox.
-        assert_eq!(*bp.route.counts.lock().get("03cc-inbox").unwrap(), 1);
+        assert_eq!(*bp.route.members.lock().counts.get("03cc-inbox").unwrap(), 1);
 
         // Idempotent: re-leaving a room the socket isn't in is a no-op.
         bp.on_room_leave("sockA", "03bb-inbox");
-        assert!(bp.route.counts.lock().get("03bb-inbox").is_none());
+        assert!(!bp.route.members.lock().counts.contains_key("03bb-inbox"));
     }
 
     /// Redis unreachable: publish must not block or error — frames drop+count,

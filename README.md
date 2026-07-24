@@ -130,14 +130,24 @@ keeps working, cross-instance recipients fall back to the durable mailbox
 (`/listMessages` from any instance), and the degradation is logged + counted —
 the server never fails or blocks a send on Redis.
 
-## Operations (unauthenticated, at the root — never under `ROUTING_PREFIX`)
+## Operations (unauthenticated, unprefixed)
+
+Split across two listeners (see `OPS_BIND`). Everything here is pre-auth and never under `ROUTING_PREFIX`.
+
+**Public listener** (the main HTTP port):
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/` | Plain-text banner (legacy uptime check) |
 | `GET` | `/health/live` | Liveness: the event loop answered — always `200` |
-| `GET` | `/health/ready` | Readiness: `200` when routable, `503` + JSON `{ready, db, redis, draining}` on DB loss, on Redis-subscription loss in Model B (Model A skips the check), or while draining |
-| `GET` | `/metrics` | Prometheus text: connections/rooms, fan-out + sign-latency histograms, persist queue depth / inline-fallback / dead-letter counters, Model B publish/drop/lag, admission + drain gauges. Operational counts only — no identities, no message data, no key material. Bind to a scrape network in production. |
+| `GET` | `/docs`, `/openapi.json` | API docs (pre-auth, like the TS/Go references) |
+
+**Private ops listener** (`OPS_BIND`, default `127.0.0.1:9091` — never internet-exposed unless you set it to a public bind):
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/health/ready` | Readiness: `200` when routable, else `503` + JSON `{ready, db, redis, draining}`. Unready on DB loss, on Redis-subscription loss in Model B (`redis: "down"`) or Redis < 6 (`redis: "unsupported"`); Model A skips the Redis check; and while draining. |
+| `GET` | `/metrics` | Prometheus text: connections/rooms, fan-out + sign-latency histograms, persist queue depth / inline-fallback / dead-letter counters, Model B publish/drop/lag + room-subscription count, admission + drain gauges. Operational counts only — no identities, no message data, no key material. |
 
 **Admission control** (`MAX_CONNECTIONS`): gates only *new* WS handshakes
 (engine.io requests without a `sid`). Established sessions, all API routes,

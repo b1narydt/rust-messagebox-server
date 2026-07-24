@@ -254,18 +254,36 @@ fn reject_response(code: &str, description: &str) -> Response {
 // ---------------------------------------------------------------------------
 
 /// Readiness probe result — serialized verbatim as the `/health/ready` body.
+///
+/// Build it with [`ReadinessReport::from_checks`] so `ready` can never
+/// contradict its components (it is derived, not stored independently).
 #[derive(Debug, serde::Serialize)]
 pub struct ReadinessReport {
-    /// `true` ⇔ 200: route traffic here.
+    /// `true` ⇔ 200: route traffic here. Derived from the fields below.
     pub ready: bool,
     /// `"ok"` | `"unreachable"` — MySQL answered `SELECT 1` within the probe
     /// timeout. DB loss ⇒ unready in both models (durability is MySQL-only).
     pub db: &'static str,
-    /// Model B: `"ok"` | `"down"` (live Redis subscription held?). Model A:
-    /// `null` — no Redis in the topology, check skipped.
+    /// Model B: `"ok"` | `"down"` | `"unsupported"` (Redis < 6, no RESP3).
+    /// Model A: `null` — no Redis in the topology, check skipped.
     pub redis: Option<&'static str>,
     /// Draining instances report unready so the LB deregisters them.
     pub draining: bool,
+}
+
+impl ReadinessReport {
+    /// The single place `ready` is computed, so the payload is always
+    /// self-consistent. Ready ⇔ DB reachable AND (Model A, or Model B with a
+    /// live `"ok"` Redis subscription) AND not draining.
+    fn from_checks(db_ok: bool, redis: Option<&'static str>, draining: bool) -> Self {
+        let redis_ok = matches!(redis, None | Some("ok"));
+        Self {
+            ready: db_ok && redis_ok && !draining,
+            db: if db_ok { "ok" } else { "unreachable" },
+            redis,
+            draining,
+        }
+    }
 }
 
 /// Run the readiness checks: DB reachable (both models), Redis subscription
@@ -279,14 +297,16 @@ pub async fn readiness(
         tokio::time::timeout(DB_PROBE_TIMEOUT, sqlx::query("SELECT 1").execute(db)).await,
         Ok(Ok(_))
     );
-    let redis = backplane.map(|bp| if bp.is_subscribed() { "ok" } else { "down" });
-    let draining = ops.is_draining();
-    ReadinessReport {
-        ready: db_ok && redis != Some("down") && !draining,
-        db: if db_ok { "ok" } else { "unreachable" },
-        redis,
-        draining,
-    }
+    let redis = backplane.map(|bp| {
+        if bp.is_unsupported() {
+            "unsupported"
+        } else if bp.is_subscribed() {
+            "ok"
+        } else {
+            "down"
+        }
+    });
+    ReadinessReport::from_checks(db_ok, redis, ops.is_draining())
 }
 
 impl IntoResponse for ReadinessReport {

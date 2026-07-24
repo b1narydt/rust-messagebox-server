@@ -35,6 +35,10 @@ pub struct Limiter {
     /// on the socket peer IP directly.
     trusted_header: Option<HeaderName>,
     retry_after_secs: u64,
+    /// One-shot guard so the "trusted header configured but absent" warning
+    /// (misconfiguration → every client collapses into one bucket) is logged
+    /// once, not on every request.
+    warned_missing_header: std::sync::atomic::AtomicBool,
 }
 
 impl Limiter {
@@ -69,7 +73,18 @@ impl Limiter {
         let trusted_header = if header_name.is_empty() {
             None
         } else {
-            HeaderName::from_bytes(header_name.as_bytes()).ok()
+            match HeaderName::from_bytes(header_name.as_bytes()) {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    // Don't silently demote to peer-IP keying (M2): a bad header
+                    // name is an operator error worth surfacing loudly.
+                    tracing::warn!(
+                        header = %header_name, error = %e,
+                        "TRUSTED_CLIENT_IP_HEADER is not a valid header name — rate limiting will key on the socket peer IP (set it correctly, or empty to opt out)"
+                    );
+                    None
+                }
+            }
         };
 
         tracing::info!(
@@ -82,6 +97,7 @@ impl Limiter {
             inner: RateLimiter::keyed(quota),
             trusted_header,
             retry_after_secs: 1,
+            warned_missing_header: std::sync::atomic::AtomicBool::new(false),
         }))
     }
 
@@ -97,6 +113,19 @@ impl Limiter {
                 {
                     return ip;
                 }
+            }
+            // M1: trusted header configured but absent (e.g. deployed without
+            // the expected proxy) → every client collapses into ONE bucket
+            // keyed on the proxy peer, silently throttling the whole service.
+            // Warn once so the misconfiguration is visible, not a mystery.
+            if !self
+                .warned_missing_header
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                tracing::warn!(
+                    header = %h,
+                    "rate limiting: TRUSTED_CLIENT_IP_HEADER is set but absent on requests — keying on the socket peer IP (all clients may share one bucket). Ensure the trusting proxy sets it, or set the env empty to key on peer intentionally."
+                );
             }
         }
         peer.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
@@ -147,6 +176,7 @@ mod tests {
             inner: RateLimiter::keyed(quota),
             trusted_header: trusted.map(|h| HeaderName::from_bytes(h.as_bytes()).unwrap()),
             retry_after_secs: 1,
+            warned_missing_header: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -189,6 +219,7 @@ mod tests {
             inner: RateLimiter::keyed(quota),
             trusted_header: None,
             retry_after_secs: 1,
+            warned_missing_header: std::sync::atomic::AtomicBool::new(false),
         };
         let peer: IpAddr = "198.51.100.5".parse().unwrap();
         let h = HeaderMap::new();

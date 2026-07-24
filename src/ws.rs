@@ -773,11 +773,13 @@ async fn handle_ws_send_message(
 
     // Recipient-block enforcement (parity with the HTTP path): a recipient can
     // block a sender (recipient_fee == -1). The WS path honors it too, so a
-    // blocked sender can't route around the block over WebSocket. On a DB error
-    // we fail OPEN — the live-push path is best-effort by design (durability is
-    // the async MySQL persist; the HTTP/mailbox path enforces blocks
-    // authoritatively), so a permissions-lookup blip must not drop a live MPC
-    // message. Blocks are enforced whenever the permissions store is reachable.
+    // blocked sender can't route around the block over WebSocket. We fail
+    // CLOSED on a DB error: a block is a safety control, and this path both
+    // pushes live AND persists to the mailbox (which does NOT re-check the
+    // block at read time), so delivering on an unverified lookup would durably
+    // leak a blocked message. Rejecting on a permissions-store blip is the safe
+    // posture — the same MySQL backs persistence anyway, so a real outage
+    // degrades the whole send, not just the block check.
     match crate::db::queries::get_recipient_fee(&ws.db, &recipient, sender, &message_box).await {
         Ok(-1) => {
             warn!(sid = %sid, "BRC-103 sendMessage: recipient has blocked the sender — rejected");
@@ -786,7 +788,9 @@ async fn handle_ws_send_message(
         }
         Ok(_) => {}
         Err(e) => {
-            warn!(sid = %sid, error = %e, "BRC-103 sendMessage: recipient-block lookup failed — delivering live (blocks stay enforced on the HTTP/mailbox path)");
+            error!(sid = %sid, error = %e, "BRC-103 sendMessage: recipient-block lookup failed — rejecting (fail closed; a blocked message must not be delivered/persisted on an unverified check)");
+            message_failed(socket, ws, "Could not verify delivery permission").await;
+            return;
         }
     }
 
