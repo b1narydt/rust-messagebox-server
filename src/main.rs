@@ -374,6 +374,7 @@ async fn main() {
                                     published: bp.published(),
                                     dropped: bp.dropped(),
                                     subscribed: bp.is_subscribed(),
+                                    subscriptions: bp.active_subscription_count() as u64,
                                 }
                             }),
                             ops: Some(messagebox_server::metrics::OpsSnapshot {

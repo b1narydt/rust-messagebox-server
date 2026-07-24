@@ -108,6 +108,8 @@ pub struct BackplaneSnapshot {
     pub published: u64,
     pub dropped: u64,
     pub subscribed: bool,
+    /// Room channels currently subscribed (directed routing).
+    pub subscriptions: u64,
 }
 
 /// Admission/drain state sampled from [`crate::ops::OpsState`] (Phase-3 D3).
@@ -244,8 +246,14 @@ pub fn render(s: &Snapshot) -> String {
         gauge(
             &mut out,
             "mbs_backplane_subscribed",
-            "1 while this instance holds a live subscription to the backplane channel.",
+            "1 while this instance holds a live Redis connection for the backplane.",
             u64::from(bp.subscribed),
+        );
+        gauge(
+            &mut out,
+            "mbs_backplane_room_subscriptions",
+            "Room channels this instance is subscribed to (directed routing: one per owned room).",
+            bp.subscriptions,
         );
         BACKPLANE_LAG_SECONDS.render_into(
             "mbs_backplane_lag_seconds",
@@ -328,6 +336,7 @@ mod tests {
                 published: 100,
                 dropped: 5,
                 subscribed: true,
+                subscriptions: 3,
             }),
             ops: Some(OpsSnapshot {
                 draining: false,

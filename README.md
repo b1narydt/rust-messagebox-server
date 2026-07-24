@@ -107,17 +107,28 @@ MODEL B — horizontal fleet (REDIS_URL set)
    [ LB, sticky WS ] → [ MBS × N ] ── shared [ MySQL ] + shared [ Redis pub/sub ]
 ```
 
-Model B delivery is **carry-unsigned / sign-on-owner**: `broadcast_to_room`
-publishes the *unsigned* message to Redis; every instance subscribes and
-signs **only for its own local room members** — BRC-103 signing is pinned to
-the instance holding that socket's authsocket `Peer` session, so no other
-instance can (or does) sign for it. The local delivery path is byte-identical
-in both models; Model A merely skips the publish.
+Model B uses **directed per-room routing**: each room `{identityKey}-{box}` has
+its own Redis channel (`mbs:room:{roomId}`), and an instance subscribes to a
+room's channel *only while it owns a local member of that room* (subscribe on
+first join, unsubscribe on last leave/disconnect). A publish reaches only the
+instance(s) actually holding the recipient's sockets — **no fan-out to instances
+with no members**, so the fleet scales on message volume, not just connections.
+Redis drops a dead instance's subscriptions automatically, so the live
+subscription set *is* the routing table: self-healing, no directory to keep
+consistent. (This needs **Redis 6+** for RESP3 push — every managed Redis
+qualifies.)
 
-Redis is live-push only, **never durability**: if Redis is down, local
-delivery keeps working, cross-instance recipients fall back to the durable
-mailbox (`/listMessages` from any instance), and the degradation is logged +
-counted — the server never fails or blocks a send on Redis.
+Delivery is **carry-unsigned / sign-on-owner**: `broadcast_to_room` publishes
+the *unsigned* message; the owning instance signs **only for its own local room
+members** — BRC-103 signing is pinned to the instance holding that socket's
+authsocket `Peer` session, so no other instance can (or does) sign for it. The
+local delivery path is byte-identical in both models; Model A merely skips the
+publish.
+
+Redis is live-push only, **never durability**: if Redis is down, local delivery
+keeps working, cross-instance recipients fall back to the durable mailbox
+(`/listMessages` from any instance), and the degradation is logged + counted —
+the server never fails or blocks a send on Redis.
 
 ## Operations (unauthenticated, at the root — never under `ROUTING_PREFIX`)
 

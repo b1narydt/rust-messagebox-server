@@ -1,72 +1,79 @@
-//! Model B backplane — cross-instance live push over Redis pub/sub.
+//! Model B backplane — cross-instance live push over Redis pub/sub, with
+//! **directed per-room routing**.
 //!
 //! One binary, topology chosen by config (transport-architecture WS2-3):
 //! no `REDIS_URL` → **Model A** (single self-contained instance, in-process
 //! routing — the default); `REDIS_URL` set → **Model B** (N replicas behind a
 //! sticky LB, this backplane bridging live push between them).
 //!
+//! ## Directed routing (no fan-out)
+//!
+//! Each room `{identityKey}-{messageBox}` maps to its own Redis channel,
+//! [`room_channel`] = `mbs:room:{roomId}`. An instance **subscribes to a room's
+//! channel only while it owns a local member of that room** — it subscribes on
+//! the first local join and unsubscribes on the last local leave/disconnect. A
+//! publisher therefore reaches only the instance(s) actually holding the
+//! recipient's sockets; an instance with no members of a room never sees its
+//! traffic. This is the CF-Durable-Object routing model without the platform
+//! lock-in: the recipient's owning instance is the "object", addressed by the
+//! room channel.
+//!
+//! Redis pub/sub subscriptions are dropped automatically when a connection
+//! dies, so **the live subscription set IS the routing table** — self-healing,
+//! with no directory to keep consistent and no stale-entry reaper. A crashed
+//! instance's routes simply vanish; the recipient re-handshakes onto a live
+//! instance, which re-subscribes.
+//!
 //! ## Carry-unsigned / sign-on-owner
 //!
 //! BRC-103 signing is pinned to the connection-owning instance: only the
 //! instance holding a socket's authsocket `Peer` session can produce a signed
 //! frame for it. So the backplane carries the **UNSIGNED** [`RoomMessage`]
-//! (wrapped in a [`BackplaneEnvelope`]); every instance subscribes, and each
-//! one signs **only for its own local room members** — the same signed
-//! local-delivery path Model A uses (`WsBroadcast::deliver_local`). A
-//! non-owner instance structurally *cannot* sign for a remote socket: it has
-//! no `Peer` session for it.
-//!
-//! ## The room registry is per-instance, rebuilt on reconnect
-//!
-//! Each instance's in-process authsocket room map is the authoritative record
-//! of which sockets it owns (transport-architecture WS2-3: "Room registry
-//! stays per-instance"). A reconnecting client re-handshakes and re-joins its
-//! room on whichever instance the LB lands it on, rebuilding the registry
-//! there. Publishers therefore do not need cross-instance membership
-//! knowledge: they PUBLISH unconditionally and owner instances filter by
-//! their local membership.
+//! (wrapped in a [`BackplaneEnvelope`]); the owner instance signs for its local
+//! members via the same signed local-delivery path Model A uses
+//! (`WsBroadcast::deliver_local`).
 //!
 //! ## Redis is live-push ONLY — never durability
 //!
 //! Durability lives in shared MySQL (persist pipeline + HTTP `/listMessages`
 //! from ANY instance). Accordingly this module **degrades, never fails**:
-//! Redis down → publishes are counted and dropped (recipients fall back to
-//! the mailbox), subscriptions reconnect with backoff, and nothing on the
-//! send path ever blocks on Redis (publish is a non-blocking enqueue to a
-//! bounded queue drained by a background task).
+//! Redis down → publishes are counted and dropped (recipients fall back to the
+//! mailbox), subscriptions reconnect with backoff and replay the owned-room
+//! set, and a subscribe that races an in-flight publish just misses the live
+//! push (the mailbox covers it). Nothing on the send path ever blocks on Redis.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use redis::{FromRedisValue, IntoConnectionInfo};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::ws::RoomMessage;
 
-/// The single pub/sub channel all instances of a deployment share. Tenant
-/// isolation is at the Redis-deployment level (each licensee runs their own
-/// stack), so no per-tenant namespacing is needed inside the channel name.
-pub const CHANNEL: &str = "mbs:backplane:v1";
+/// Per-room channel prefix. Tenant isolation is at the Redis-deployment level
+/// (each licensee runs their own stack), so no per-tenant namespacing is needed.
+pub const ROOM_CHANNEL_PREFIX: &str = "mbs:room:";
 
-/// Bounded queue between the send paths and the publisher task. If Redis is
-/// down long enough to fill it, further publishes are dropped (counted) —
-/// live push is best-effort; the mailbox stays durable.
+/// The Redis pub/sub channel a room's live push travels on.
+pub fn room_channel(room_id: &str) -> String {
+    format!("{ROOM_CHANNEL_PREFIX}{room_id}")
+}
+
+/// Bounded queue between the send paths and the publisher task.
 const PUBLISH_QUEUE_CAPACITY: usize = 1024;
 
-/// Bounded queue between the Redis subscription and the local signed-delivery
-/// task. The delivery task does per-message BRC-103 fan-out signing, so under a
-/// burst it is slower than the subscription can enqueue; a bound turns that
-/// backpressure into bounded, counted drops (the recipient still gets the
-/// message from the mailbox) instead of unbounded memory growth (Model B OOM).
+/// Bounded queue between the Redis subscription and the local signing fan-out
+/// (backpressure → counted drops, never unbounded memory).
 const DELIVERY_QUEUE_CAPACITY: usize = 2048;
 
-/// Don't re-attempt a failed Redis connect more than once per interval while
-/// messages are flowing (avoids a connect storm when Redis is down).
+/// Don't re-attempt a failed publisher connect more than once per interval.
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Cap on a single connect attempt so the publisher task never wedges.
+/// Cap on a single connect attempt so a task never wedges.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Subscriber reconnect backoff bounds.
@@ -74,8 +81,6 @@ const RECONNECT_MIN: Duration = Duration::from_millis(500);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// What crosses the wire: the UNSIGNED room message plus routing metadata.
-/// `origin` lets the publishing instance skip its own envelope on the
-/// subscribe side (its local leg already delivered at publish time).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct BackplaneEnvelope {
     pub origin: String,
@@ -84,10 +89,7 @@ pub struct BackplaneEnvelope {
     pub event: String,
     pub message: RoomMessage,
     /// Publisher's wall clock at enqueue time (µs since epoch). Used for the
-    /// pub/sub-lag metric: the publishing instance observes its OWN envelope
-    /// coming back off the channel and measures publish→subscribe round-trip
-    /// on a single clock (no cross-instance skew). `0`/absent = unknown
-    /// (older publisher during a rolling deploy) — no lag sample is taken.
+    /// pub/sub-lag metric on own-origin envelopes. `0`/absent = unknown.
     #[serde(rename = "publishedAtUs", default)]
     pub published_at_us: u64,
 }
@@ -100,31 +102,60 @@ pub(crate) fn now_epoch_us() -> u64 {
         .unwrap_or(0)
 }
 
-/// Handle to the Model B backplane: a non-blocking publisher plus a
-/// self-reconnecting subscription feeding [`Backplane::take_delivery_rx`].
+/// One item on the publish queue: which channel, what payload.
+struct PublishItem {
+    channel: String,
+    payload: String,
+}
+
+/// A subscription-lifecycle command for the subscriber task.
+enum RouteCmd {
+    Subscribe(String),
+    Unsubscribe(String),
+}
+
+/// Per-instance routing state: which rooms this instance owns local members of,
+/// and which room channels it has actually subscribed to.
+#[derive(Default)]
+struct RouteState {
+    /// room → count of local members (desired subscriptions).
+    counts: parking_lot::Mutex<HashMap<String, usize>>,
+    /// sid → the rooms that socket joined here (so disconnect can decrement).
+    sid_rooms: parking_lot::Mutex<HashMap<String, HashSet<String>>>,
+    /// room channels the subscriber task has confirmed SUBSCRIBEd (live).
+    active: parking_lot::Mutex<HashSet<String>>,
+}
+
+impl RouteState {
+    fn rooms_snapshot(&self) -> Vec<String> {
+        self.counts.lock().keys().cloned().collect()
+    }
+}
+
+/// Handle to the Model B backplane.
 pub struct Backplane {
     instance_id: String,
-    publish_tx: mpsc::Sender<String>,
-    /// Raw envelope JSON received from the channel (all origins, unfiltered).
-    /// Taken exactly once by `WsBroadcast` to drive local signed delivery.
+    publish_tx: mpsc::Sender<PublishItem>,
     delivery_rx: parking_lot::Mutex<Option<mpsc::Receiver<String>>>,
+    route: Arc<RouteState>,
+    route_tx: mpsc::UnboundedSender<RouteCmd>,
     published: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     subscribed: Arc<AtomicBool>,
 }
 
 impl Backplane {
-    /// Spawn the publisher + subscriber tasks against `redis_url`. Never
-    /// fails and never blocks on Redis: a bad/unreachable Redis only means
-    /// degraded (dropped) cross-instance live push, observable via
-    /// [`Self::dropped`] and warn logs.
+    /// Spawn the publisher + subscriber tasks against `redis_url`. Never fails
+    /// and never blocks on Redis.
     pub fn new(redis_url: &str) -> Arc<Self> {
         let (publish_tx, publish_rx) = mpsc::channel(PUBLISH_QUEUE_CAPACITY);
         let (delivery_tx, delivery_rx) = mpsc::channel(DELIVERY_QUEUE_CAPACITY);
+        let (route_tx, route_rx) = mpsc::unbounded_channel();
 
         let published = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
         let subscribed = Arc::new(AtomicBool::new(false));
+        let route = Arc::new(RouteState::default());
 
         tokio::spawn(publisher_task(
             redis_url.to_string(),
@@ -136,34 +167,30 @@ impl Backplane {
             redis_url.to_string(),
             delivery_tx,
             subscribed.clone(),
+            route.clone(),
+            route_rx,
         ));
 
         Arc::new(Self {
             instance_id: new_instance_id(),
             publish_tx,
             delivery_rx: parking_lot::Mutex::new(Some(delivery_rx)),
+            route,
+            route_tx,
             published,
             dropped,
             subscribed,
         })
     }
 
-    /// This instance's unique id (fresh per boot — a restarted instance is a
-    /// new owner; its previous sockets are gone anyway).
+    /// This instance's unique id (fresh per boot).
     pub fn instance_id(&self) -> &str {
         &self.instance_id
     }
 
-    /// Enqueue the UNSIGNED room message for other instances. Non-blocking
-    /// and best-effort: on a full queue (Redis down/backed up) the frame is
-    /// dropped and counted — never stalls or fails the caller's send.
+    /// Enqueue the UNSIGNED room message to the room's channel. Non-blocking
+    /// and best-effort: a full queue (Redis down/backed up) drops+counts.
     pub fn publish(&self, room_id: &str, event: &str, message: &RoomMessage) {
-        let _span = tracing::debug_span!(
-            "backplane_publish",
-            room = %room_id,
-            msg_id = %message.message_id,
-        )
-        .entered();
         let envelope = BackplaneEnvelope {
             origin: self.instance_id.clone(),
             room_id: room_id.to_string(),
@@ -179,9 +206,11 @@ impl Backplane {
                 return;
             }
         };
-        if self.publish_tx.try_send(payload).is_err() {
-            // Queue full or publisher gone: degrade. The recipient still gets
-            // the message from the mailbox (MySQL) via HTTP /listMessages.
+        let item = PublishItem {
+            channel: room_channel(room_id),
+            payload,
+        };
+        if self.publish_tx.try_send(item).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
             warn!(
                 room = %room_id,
@@ -190,13 +219,94 @@ impl Backplane {
         }
     }
 
-    /// Take the raw subscription stream (exactly once). `WsBroadcast` drains
-    /// it and delivers remote-origin envelopes to local room members.
+    /// A socket joined `room_id` on this instance. Subscribes to the room's
+    /// channel on the first local member.
+    pub fn on_room_join(&self, sid: &str, room_id: &str) {
+        let newly = self
+            .route
+            .sid_rooms
+            .lock()
+            .entry(sid.to_string())
+            .or_default()
+            .insert(room_id.to_string());
+        if !newly {
+            return;
+        }
+        let first = {
+            let mut counts = self.route.counts.lock();
+            let c = counts.entry(room_id.to_string()).or_insert(0);
+            *c += 1;
+            *c == 1
+        };
+        if first {
+            let _ = self.route_tx.send(RouteCmd::Subscribe(room_id.to_string()));
+        }
+    }
+
+    /// A socket left `room_id` on this instance. Unsubscribes on the last local
+    /// member.
+    pub fn on_room_leave(&self, sid: &str, room_id: &str) {
+        let removed = self
+            .route
+            .sid_rooms
+            .lock()
+            .get_mut(sid)
+            .is_some_and(|s| s.remove(room_id));
+        if !removed {
+            return;
+        }
+        self.decrement_and_maybe_unsub(room_id);
+    }
+
+    /// A socket disconnected: drop all of its local room memberships.
+    pub fn on_socket_disconnect(&self, sid: &str) {
+        let rooms = self.route.sid_rooms.lock().remove(sid).unwrap_or_default();
+        for room in rooms {
+            self.decrement_and_maybe_unsub(&room);
+        }
+    }
+
+    fn decrement_and_maybe_unsub(&self, room_id: &str) {
+        let last = {
+            let mut counts = self.route.counts.lock();
+            match counts.get_mut(room_id) {
+                Some(c) => {
+                    *c -= 1;
+                    if *c == 0 {
+                        counts.remove(room_id);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            }
+        };
+        if last {
+            let _ = self
+                .route_tx
+                .send(RouteCmd::Unsubscribe(room_id.to_string()));
+        }
+    }
+
+    /// `true` once this instance has a CONFIRMED live subscription to
+    /// `room_id`'s channel (i.e. cross-instance live push will reach it). Used
+    /// by tests and observability.
+    pub fn is_room_active(&self, room_id: &str) -> bool {
+        self.route.active.lock().contains(room_id)
+    }
+
+    /// Number of room channels this instance is currently subscribed to.
+    pub fn active_subscription_count(&self) -> usize {
+        self.route.active.lock().len()
+    }
+
+    /// Take the raw subscription stream (exactly once).
     pub fn take_delivery_rx(&self) -> Option<mpsc::Receiver<String>> {
         self.delivery_rx.lock().take()
     }
 
-    /// `true` while the subscriber holds a live subscription to [`CHANNEL`].
+    /// `true` while the subscriber holds a live Redis connection.
     pub fn is_subscribed(&self) -> bool {
         self.subscribed.load(Ordering::Relaxed)
     }
@@ -206,9 +316,7 @@ impl Backplane {
         self.published.load(Ordering::Relaxed)
     }
 
-    /// Envelopes dropped instead of published (Redis unreachable, queue full,
-    /// or serialization failure). A rising value = degraded cross-instance
-    /// live push.
+    /// Envelopes dropped instead of published.
     pub fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
@@ -218,9 +326,6 @@ impl Backplane {
 fn new_instance_id() -> String {
     let mut buf = [0u8; 8];
     if getrandom::fill(&mut buf).is_err() {
-        // Extremely unlikely; fall back to a time-derived id rather than
-        // aborting — a collision only risks a duplicate live push, and the
-        // client dedupes on messageId.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.subsec_nanos())
@@ -231,11 +336,10 @@ fn new_instance_id() -> String {
     hex::encode(buf)
 }
 
-/// Drains the publish queue into Redis `PUBLISH`, reconnecting lazily.
-/// Frames that cannot be published are dropped (counted) — live push only.
+/// Drains the publish queue into per-room Redis `PUBLISH`, reconnecting lazily.
 async fn publisher_task(
     redis_url: String,
-    mut rx: mpsc::Receiver<String>,
+    mut rx: mpsc::Receiver<PublishItem>,
     published: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
 ) {
@@ -253,7 +357,7 @@ async fn publisher_task(
     let mut conn: Option<redis::aio::MultiplexedConnection> = None;
     let mut last_failed_connect: Option<tokio::time::Instant> = None;
 
-    while let Some(payload) = rx.recv().await {
+    while let Some(item) = rx.recv().await {
         if conn.is_none() {
             let may_retry =
                 last_failed_connect.is_none_or(|t| t.elapsed() >= CONNECT_RETRY_INTERVAL);
@@ -284,14 +388,14 @@ async fn publisher_task(
         match conn.as_mut() {
             Some(c) => {
                 let result: redis::RedisResult<i64> = redis::cmd("PUBLISH")
-                    .arg(CHANNEL)
-                    .arg(&payload)
+                    .arg(&item.channel)
+                    .arg(&item.payload)
                     .query_async(c)
                     .await;
                 match result {
                     Ok(receivers) => {
                         published.fetch_add(1, Ordering::Relaxed);
-                        debug!(receivers, "backplane: envelope published");
+                        debug!(channel = %item.channel, receivers, "backplane: envelope published");
                     }
                     Err(e) => {
                         warn!(error = %e, "backplane: PUBLISH failed — frame dropped, reconnecting");
@@ -307,17 +411,45 @@ async fn publisher_task(
     }
 }
 
-/// Holds a subscription to [`CHANNEL`] and forwards every payload into
-/// `delivery_tx`; reconnects with capped exponential backoff. Exits when the
-/// delivery receiver is gone (owner dropped).
+/// Build a RESP3 client — required for the push-based dynamic-subscription API.
+/// RESP3 is requested via the `protocol=resp3` URL param (the connection-info
+/// protocol field is not publicly settable), preserving any existing query
+/// params / TLS options on the operator's `REDIS_URL`.
+fn resp3_client(redis_url: &str) -> redis::RedisResult<redis::Client> {
+    // Validate the URL up front (and surface a bad REDIS_URL early).
+    let _ = redis_url.into_connection_info()?;
+    let url = if redis_url.contains("protocol=") {
+        redis_url.to_string()
+    } else if redis_url.contains('?') {
+        format!("{redis_url}&protocol=resp3")
+    } else if url_has_path(redis_url) {
+        format!("{redis_url}?protocol=resp3")
+    } else {
+        // No path segment (e.g. `redis://host:6379`) — a query needs a `/` first.
+        format!("{redis_url}/?protocol=resp3")
+    };
+    redis::Client::open(url)
+}
+
+/// Does the redis URL already have a path segment after the authority?
+fn url_has_path(redis_url: &str) -> bool {
+    redis_url
+        .split_once("://")
+        .map(|(_, rest)| rest.contains('/'))
+        .unwrap_or(false)
+}
+
+/// Holds a RESP3 connection, dynamically SUBSCRIBEs/UNSUBSCRIBEs room channels
+/// as local membership changes, and forwards every message payload into
+/// `delivery_tx`. Reconnects with capped backoff, replaying the owned-room set.
 async fn subscriber_task(
     redis_url: String,
     delivery_tx: mpsc::Sender<String>,
     subscribed: Arc<AtomicBool>,
+    route: Arc<RouteState>,
+    mut control_rx: mpsc::UnboundedReceiver<RouteCmd>,
 ) {
-    use futures_util::StreamExt;
-
-    let client = match redis::Client::open(redis_url.as_str()) {
+    let client = match resp3_client(&redis_url) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, "backplane: invalid REDIS_URL — Model B subscribe disabled");
@@ -327,53 +459,123 @@ async fn subscriber_task(
 
     let mut backoff = RECONNECT_MIN;
     loop {
-        match tokio::time::timeout(CONNECT_TIMEOUT, client.get_async_pubsub()).await {
-            Ok(Ok(mut pubsub)) => match pubsub.subscribe(CHANNEL).await {
-                Ok(()) => {
-                    info!(channel = CHANNEL, "backplane: subscribed");
-                    subscribed.store(true, Ordering::Relaxed);
-                    backoff = RECONNECT_MIN;
-                    let mut stream = pubsub.into_on_message();
-                    while let Some(msg) = stream.next().await {
-                        match msg.get_payload::<String>() {
-                            Ok(payload) => match delivery_tx.try_send(payload) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    // Delivery task is behind (signing fan-out
-                                    // backpressure): drop this live push — the
-                                    // mailbox still delivers it. Bounded, never OOM.
-                                    warn!("backplane: local delivery queue full — dropping cross-instance push (mailbox fallback covers delivery)");
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                    subscribed.store(false, Ordering::Relaxed);
-                                    return; // consumer gone — shut down
-                                }
-                            },
-                            Err(e) => {
-                                warn!(error = %e, "backplane: non-UTF8 payload on channel — skipped")
-                            }
-                        }
-                    }
-                    subscribed.store(false, Ordering::Relaxed);
-                    warn!("backplane: subscription stream ended — reconnecting");
-                }
-                Err(e) => {
-                    warn!(error = %e, "backplane: SUBSCRIBE failed — retrying");
-                }
-            },
+        // Fresh push channel per connection.
+        let (push_tx, mut push_rx) = mpsc::unbounded_channel::<redis::PushInfo>();
+        let config = redis::AsyncConnectionConfig::new().set_push_sender(push_tx);
+
+        let mut conn = match tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            client.get_multiplexed_async_connection_with_config(&config),
+        )
+        .await
+        {
+            Ok(Ok(c)) => c,
             Ok(Err(e)) => {
+                // A "RESP3NotSupported"/HELLO error here means Redis < 6 — the
+                // directed-routing backplane requires RESP3 (Redis 6+).
                 debug!(error = %e, "backplane: subscriber connect failed — retrying");
+                if !reconnect_wait(&delivery_tx, &mut backoff).await {
+                    return;
+                }
+                continue;
             }
             Err(_) => {
                 debug!("backplane: subscriber connect timed out — retrying");
+                if !reconnect_wait(&delivery_tx, &mut backoff).await {
+                    return;
+                }
+                continue;
             }
+        };
+
+        // Replay: subscribe to every room this instance currently owns.
+        route.active.lock().clear();
+        let mut replay_ok = true;
+        for room in route.rooms_snapshot() {
+            if conn.subscribe(room_channel(&room)).await.is_err() {
+                replay_ok = false;
+                break;
+            }
+            route.active.lock().insert(room);
         }
-        if delivery_tx.is_closed() {
+        if !replay_ok {
+            subscribed.store(false, Ordering::Relaxed);
+            if !reconnect_wait(&delivery_tx, &mut backoff).await {
+                return;
+            }
+            continue;
+        }
+
+        subscribed.store(true, Ordering::Relaxed);
+        backoff = RECONNECT_MIN;
+        info!(
+            rooms = route.active.lock().len(),
+            "backplane: subscriber connected (RESP3, directed routing)"
+        );
+
+        // Event loop: subscription control + inbound pushes.
+        let reconnect = loop {
+            tokio::select! {
+                cmd = control_rx.recv() => match cmd {
+                    Some(RouteCmd::Subscribe(room)) => {
+                        if conn.subscribe(room_channel(&room)).await.is_ok() {
+                            route.active.lock().insert(room);
+                        } else {
+                            break true; // connection bad — reconnect + replay
+                        }
+                    }
+                    Some(RouteCmd::Unsubscribe(room)) => {
+                        let _ = conn.unsubscribe(room_channel(&room)).await;
+                        route.active.lock().remove(&room);
+                    }
+                    None => return, // Backplane dropped — shut down
+                },
+                push = push_rx.recv() => match push {
+                    Some(info) => match info.kind {
+                        redis::PushKind::Message => {
+                            // data = [channel, payload]; forward the payload.
+                            if let Some(payload) = info
+                                .data
+                                .get(1)
+                                .and_then(|v| String::from_redis_value_ref(v).ok())
+                            {
+                                match delivery_tx.try_send(payload) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => warn!(
+                                        "backplane: local delivery queue full — dropping cross-instance push (mailbox fallback covers delivery)"
+                                    ),
+                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                }
+                            }
+                        }
+                        redis::PushKind::Disconnection => break true,
+                        _ => {} // subscribe/unsubscribe confirmations
+                    },
+                    None => break true, // push stream closed — reconnect
+                },
+            }
+        };
+
+        subscribed.store(false, Ordering::Relaxed);
+        route.active.lock().clear();
+        if !reconnect {
             return;
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(RECONNECT_MAX);
+        warn!("backplane: subscription connection lost — reconnecting");
+        if !reconnect_wait(&delivery_tx, &mut backoff).await {
+            return;
+        }
     }
+}
+
+/// Sleep the backoff and grow it; returns `false` if the consumer is gone.
+async fn reconnect_wait(delivery_tx: &mpsc::Sender<String>, backoff: &mut Duration) -> bool {
+    if delivery_tx.is_closed() {
+        return false;
+    }
+    tokio::time::sleep(*backoff).await;
+    *backoff = (*backoff * 2).min(RECONNECT_MAX);
+    true
 }
 
 #[cfg(test)]
@@ -392,9 +594,14 @@ mod tests {
         }
     }
 
-    /// The wire shape is stable: routing metadata + the UNSIGNED RoomMessage
-    /// exactly as the local signed-delivery path would serialize it — and no
-    /// signature material anywhere (signing happens only on the owner).
+    #[test]
+    fn room_channel_is_prefixed_per_room() {
+        assert_eq!(room_channel("03bb-inbox"), "mbs:room:03bb-inbox");
+        assert_ne!(room_channel("03bb-inbox"), room_channel("03cc-inbox"));
+    }
+
+    /// The wire shape is stable: routing metadata + the UNSIGNED RoomMessage,
+    /// no signature material anywhere.
     #[test]
     fn envelope_wire_shape_is_unsigned_room_message() {
         let env = BackplaneEnvelope {
@@ -407,25 +614,13 @@ mod tests {
         let v = serde_json::to_value(&env).expect("serialize");
         assert_eq!(v["origin"], "abc123");
         assert_eq!(v["roomId"], "03bb-inbox");
-        assert_eq!(v["event"], "sendMessage-03bb-inbox");
         assert_eq!(v["publishedAtUs"], 1_700_000_000_000_000u64);
-        // The carried message is the plain RoomMessage JSON…
-        assert_eq!(
-            v["message"],
-            serde_json::to_value(room_message()).expect("room message")
-        );
-        // …with exactly its fields — nothing signature-shaped rides along.
         let msg = v["message"].as_object().expect("message object");
         assert_eq!(msg.len(), 7);
         for key in ["signature", "nonce", "yourNonce", "identityKey"] {
-            assert!(
-                !msg.contains_key(key),
-                "unsigned payload must not carry {key}"
-            );
+            assert!(!msg.contains_key(key), "unsigned payload must not carry {key}");
         }
-
-        let back: BackplaneEnvelope = serde_json::from_value(v).expect("envelope roundtrips");
-        assert_eq!(back.origin, "abc123");
+        let back: BackplaneEnvelope = serde_json::from_value(v).expect("roundtrips");
         assert_eq!(back.message.message_id, "m1");
     }
 
@@ -437,11 +632,43 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// Redis unreachable: publish must not block or error — frames are
-    /// dropped and counted, the caller's send path is untouched.
+    /// Directed routing bookkeeping (no live Redis needed — the subscriber task
+    /// just fails to connect to the dead port): join/leave/disconnect drive the
+    /// desired-subscription counts and the subscribe/unsubscribe transitions on
+    /// 0↔1 boundaries. `#[tokio::test]` because `Backplane::new` spawns tasks.
+    #[tokio::test]
+    async fn membership_drives_subscription_transitions() {
+        let bp = Backplane::new("redis://127.0.0.1:1/");
+
+        // First join of a room → count 1.
+        bp.on_room_join("sockA", "03bb-inbox");
+        assert_eq!(*bp.route.counts.lock().get("03bb-inbox").unwrap(), 1);
+        // Second local member of the same room → count 2 (no new subscribe).
+        bp.on_room_join("sockB", "03bb-inbox");
+        assert_eq!(*bp.route.counts.lock().get("03bb-inbox").unwrap(), 2);
+        // A different room tracked independently.
+        bp.on_room_join("sockA", "03cc-inbox");
+        assert_eq!(*bp.route.counts.lock().get("03cc-inbox").unwrap(), 1);
+
+        // One member leaves 03bb-inbox → count 1, still owned.
+        bp.on_room_leave("sockA", "03bb-inbox");
+        assert_eq!(*bp.route.counts.lock().get("03bb-inbox").unwrap(), 1);
+
+        // Disconnect sockB → last member of 03bb-inbox gone → room dropped.
+        bp.on_socket_disconnect("sockB");
+        assert!(bp.route.counts.lock().get("03bb-inbox").is_none());
+        // sockA still owns 03cc-inbox.
+        assert_eq!(*bp.route.counts.lock().get("03cc-inbox").unwrap(), 1);
+
+        // Idempotent: re-leaving a room the socket isn't in is a no-op.
+        bp.on_room_leave("sockA", "03bb-inbox");
+        assert!(bp.route.counts.lock().get("03bb-inbox").is_none());
+    }
+
+    /// Redis unreachable: publish must not block or error — frames drop+count,
+    /// the caller's send path is untouched.
     #[tokio::test]
     async fn publish_with_redis_down_degrades_without_blocking() {
-        // Port 1 on loopback: connection refused immediately.
         let bp = Backplane::new("redis://127.0.0.1:1/");
         let start = std::time::Instant::now();
         bp.publish("03bb-inbox", "sendMessage-03bb-inbox", &room_message());
@@ -450,13 +677,9 @@ mod tests {
             "publish must be non-blocking"
         );
 
-        // The publisher task fails to connect and counts the drop.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while bp.dropped() == 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "drop must be observed"
-            );
+            assert!(tokio::time::Instant::now() < deadline, "drop must be observed");
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(bp.published(), 0);

@@ -27,7 +27,7 @@ use messagebox_server::backplane::Backplane;
 use messagebox_server::ws::{self, RoomMessage, WsBroadcast};
 
 use testcontainers::runners::AsyncRunner;
-use testcontainers::ContainerAsync;
+use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::redis::Redis;
 
 const SERVER_KEY_A: &str = "0000000000000000000000000000000000000000000000000000000000000011";
@@ -58,7 +58,11 @@ async fn identity_of(key_hex: &str) -> String {
 
 /// Start a Redis container and return (container-keepalive, redis URL).
 async fn redis_container() -> (ContainerAsync<Redis>, String) {
+    // Pin Redis 7: the directed-routing backplane uses RESP3 push (HELLO), which
+    // needs Redis 6+. The module's default image predates it. Real managed Redis
+    // (ElastiCache/Upstash/Redis Cloud) is all 6+.
     let container = Redis::default()
+        .with_tag("7-alpine")
         .start()
         .await
         .expect("start Redis testcontainer (Docker required)");
@@ -175,14 +179,25 @@ async fn cross_instance_delivery_is_signed_by_the_owner() {
     let (url_a, _ws_a) = boot_instance(SERVER_KEY_A, Some(bp_a.clone())).await;
     let (_url_b, ws_b) = boot_instance(SERVER_KEY_B, Some(bp_b.clone())).await;
 
-    // Pub/sub has no replay: A must hold its subscription before B publishes.
-    wait_until("instance A subscribed", || bp_a.is_subscribed()).await;
+    wait_until("instance A connected to Redis", || bp_a.is_subscribed()).await;
 
     let recipient = identity_of(CLIENT_KEY).await;
     let room = format!("{recipient}-mpc_inbox");
     let (client, mut msg_rx) = connect_and_join(&url_a, &room).await;
 
-    // B broadcasts (as its HTTP /sendMessage handler would, post-gating).
+    // Directed routing: A subscribes to THIS room's channel only after the
+    // client joins. Wait for that confirmed subscription before B publishes
+    // (pub/sub has no replay; a pre-subscription publish would only hit the
+    // mailbox, which this test doesn't exercise).
+    wait_until("A subscribed to the room channel", || {
+        bp_a.is_room_active(&room)
+    })
+    .await;
+
+    // B broadcasts (as its HTTP /sendMessage handler would, post-gating). B does
+    // NOT own the room, so it is not subscribed to the room channel and never
+    // sees its own publish — directed routing, no fan-out to non-owners.
+    assert!(!bp_b.is_room_active(&room));
     let msg = room_message("m-cross-1", &recipient, "mpc_inbox");
     let delivered_on_b = ws_b
         .broadcast_to_room(&room, &format!("sendMessage-{room}"), &msg)
@@ -222,12 +237,14 @@ async fn own_origin_envelope_is_not_double_delivered() {
     let (_redis, url) = redis_container().await;
     let bp = Backplane::new(&url);
     let (url_a, ws_a) = boot_instance(SERVER_KEY_A, Some(bp.clone())).await;
-    // Subscribed BEFORE publishing, so the skip logic is actually exercised.
-    wait_until("subscribed", || bp.is_subscribed()).await;
+    wait_until("connected to Redis", || bp.is_subscribed()).await;
 
     let recipient = identity_of(CLIENT_KEY).await;
     let room = format!("{recipient}-mpc_inbox");
     let (client, mut msg_rx) = connect_and_join(&url_a, &room).await;
+    // Owner IS subscribed to its own room channel here, so the own-origin skip
+    // is actually exercised (the envelope round-trips back to this instance).
+    wait_until("subscribed to the room channel", || bp.is_room_active(&room)).await;
 
     let msg = room_message("m-self-1", &recipient, "mpc_inbox");
     let delivered = ws_a
@@ -275,8 +292,12 @@ async fn reconnect_to_another_instance_moves_delivery_ownership() {
     client_on_a.disconnect().await.expect("disconnect from A");
 
     // Reconnect to B: fresh BRC-103 handshake + re-join rebuilds the
-    // per-instance registry there.
+    // per-instance registry there, and B subscribes to the room channel.
     let (client_on_b, mut rx_b) = connect_and_join(&url_b, &room).await;
+    wait_until("B subscribed to the room channel", || {
+        bp_b.is_room_active(&room)
+    })
+    .await;
 
     // A message entering at A (which no longer owns any socket for the room).
     let msg = room_message("m-move-1", &recipient, "mpc_inbox");
@@ -308,7 +329,7 @@ async fn wire_carries_unsigned_room_message() {
     let client = redis::Client::open(url.as_str()).expect("redis client");
     let mut pubsub = client.get_async_pubsub().await.expect("pubsub");
     pubsub
-        .subscribe(messagebox_server::backplane::CHANNEL)
+        .subscribe(messagebox_server::backplane::room_channel("03cc-mpc_inbox"))
         .await
         .expect("subscribe");
 

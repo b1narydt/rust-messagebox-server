@@ -257,6 +257,30 @@ impl WsBroadcast {
         &self.ops
     }
 
+    /// Model B directed routing: a socket joined a room here → ensure this
+    /// instance is subscribed to the room's Redis channel. No-op in Model A.
+    fn route_join(&self, sid: &str, room_id: &str) {
+        if let Some(bp) = &self.backplane {
+            bp.on_room_join(sid, room_id);
+        }
+    }
+
+    /// A socket left a room here → drop the room subscription on the last local
+    /// member. No-op in Model A.
+    fn route_leave(&self, sid: &str, room_id: &str) {
+        if let Some(bp) = &self.backplane {
+            bp.on_room_leave(sid, room_id);
+        }
+    }
+
+    /// A socket disconnected → drop all of its room subscriptions. No-op in
+    /// Model A.
+    fn route_disconnect(&self, sid: &str) {
+        if let Some(bp) = &self.backplane {
+            bp.on_socket_disconnect(sid);
+        }
+    }
+
     /// Persist-pipeline counters (shared with the background worker).
     pub fn persist_stats(&self) -> Arc<crate::persist::PersistStats> {
         Arc::clone(self.persist.stats())
@@ -382,6 +406,7 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
         let core_msg = core.clone();
         let core_dc = core.clone();
         let ws = ws_broadcast.clone();
+        let ws_dc = ws_broadcast.clone();
 
         // --- authMessage (BRC-103 mutual auth + general message routing) ---
         socket.on(
@@ -433,9 +458,11 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
         socket.on_disconnect(
             move |socket: SocketRef, reason: socketioxide::socket::DisconnectReason| {
                 let core = core_dc.clone();
+                let ws = ws_dc.clone();
                 async move {
                     let sid = socket.id.to_string();
                     core.remove_connection(&sid);
+                    ws.route_disconnect(&sid);
                     info!(sid = %sid, reason = ?reason, "authsocket: client disconnected");
                 }
             },
@@ -540,6 +567,7 @@ async fn handle_verified_event(
                 return;
             }
             core.join_room(sid, &room_id);
+            ws.route_join(sid, &room_id);
             debug!(sid = %sid, room = %room_id, "authsocket: joined room");
             emit_signed_to_socket(
                 socket,
@@ -563,6 +591,7 @@ async fn handle_verified_event(
                 return;
             }
             core.leave_room(sid, &room_id);
+            ws.route_leave(sid, &room_id);
             debug!(sid = %sid, room = %room_id, "authsocket: left room");
             emit_signed_to_socket(
                 socket,
