@@ -512,9 +512,14 @@ async fn handle_verified_event(
             // Fail closed: no verified identity -> no join. (`ev.sender` is that
             // identity, but read it back from the server so the check can never
             // drift from what emit_to_room will trust.)
+            // Anchor on the `{identityKey}-` boundary, not a bare prefix: a
+            // bare starts_with(key) would authorize any room whose id merely
+            // begins with the key. 66-hex keys can't prefix one another today,
+            // but the delimiter check makes the own-room invariant robust (the
+            // CF-Rust reference enforces exactly this `{key}-` form).
             let owns_room = core
                 .identity_key(sid)
-                .is_some_and(|key| room_id.starts_with(&key));
+                .is_some_and(|key| room_id == key || room_id.starts_with(&format!("{key}-")));
             if !owns_room {
                 warn!(sid = %sid, room = %room_id,
                     "authsocket: joinRoom rejected — identity mismatch");

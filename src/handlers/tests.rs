@@ -35,6 +35,7 @@ fn test_config() -> Config {
         redis_url: None,
         max_connections: 0,
         drain_timeout_secs: 30,
+        parity_fees: false,
         message_box_fees: Vec::new(),
         message_box_fees_warnings: Vec::new(),
         enable_firebase: false,

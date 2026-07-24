@@ -20,6 +20,10 @@ pub async fn new(database_url: &str, max_connections: u32) -> Result<DbPool, sql
         .await
 }
 
+/// The embedded migration set. Kept as a named static so it can be introspected
+/// (see the in-place-upgrade guard test) as well as run.
+pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 pub async fn migrate(pool: &DbPool) -> Result<(), sqlx::migrate::MigrateError> {
-    sqlx::migrate!("./migrations").run(pool).await
+    MIGRATOR.run(pool).await
 }

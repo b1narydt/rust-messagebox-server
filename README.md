@@ -53,17 +53,16 @@ The server runs a Socket.IO layer (via `socketioxide`) for real-time message del
 SERVER_PRIVATE_KEY="<64-hex-private-key>" PORT=3322 cargo run --release --bin messagebox-server
 ```
 
-### Database: fresh deploys only
+### Database: migrations upgrade in place
 
-The migration chain was squashed to a single fresh-deploy baseline
-(`20260717000000_baseline_schema.sql`, design decision D2). **Point this server at
-an empty database.**
-
-Against a database that ran the older 4-migration chain, `sqlx` finds
-`_sqlx_migrations` rows whose versions no longer exist in the source and returns
-`VersionMissing`; `main()` treats that as fatal, so the process panics on every
-start (crash loop). There is no in-place upgrade path — drop and recreate the
-schema, or provision a new database.
+Migrations run automatically at boot (`sqlx::migrate!`), and the chain upgrades
+an existing database in place — no wipe required. The original incremental
+migrations are kept byte-identical so a database migrated by an earlier build
+validates its applied rows as no-ops, and the only schema deltas (the `messages`
+surrogate primary key and the reference-clean fee seed) land as a single additive
+forward migration (`20260718000000_messages_pk_and_fee_cleanup.sql`). Fresh
+deploys run the whole chain; existing deploys run only what's new. This matches
+the TS (knex) and Go (idempotent DDL) references, both of which upgrade in place.
 
 ## Environment variables
 

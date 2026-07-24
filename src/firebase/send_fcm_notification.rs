@@ -127,7 +127,7 @@ pub async fn send_fcm_notification(
                 body_text
             );
 
-            if should_deactivate(&body_text) {
+            if should_deactivate(status, &body_text) {
                 tracing::warn!(
                     "Deactivating device ...{} due to invalid FCM token",
                     token_tail
@@ -214,12 +214,49 @@ fn build_fcm_body(token: &str, payload: &FcmPayload) -> serde_json::Value {
 /// invalid and should be deactivated (§4.3: v1 API `NOT_FOUND` /
 /// `UNREGISTERED`, plus the legacy SDK strings
 /// `registration-token-not-registered` / `invalid-registration-token`).
-fn should_deactivate(response_body: &str) -> bool {
-    let upper = response_body.to_uppercase();
-    upper.contains("NOT_FOUND")
-        || upper.contains("UNREGISTERED")
-        || upper.contains("REGISTRATION-TOKEN-NOT-REGISTERED")
-        || upper.contains("INVALID-REGISTRATION-TOKEN")
+/// Decide whether an FCM error means the token is permanently invalid and the
+/// device row should be deactivated.
+///
+/// The old logic uppercased the whole body and substring-matched `NOT_FOUND` /
+/// `UNREGISTERED` on ANY non-2xx response, so an unrelated error whose text
+/// merely contained those words (a 5xx, a details string, a wrapped upstream
+/// error) would deactivate a still-valid token. The FCM v1 contract is precise:
+/// a permanently-invalid token is reported as **HTTP 404** with
+/// `error.status == "NOT_FOUND"` and/or `error.details[].errorCode ==
+/// "UNREGISTERED"`. We deactivate only on that, never on 5xx/UNAVAILABLE/
+/// INTERNAL/auth/quota errors. The narrow lowercase legacy-SDK token codes are
+/// kept as an unambiguous fallback (they are token-specific by construction).
+///
+/// This mirrors the TS reference (`registration-token-not-registered` /
+/// `invalid-registration-token`) and the Go reference (`IsUnregistered` /
+/// `IsInvalidArgument`), which both classify narrowly rather than by substring.
+fn should_deactivate(status: reqwest::StatusCode, response_body: &str) -> bool {
+    // Unambiguous legacy-SDK token codes: safe to honor without a status gate.
+    if response_body.contains("registration-token-not-registered")
+        || response_body.contains("invalid-registration-token")
+    {
+        return true;
+    }
+
+    // FCM v1: only a 404 can mean "token no longer registered".
+    if status != reqwest::StatusCode::NOT_FOUND {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(response_body) else {
+        // A 404 with an unparseable body: treat as invalid-token (the v1 API
+        // only 404s for an unknown token target).
+        return true;
+    };
+    if v["error"]["status"].as_str() == Some("NOT_FOUND") {
+        return true;
+    }
+    v["error"]["details"]
+        .as_array()
+        .is_some_and(|details| {
+            details
+                .iter()
+                .any(|d| d["errorCode"].as_str() == Some("UNREGISTERED"))
+        })
 }
 
 /// Show only the last 10 characters of an FCM token for log safety.
@@ -276,18 +313,43 @@ mod tests {
         assert_eq!(m["apns"]["payload"]["originator"], "02abc");
     }
 
-    /// §4.3 token lifecycle: v1 invalid-token signals deactivate; transient
-    /// errors do not.
+    /// §4.3 token lifecycle: only a 404 + a real invalid-token signal
+    /// deactivates; transient errors and body-substring coincidences do not.
     #[test]
     fn deactivation_signals() {
-        assert!(should_deactivate(r#"{"error":{"status":"NOT_FOUND"}}"#));
+        use reqwest::StatusCode;
+        let nf = StatusCode::NOT_FOUND;
+
+        // 404 + structured invalid-token signals → deactivate.
+        assert!(should_deactivate(nf, r#"{"error":{"status":"NOT_FOUND"}}"#));
         assert!(should_deactivate(
-            r#"{"error":{"details":[{"errorCode":"UNREGISTERED"}]}}"#
+            nf,
+            r#"{"error":{"status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}"#
         ));
-        assert!(should_deactivate("registration-token-not-registered"));
-        assert!(should_deactivate("invalid-registration-token"));
-        assert!(!should_deactivate(r#"{"error":{"status":"UNAVAILABLE"}}"#));
-        assert!(!should_deactivate(r#"{"error":{"status":"INTERNAL"}}"#));
+        // Legacy-SDK token codes: honored regardless of status.
+        assert!(should_deactivate(nf, "registration-token-not-registered"));
+        assert!(should_deactivate(
+            StatusCode::BAD_REQUEST,
+            "invalid-registration-token"
+        ));
+
+        // Transient / unrelated errors must NOT deactivate.
+        assert!(!should_deactivate(
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"error":{"status":"UNAVAILABLE"}}"#
+        ));
+        assert!(!should_deactivate(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"status":"INTERNAL"}}"#
+        ));
+        // The old false-positive: a non-404 body that merely mentions the words.
+        assert!(!should_deactivate(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"status":"INTERNAL","message":"upstream NOT_FOUND while reading config"}}"#
+        ));
+        // A 404 whose body does not carry a token signal still deactivates
+        // (the v1 API only 404s for an unknown token target).
+        assert!(should_deactivate(nf, "Not Found"));
     }
 
     #[test]

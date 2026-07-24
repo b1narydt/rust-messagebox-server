@@ -742,6 +742,32 @@ async fn test_baseline_messages_has_real_primary_key() {
     );
 }
 
+/// In-place-upgrade guard: the original incremental migrations must never be
+/// deleted/squashed again. Squashing them once left already-migrated DBs with
+/// applied `_sqlx_migrations` rows whose versions no longer existed in the
+/// source, so `Migrator::run` returned `VersionMissing` and the process
+/// crash-looped on boot. Keeping the originals byte-identical is what makes an
+/// existing DB validate them as no-ops and upgrade in place; this test fails if
+/// anyone removes one. (No DB needed — inspects the embedded migration set.)
+#[test]
+fn migration_chain_preserves_the_original_versions() {
+    let versions: std::collections::HashSet<i64> =
+        crate::db::MIGRATOR.iter().map(|m| m.version).collect();
+    for required in [
+        20260412120000i64, // initial_schema
+        20260413190000,    // tiered_messagebox_pricing
+        20260413200000,    // remove_peerpay_fees
+        20260413210000,    // zero_default_fees
+        20260718000000,    // messages_pk_and_fee_cleanup (the forward delta)
+    ] {
+        assert!(
+            versions.contains(&required),
+            "migration version {required} is missing — never squash/delete an \
+             applied migration; add forward migrations instead (VersionMissing crash-loop guard)"
+        );
+    }
+}
+
 /// Baseline seed is free delivery for every box (owner decision — deviates
 /// from the TS `notifications=10` seed): notifications=0, inbox=0,
 /// payment_inbox=0. Operators arm a fee per box via MESSAGEBOX_FEES (upserted

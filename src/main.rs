@@ -41,6 +41,30 @@ async fn main() {
         .expect("Failed to open database");
     db::migrate(&pool).await.expect("Failed to run migrations");
 
+    // Fee policy: free delivery by default; MESSAGEBOX_PARITY_FEES=true restores
+    // the reference (TS/Go/CF) pay-to-deliver economics for `notifications`.
+    // The flag drives both the recipient smart-default (in db::queries) and the
+    // server delivery-fee seed below. Set it before any fee lookup or cache prime.
+    db::queries::set_parity_fees(config.parity_fees);
+    if config.parity_fees {
+        // Seed the reference notifications delivery fee unless the operator set
+        // it explicitly via MESSAGEBOX_FEES (that override wins and is applied
+        // just below).
+        let overridden = config
+            .message_box_fees
+            .iter()
+            .any(|(b, _)| b == "notifications");
+        if !overridden {
+            if let Err(e) = db::queries::upsert_server_fee(&pool, "notifications", 10).await {
+                tracing::error!("failed to seed parity notifications delivery fee: {e}");
+            } else {
+                tracing::info!(
+                    "MESSAGEBOX_PARITY_FEES=true — seeded notifications delivery fee = 10 (reference parity)"
+                );
+            }
+        }
+    }
+
     // Apply operator fee overrides from MESSAGEBOX_FEES before the in-memory
     // cache is primed so the cache always reflects the latest values.
     if config.message_box_fees.is_empty() {

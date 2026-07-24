@@ -8,6 +8,21 @@ use super::DbPool;
 
 static DELIVERY_FEE_CACHE: OnceLock<HashMap<String, i64>> = OnceLock::new();
 
+/// Whether reference (TS/Go/CF) pay-to-deliver economics are enabled for the
+/// `notifications` box (`MESSAGEBOX_PARITY_FEES=true`). Set once at boot from
+/// [`crate::config::Config::parity_fees`]; defaults to `false` (free delivery).
+static PARITY_FEES: OnceLock<bool> = OnceLock::new();
+
+/// Set the parity-fees mode at boot (before the first recipient-fee lookup).
+/// Idempotent: only the first call sticks (OnceLock).
+pub fn set_parity_fees(enabled: bool) {
+    let _ = PARITY_FEES.set(enabled);
+}
+
+fn parity_fees_enabled() -> bool {
+    PARITY_FEES.get().copied().unwrap_or(false)
+}
+
 /// Upsert a `server_fees` row. Creates the row if it does not exist; overwrites
 /// `delivery_fee` if it does. Must be called before `init_delivery_fee_cache`
 /// so the in-memory cache reflects the operator-supplied value.
@@ -218,12 +233,18 @@ pub async fn get_server_delivery_fee(pool: &DbPool, message_box: &str) -> Result
     Ok(fee.unwrap_or(0))
 }
 
-/// Smart default recipient fee. Every box defaults to 0 — delivery is free
-/// out of the box (owner decision; deviates from the TS `notifications=10`
-/// default). A recipient who wants a fee sets it explicitly via
-/// `/permissions/set`; operators set a server delivery fee via MESSAGEBOX_FEES.
-fn smart_default_fee(_message_box: &str) -> i64 {
-    0
+/// Smart default recipient fee. Free (0) for every box by default — delivery
+/// is free out of the box (owner decision; deviates from the TS/Go/CF
+/// `notifications=10` default). With `MESSAGEBOX_PARITY_FEES=true` the
+/// `notifications` box returns the reference smart-default of 10, restoring
+/// byte-parity with the reference servers. A recipient who wants a fee on any
+/// box still sets it explicitly via `/permissions/set`.
+fn smart_default_fee(message_box: &str) -> i64 {
+    if parity_fees_enabled() && message_box == "notifications" {
+        10
+    } else {
+        0
+    }
 }
 
 /// Hierarchical recipient-fee lookup (single-query):

@@ -39,6 +39,13 @@ pub struct Config {
     /// `DRAIN_TIMEOUT_SECS` — per-phase bound on the SIGTERM graceful drain
     /// (in-flight send quiesce, persist-queue flush). Default 30.
     pub drain_timeout_secs: u64,
+    /// `MESSAGEBOX_PARITY_FEES=true` — restore the reference (TS/Go/CF) fee
+    /// economics: seed the `notifications` box at delivery fee 10 and use a
+    /// recipient smart-default of 10 for it. Default `false` = free delivery
+    /// for every box (owner decision — a deliberate deviation from the
+    /// reference, which is pay-to-deliver). `MESSAGEBOX_FEES` overrides still
+    /// win per box. Free by default, byte-parity on demand.
+    pub parity_fees: bool,
     /// Parsed from `MESSAGEBOX_FEES=chat=10,priority=100` — applied at boot.
     pub message_box_fees: Vec<(String, i64)>,
     /// Parse warnings from `MESSAGEBOX_FEES` — emitted after the logger is up.
@@ -141,6 +148,12 @@ impl Config {
         let (message_box_fees, message_box_fees_warnings) =
             parse_message_box_fees(&env::var("MESSAGEBOX_FEES").unwrap_or_default());
 
+        // Free delivery by default; opt into reference (TS/Go/CF) pay-to-deliver
+        // economics for `notifications` with MESSAGEBOX_PARITY_FEES=true.
+        let parity_fees = env::var("MESSAGEBOX_PARITY_FEES")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         // Firebase (§4.3): explicit ENABLE_FIREBASE=true, then project id +
         // one of the credential sources. Resolution happens in main().
         let enable_firebase = env::var("ENABLE_FIREBASE")
@@ -168,6 +181,7 @@ impl Config {
             redis_url,
             max_connections,
             drain_timeout_secs,
+            parity_fees,
             message_box_fees,
             message_box_fees_warnings,
             enable_firebase,
@@ -278,6 +292,7 @@ impl fmt::Debug for Config {
             .field("redis_url", &self.redis_url.as_deref().map(redact_db_url))
             .field("max_connections", &self.max_connections)
             .field("drain_timeout_secs", &self.drain_timeout_secs)
+            .field("parity_fees", &self.parity_fees)
             .field("message_box_fees", &self.message_box_fees)
             // message_box_fees_warnings are transient — omitted from Debug output.
             .field("enable_firebase", &self.enable_firebase)
@@ -321,6 +336,7 @@ mod tests {
             redis_url: None,
             max_connections: 0,
             drain_timeout_secs: 30,
+            parity_fees: false,
             message_box_fees: Vec::new(),
             message_box_fees_warnings: Vec::new(),
             enable_firebase: true,
