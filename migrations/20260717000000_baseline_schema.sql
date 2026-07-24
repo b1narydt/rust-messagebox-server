@@ -67,13 +67,14 @@ CREATE TABLE server_fees (
   UNIQUE KEY uq_server_fees_box (message_box)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- Out-of-box seed matches the TS server exactly (Phase-5 decision, parity
--- audit D3 follow-on): notifications=10, inbox=0, payment_inbox=0 — so
--- notifications are pay-to-deliver by default, like TS. Operators override
--- per box via the MESSAGEBOX_FEES env var (upserted at boot after
--- migrations, before the delivery-fee cache is primed). The smart-default
--- RECIPIENT fee for `notifications` (=10) lives in code and also matches TS.
+-- Out-of-box seed: every box is FREE to deliver (delivery_fee 0) — owner
+-- decision, a deliberate deviation from TS parity (which seeds notifications
+-- at 10; the earlier D3 decision followed TS). Delivery is a free competitive
+-- market, not a pay-to-send protocol; operators who want a fee set it per box
+-- via the MESSAGEBOX_FEES env var (upserted at boot after migrations, before
+-- the delivery-fee cache is primed). The smart-default RECIPIENT fee is 0 for
+-- every box too (see `smart_default_fee` in db::queries).
 INSERT INTO server_fees (message_box, delivery_fee) VALUES
-  ('notifications', 10),
+  ('notifications', 0),
   ('inbox', 0),
   ('payment_inbox', 0);

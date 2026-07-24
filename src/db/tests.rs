@@ -138,8 +138,8 @@ async fn test_get_server_delivery_fee_default() {
         .await
         .unwrap();
     assert_eq!(
-        fee, 10,
-        "notifications default delivery fee is 10 — TS parity (D3); override via MESSAGEBOX_FEES"
+        fee, 0,
+        "delivery is free out of the box for every box (owner decision); arm via MESSAGEBOX_FEES"
     );
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
@@ -194,7 +194,7 @@ async fn test_get_recipient_fee_auto_create_default() {
     let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "notifications")
         .await
         .unwrap();
-    assert_eq!(fee, 10, "notifications box smart default should be 10");
+    assert_eq!(fee, 0, "every box smart-defaults to a 0 recipient fee (free delivery)");
 
     let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
         .await
@@ -319,14 +319,15 @@ async fn test_list_permissions_with_pagination() {
 async fn test_delivery_fee_cache() {
     let pool = fresh_pool().await;
     // After init_delivery_fee_cache (called in fresh_pool), fees come from the
-    // cache. The baseline seed matches TS (D3): notifications=10, others 0;
-    // operators override via MESSAGEBOX_FEES (applied before cache priming).
+    // cache. The baseline seed is 0 for every box (free delivery — owner
+    // decision); operators arm a fee via MESSAGEBOX_FEES (applied before cache
+    // priming).
     let fee = get_server_delivery_fee(&pool, "notifications")
         .await
         .unwrap();
     assert_eq!(
-        fee, 10,
-        "notifications delivery fee is 10 out of the box (TS parity)"
+        fee, 0,
+        "notifications delivery fee is 0 out of the box (free delivery)"
     );
 
     let fee = get_server_delivery_fee(&pool, "inbox").await.unwrap();
@@ -741,9 +742,10 @@ async fn test_baseline_messages_has_real_primary_key() {
     );
 }
 
-/// Baseline seed matches the TS server exactly (Phase-5 D3 decision):
-/// notifications=10, inbox=0, payment_inbox=0. Operators override per box
-/// via MESSAGEBOX_FEES (upserted at boot before the cache is primed).
+/// Baseline seed is free delivery for every box (owner decision — deviates
+/// from the TS `notifications=10` seed): notifications=0, inbox=0,
+/// payment_inbox=0. Operators arm a fee per box via MESSAGEBOX_FEES (upserted
+/// at boot before the cache is primed).
 #[tokio::test]
 async fn test_baseline_server_fees_seed() {
     let pool = fresh_pool().await;
@@ -756,9 +758,9 @@ async fn test_baseline_server_fees_seed() {
         rows,
         vec![
             ("inbox".to_string(), 0),
-            ("notifications".to_string(), 10),
+            ("notifications".to_string(), 0),
             ("payment_inbox".to_string(), 0),
         ],
-        "baseline seed must match the TS seed: notifications=10, inbox=0, payment_inbox=0"
+        "baseline seed is free delivery for every box: notifications=0, inbox=0, payment_inbox=0"
     );
 }

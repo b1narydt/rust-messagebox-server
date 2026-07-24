@@ -7,10 +7,11 @@
 //! - The primary MPC delivery path — WS `sendMessage` (`ws.rs`) — carries no
 //!   fee/permission/payment check at all, so any `blocked`/`fee` row here can
 //!   be bypassed by sending over WS.
-//! - `inbox` and `payment_inbox` seed at fee 0 and every in-stack caller sends
-//!   with `check_permissions: false`. Note `notifications` is the exception:
-//!   the baseline migration seeds it at 10 sats for TS parity, so HTTP sends
-//!   to that box DO require payment (operators zero it via `MESSAGEBOX_FEES`).
+//! - All boxes seed at delivery fee 0 (owner decision — free delivery, a
+//!   deviation from the TS `notifications=10` default), and every in-stack
+//!   caller sends with `check_permissions: false`. Operators can arm a fee per
+//!   box via `MESSAGEBOX_FEES`, at which point HTTP sends to that box require
+//!   payment (the WS path still bypasses it).
 //!
 //! Do not build authorization or monetization on this plane without new work
 //! (see the mbs-enterprise-production design; owner decision O1 keeps it).

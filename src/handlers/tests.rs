@@ -677,10 +677,11 @@ async fn test_get_quote_missing_params() {
 // ===========================================================================
 // Payment-path tests (parity audit H3/H4 — TS status codes + error codes)
 //
-// The `notifications` box carries the TS-parity delivery fee of 10 sats out
-// of the box (baseline seed, D3), which is what arms the payment plane here.
-// A stub WalletInterface pins the internalize outcomes (accepted / rejected /
-// exception) without a remote storage backend.
+// All seeded boxes are free by default, so `setup_app_with_wallet` arms
+// `PAYABLE_BOX` with a per-test delivery fee to exercise the payment plane
+// (H3/H4 are all gated on `delivery_fee > 0`). A stub WalletInterface pins the
+// internalize outcomes (accepted / rejected / exception) without a remote
+// storage backend.
 // ===========================================================================
 
 mod stub_wallet {
@@ -896,10 +897,22 @@ mod stub_wallet {
 }
 
 /// App with a stubbed funded wallet (payment-path tests).
+/// The payable box the payment-path tests use. NOT one of the seeded boxes
+/// (all of which are free), so its fee is armed per-test in the DB below; the
+/// delivery-fee cache misses it and falls through to that live value. Kept off
+/// `notifications` on purpose so the FCM path stays out of these tests.
+const PAYABLE_BOX: &str = "priority";
+
 async fn setup_app_with_wallet(
     wallet: Arc<dyn bsv::wallet::interfaces::WalletInterface>,
 ) -> Router {
     let pool = fresh_pool().await;
+    // Arm the payment plane: give PAYABLE_BOX a nonzero server delivery fee so
+    // the H3/H4 payment paths (all gated on `delivery_fee > 0`) are exercised.
+    // Defaults stay free — this is a per-test override, not the seed.
+    crate::db::queries::upsert_server_fee(&pool, PAYABLE_BOX, 10)
+        .await
+        .expect("arm payable-box delivery fee");
     let (_sio_layer, io) = socketioxide::SocketIo::new_layer();
     io.ns("/", |_: socketioxide::extract::SocketRef| {});
     let ws_broadcast = crate::ws::WsBroadcast::new(
@@ -943,11 +956,11 @@ fn valid_payment() -> Value {
     })
 }
 
-fn notifications_send_body(message_id: &str, payment: Option<Value>) -> Value {
+fn payable_send_body(message_id: &str, payment: Option<Value>) -> Value {
     let mut body = json!({
         "message": {
             "recipient": RECIPIENT_KEY,
-            "messageBox": "notifications",
+            "messageBox": PAYABLE_BOX,
             "messageId": message_id,
             "body": "pay-to-deliver"
         }
@@ -966,7 +979,7 @@ async fn test_send_payable_without_payment_is_missing_payment_tx() {
     )))
     .await;
     let (status, body) =
-        post_json(&app, "/sendMessage", notifications_send_body("pay-1", None)).await;
+        post_json(&app, "/sendMessage", payable_send_body("pay-1", None)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MISSING_PAYMENT_TX");
 }
@@ -982,7 +995,7 @@ async fn test_send_payment_empty_outputs_is_missing_delivery_output() {
     let (status, body) = post_json(
         &app,
         "/sendMessage",
-        notifications_send_body("pay-2", Some(json!({"tx": [1, 2, 3], "outputs": []}))),
+        payable_send_body("pay-2", Some(json!({"tx": [1, 2, 3], "outputs": []}))),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1000,7 +1013,7 @@ async fn test_send_payment_not_accepted_is_insufficient_payment_400() {
     let (status, body) = post_json(
         &app,
         "/sendMessage",
-        notifications_send_body("pay-3", Some(valid_payment())),
+        payable_send_body("pay-3", Some(valid_payment())),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1018,7 +1031,7 @@ async fn test_send_payment_internalize_exception_is_500_internalize_failed() {
     let (status, body) = post_json(
         &app,
         "/sendMessage",
-        notifications_send_body("pay-4", Some(valid_payment())),
+        payable_send_body("pay-4", Some(valid_payment())),
     )
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1035,7 +1048,7 @@ async fn test_send_payment_accepted_succeeds() {
     let (status, body) = post_json(
         &app,
         "/sendMessage",
-        notifications_send_body("pay-5", Some(valid_payment())),
+        payable_send_body("pay-5", Some(valid_payment())),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "body: {body}");

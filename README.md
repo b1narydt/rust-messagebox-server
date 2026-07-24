@@ -36,7 +36,7 @@ Pre-auth (like TS): `GET /docs` (Swagger UI) and `GET /openapi.json`.
 
 Messages stored to the magic box name **`notifications`** additionally trigger a Firebase Cloud Messaging (v1) push to every **active** device the recipient registered via `/registerDevice` — best-effort, after the send, never failing it. The visible notification is `title: "New Message"`, `body: <messageId>` (content stays E2E-encrypted; the ID lets the app fetch it). Delivery success bumps the device's `lastUsed`; an FCM invalid-token response (`NOT_FOUND`/`UNREGISTERED`) deactivates the device. Enablement is explicit: `ENABLE_FIREBASE=true` + `FIREBASE_PROJECT_ID` + one credential source (see env vars). The service-account key material is **never logged** (upstream TS logs its first 100 chars at init — deliberately not reproduced).
 
-`notifications` is also pay-to-deliver out of the box, matching TS: delivery fee 10 sats (seeded, overridable via `MESSAGEBOX_FEES`) plus the smart-default recipient fee of 10.
+Delivery is **free out of the box** for every box, `notifications` included (delivery fee 0, smart-default recipient fee 0). This is a deliberate deviation from the TS server, which seeds `notifications` at 10 sats. An operator who wants a fee arms it per box via `MESSAGEBOX_FEES` (e.g. `MESSAGEBOX_FEES=notifications=10`).
 
 ## WebSocket (Socket.IO)
 
@@ -81,7 +81,7 @@ schema, or provision a new database.
 | `REDIS_URL` | *(none)* | Unset → **Model A** (single instance, in-process routing — the default). Set → **Model B**: Redis pub/sub backplane for cross-instance live push; run N replicas behind a **sticky** LB. See below. |
 | `MAX_CONNECTIONS` | `0` (unlimited) | Per-instance WebSocket connection ceiling (admission control). Past it, NEW connections get `503` + `Retry-After` (Model B: the LB sheds to another instance; Model A: the client retries). In-flight sessions are never affected. |
 | `DRAIN_TIMEOUT_SECS` | `30` | Per-phase bound on the SIGTERM graceful drain (in-flight send quiesce, persist-queue flush). |
-| `MESSAGEBOX_FEES` | *(none)* | Operator per-box delivery-fee overrides, `box=sats` comma-separated (e.g. `notifications=0,priority=100`). Upserted at boot **before** the fee cache is primed. Out-of-box seed matches TS: `notifications=10`, `inbox=0`, `payment_inbox=0`. |
+| `MESSAGEBOX_FEES` | *(none)* | Operator per-box delivery-fee overrides, `box=sats` comma-separated (e.g. `notifications=10,priority=100`). Upserted at boot **before** the fee cache is primed. Out-of-box seed is free delivery for every box: `notifications=0`, `inbox=0`, `payment_inbox=0` (deviates from TS, which seeds `notifications=10`). |
 | `ENABLE_FIREBASE` | `false` | Explicit opt-in for FCM push notifications (must be exactly `true`, TS parity). |
 | `FIREBASE_PROJECT_ID` | *(none)* | Firebase project id — required when Firebase is enabled. |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | *(none)* | Service-account key JSON (inline). SECRET — never logged or Debug-printed. |

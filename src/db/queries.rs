@@ -200,8 +200,14 @@ pub async fn acknowledge_messages(
 // ---------------------------------------------------------------------------
 
 pub async fn get_server_delivery_fee(pool: &DbPool, message_box: &str) -> Result<i64, sqlx::Error> {
+    // The cache is a boot-time snapshot of every configured box. A hit is
+    // authoritative; a miss means the box was not configured at boot, so fall
+    // through to a live lookup rather than assuming 0 (correct if a fee was
+    // added out-of-band, and what lets tests arm a fee on a non-seeded box).
     if let Some(cache) = DELIVERY_FEE_CACHE.get() {
-        return Ok(cache.get(message_box).copied().unwrap_or(0));
+        if let Some(fee) = cache.get(message_box) {
+            return Ok(*fee);
+        }
     }
 
     let fee: Option<i64> =
@@ -212,13 +218,12 @@ pub async fn get_server_delivery_fee(pool: &DbPool, message_box: &str) -> Result
     Ok(fee.unwrap_or(0))
 }
 
-/// Smart default fee: notifications=10, everything else=0.
-fn smart_default_fee(message_box: &str) -> i64 {
-    if message_box == "notifications" {
-        10
-    } else {
-        0
-    }
+/// Smart default recipient fee. Every box defaults to 0 — delivery is free
+/// out of the box (owner decision; deviates from the TS `notifications=10`
+/// default). A recipient who wants a fee sets it explicitly via
+/// `/permissions/set`; operators set a server delivery fee via MESSAGEBOX_FEES.
+fn smart_default_fee(_message_box: &str) -> i64 {
+    0
 }
 
 /// Hierarchical recipient-fee lookup (single-query):
