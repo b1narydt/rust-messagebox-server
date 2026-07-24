@@ -82,6 +82,9 @@ the TS (knex) and Go (idempotent DDL) references, both of which upgrade in place
 | `DRAIN_TIMEOUT_SECS` | `30` | Per-phase bound on the SIGTERM graceful drain (in-flight send quiesce, persist-queue flush). |
 | `OPS_BIND` | `127.0.0.1:9091` | Private listener for `/metrics` + `/health/ready` — kept off the public port so an internet-facing deploy never exposes operational counts or the dependency-health probe. Prometheus/orchestrator scrape it over the internal network. Set `0.0.0.0:<port>` to publish deliberately. |
 | `CORS_ALLOWED_ORIGINS` | *(none → permissive)* | Comma-separated browser-origin allowlist (e.g. `https://app.example.com`). Unset keeps the permissive default (safe: auth is BRC-103 request-signature based, no cookies). Set to lock the browser origin down. |
+| `RATE_LIMIT_RPS` | `50` | Per-client-IP sustained request rate on the public listener (protects the unauthenticated BRC-103 handshake). `0` disables rate limiting. |
+| `RATE_LIMIT_BURST` | `2×RPS` | Per-IP burst allowance. |
+| `TRUSTED_CLIENT_IP_HEADER` | `cf-connecting-ip` | Header carrying the real client IP, set by a **trusted** proxy (Cloudflare here). Only trust it if the origin is reachable **solely** through that proxy — otherwise a client could spoof it. Set empty to key rate limiting on the raw socket peer IP instead. |
 | `MESSAGEBOX_FEES` | *(none)* | Operator per-box delivery-fee overrides, `box=sats` comma-separated (e.g. `notifications=10,priority=100`). Upserted at boot **before** the fee cache is primed. Out-of-box seed is free delivery for every box. |
 | `MESSAGEBOX_PARITY_FEES` | `false` | `true` restores the reference (TS/Go/CF) pay-to-deliver economics for `notifications` (delivery 10 + recipient smart-default 10) in one flag. Free delivery by default; byte-parity on demand. `MESSAGEBOX_FEES` overrides still win per box. |
 | `ENABLE_FIREBASE` | `false` | Explicit opt-in for FCM push notifications (must be exactly `true`, TS parity). |

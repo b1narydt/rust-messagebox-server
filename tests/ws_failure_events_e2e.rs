@@ -53,7 +53,14 @@ async fn identity_of(key_hex: &str) -> String {
 /// Boot one MBS WS stack exactly like `main.rs` (Model A, no backplane).
 async fn boot_instance() -> (String, WsBroadcast) {
     let (layer, io) = socketioxide::SocketIo::new_layer();
+    // Lazy, deliberately-unreachable pool: the WS sendMessage path does one
+    // permissions read (recipient-block check) that errors fast here, so this
+    // also proves the fail-open behavior — live delivery survives a
+    // permissions-DB outage (durability is the async persist; the HTTP/mailbox
+    // path enforces blocks authoritatively). Short acquire timeout so the
+    // fail-open path resolves well inside the test's delivery deadline.
     let pool = sqlx::mysql::MySqlPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(200))
         .connect_lazy("mysql://unused@127.0.0.1/unused")
         .expect("lazy pool");
     let ws = WsBroadcast::new(

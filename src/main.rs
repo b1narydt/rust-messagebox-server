@@ -451,14 +451,43 @@ async fn main() {
         },
     );
 
+    // Per-IP rate limiting (outermost application concern, inside CORS so
+    // preflights are still answered). Protects the unauthenticated BRC-103
+    // handshake and the public routes. Disabled with RATE_LIMIT_RPS=0.
+    let rate_limiter = messagebox_server::ratelimit::Limiter::from_env();
+    if let Some(rl) = &rate_limiter {
+        rl.spawn_gc();
+    }
+
     let app = if prefix.is_empty() {
         Router::new().merge(public_routes).merge(api_routes)
     } else {
         Router::new().merge(public_routes).nest(&prefix, api_routes)
     }
     .layer(sio_layer)
-    .layer(admission)
-    .layer(cors);
+    .layer(admission);
+
+    let app = if let Some(rl) = rate_limiter {
+        app.layer(axum::middleware::from_fn(
+            move |req: axum::extract::Request, next: axum::middleware::Next| {
+                let rl = rl.clone();
+                async move {
+                    let peer = req
+                        .extensions()
+                        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                        .map(|ci| ci.0.ip());
+                    match rl.check(req.headers(), peer) {
+                        Ok(()) => next.run(req).await,
+                        Err(resp) => resp,
+                    }
+                }
+            },
+        ))
+    } else {
+        app
+    };
+
+    let app = app.layer(cors);
 
     // Private ops listener (Prometheus + readiness). Bind failure is non-fatal:
     // the main server still serves; only /metrics + /health/ready are then
@@ -500,13 +529,16 @@ async fn main() {
     let drain_ops = ops.clone();
     let drain_ws = ws_broadcast.clone();
     let drain_io = io.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            messagebox_server::ops::drain(&drain_ops, &drain_ws, &drain_io, drain_timeout).await;
-        })
-        .await
-        .expect("Server error");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        messagebox_server::ops::drain(&drain_ops, &drain_ws, &drain_io, drain_timeout).await;
+    })
+    .await
+    .expect("Server error");
 
     tracing::info!("Server shut down gracefully");
 }

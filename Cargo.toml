@@ -54,6 +54,10 @@ sha2 = "0.10"
 redis = { version = "1.4.1", default-features = false, features = ["tokio-comp", "tls-rustls", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
 futures-util = "0.3.32"
 
+# Per-IP HTTP rate limiting (keyed token-bucket) — the algorithm library; the
+# axum middleware + trusted-proxy IP extraction live in src/ratelimit.rs.
+governor = "0.10"
+
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 hyper = { version = "1", features = ["full"] }

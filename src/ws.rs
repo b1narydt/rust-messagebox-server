@@ -99,6 +99,10 @@ pub struct WsBroadcast {
     /// and then hand the INSERT to this worker so MySQL latency never blocks
     /// live delivery. See [`crate::persist`].
     persist: crate::persist::PersistHandle,
+    /// Shared MySQL pool — used by the WS `sendMessage` path to enforce the
+    /// same recipient-block rule the HTTP path enforces (a blocked sender must
+    /// not be able to route around the block over WebSocket).
+    db: DbPool,
     /// Model B backplane (`REDIS_URL` set) — `None` means Model A: single
     /// instance, in-process routing only. See [`crate::backplane`].
     backplane: Option<Arc<crate::backplane::Backplane>>,
@@ -129,6 +133,7 @@ impl WsBroadcast {
             core: Arc::new(AuthSocketServer::new()),
             server_private_key_hex,
             persist,
+            db,
             backplane,
             ops,
         };
@@ -736,6 +741,25 @@ async fn handle_ws_send_message(
             return;
         }
     };
+
+    // Recipient-block enforcement (parity with the HTTP path): a recipient can
+    // block a sender (recipient_fee == -1). The WS path honors it too, so a
+    // blocked sender can't route around the block over WebSocket. On a DB error
+    // we fail OPEN — the live-push path is best-effort by design (durability is
+    // the async MySQL persist; the HTTP/mailbox path enforces blocks
+    // authoritatively), so a permissions-lookup blip must not drop a live MPC
+    // message. Blocks are enforced whenever the permissions store is reachable.
+    match crate::db::queries::get_recipient_fee(&ws.db, &recipient, sender, &message_box).await {
+        Ok(-1) => {
+            warn!(sid = %sid, "BRC-103 sendMessage: recipient has blocked the sender — rejected");
+            message_failed(socket, ws, "Delivery blocked by recipient").await;
+            return;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            warn!(sid = %sid, error = %e, "BRC-103 sendMessage: recipient-block lookup failed — delivering live (blocks stay enforced on the HTTP/mailbox path)");
+        }
+    }
 
     let ack_event = format!("sendMessageAck-{room_id_str}");
 

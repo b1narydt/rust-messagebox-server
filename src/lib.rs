@@ -9,6 +9,7 @@ pub mod logger;
 pub mod metrics;
 pub mod ops;
 pub mod persist;
+pub mod ratelimit;
 pub mod ws;
 
 #[cfg(test)]

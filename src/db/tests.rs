@@ -186,6 +186,21 @@ async fn test_get_recipient_fee_box_wide_fallback() {
     assert_eq!(fee, 25, "should fall back to box-wide fee");
 }
 
+/// A recipient blocks a sender by setting recipient_fee = -1; get_recipient_fee
+/// must surface exactly -1 so both the HTTP and WS send paths can fail-closed on
+/// it (the block sentinel both `send_message.rs` and `ws.rs` depend on).
+#[tokio::test]
+async fn test_blocked_recipient_fee_is_minus_one() {
+    let pool = fresh_pool().await;
+    set_message_permission(&pool, TEST_KEY, Some(TEST_KEY2), "inbox", -1)
+        .await
+        .unwrap();
+    let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
+        .await
+        .unwrap();
+    assert_eq!(fee, -1, "a blocked (recipient_fee=-1) permission must surface as -1");
+}
+
 #[tokio::test]
 async fn test_get_recipient_fee_auto_create_default() {
     let pool = fresh_pool().await;
