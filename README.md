@@ -6,11 +6,19 @@ Built with axum + socketioxide.
 
 ## What it does
 
-The MessageBox server is the central communication hub for the MPC system. Parties never connect directly to each other -- all protocol messages flow through this server:
+A general-purpose, authenticated store-and-forward message relay between BSV
+identities. Senders address messages to a recipient's identity key, tagged with
+a named message box; recipients read them from the durable mailbox or receive
+them in real time over WebSocket. Every party authenticates cryptographically —
+there is no unauthenticated surface on the API.
 
-- **Store messages** -- parties send messages addressed to other parties' identity keys, tagged with a message box name.
-- **Route messages** -- recipients poll for messages or receive them in real time via WebSocket.
-- **Authenticate** -- every HTTP request is verified via BRC-104 mutual auth. WebSocket connections perform the BRC-103 handshake on connect.
+- **Store messages** — messages addressed to a recipient identity key are held
+  durably in MySQL, tagged with a message-box name.
+- **Route messages** — recipients read via HTTP (`/listMessages`) or receive a
+  signed live push over WebSocket the moment a message lands.
+- **Authenticate** — every HTTP request is verified via BRC-104 mutual auth;
+  WebSocket connections perform the BRC-103 handshake on connect, and every
+  server→client push is signed.
 
 ## API routes
 
@@ -43,9 +51,11 @@ Delivery is **free out of the box** for every box, `notifications` included (del
 The server runs a Socket.IO layer (via `socketioxide`) for real-time message delivery:
 
 - Clients connect and perform BRC-103 authentication using `bsv-sdk` Peer.
-- On successful auth, the server associates the socket with the client's identity key.
-- When a message is sent via HTTP, the server pushes it to the recipient's WebSocket if connected.
-- The `ws` module handles connection, authentication, and broadcast.
+- On successful auth, the server associates the socket with the **verified** identity key (client-claimed keys are ignored).
+- `authMessage` is the only inbound event; app verbs (`joinRoom`, `leaveRoom`, `sendMessage`) arrive as BRC-103-signed general messages. A client may join only its own `{identityKey}-{box}` rooms.
+- A message sent via HTTP **or** the WS `sendMessage` verb is pushed as a **signed** frame to the recipient's room members if connected; every server→client event (acks, deliveries, and the `authenticationFailed`/`joinFailed`/`leaveFailed`/`messageFailed` failure events) is signed.
+- **Recipient blocks are enforced on the WS path too** (parity with HTTP): a sender the recipient has blocked (`recipient_fee == -1`) gets a signed `messageFailed` and no delivery. It fails **closed** on a permissions-DB error — a blocked message is never delivered or persisted on an unverified check.
+- The `ws` module handles connection, authentication, room membership, and signed broadcast.
 
 ## Running
 
@@ -63,6 +73,37 @@ surrogate primary key and the reference-clean fee seed) land as a single additiv
 forward migration (`20260718000000_messages_pk_and_fee_cleanup.sql`). Fresh
 deploys run the whole chain; existing deploys run only what's new. This matches
 the TS (knex) and Go (idempotent DDL) references, both of which upgrade in place.
+
+### Deploy (Docker)
+
+A multi-stage `Dockerfile` builds a release binary on `rust:1-bookworm` and ships
+it on `debian:bookworm-slim` (only `ca-certificates`; TLS is in-process via
+rustls). The build embeds `openapi.json` via `include_str!`, so it is copied into
+the build context alongside `src/` and `migrations/`. Minimum config to boot:
+`SERVER_PRIVATE_KEY` + a MySQL `DATABASE_URL`; the container listens on `$PORT`
+and runs migrations on start.
+
+**Model B (horizontal scale)** additionally needs:
+
+- `REDIS_URL` pointing at **Redis 6+** — RESP3 is required for the directed
+  routing; against Redis < 6 the backplane logs `error!` and readiness reports
+  `redis: "unsupported"`.
+- **N replicas behind a sticky WebSocket LB.** A socket must stay pinned to the
+  instance that owns its room; without stickiness the engine.io handshake can
+  bounce between instances and auth fails.
+- All instances share the **same `SERVER_PRIVATE_KEY`** (they sign as one server
+  identity) and the **same MySQL**.
+
+**Observability:** `/metrics` + `/health/ready` bind to the private `OPS_BIND`
+(loopback by default). Scrape them over the internal network, or set
+`OPS_BIND=0.0.0.0:<port>` and expose that port to your scraper. The slim runtime
+image has no shell tools (no `curl`), so scrape from a sidecar/agent rather than
+exec-ing into the container.
+
+**Behind a proxy/CDN:** set `TRUSTED_CLIENT_IP_HEADER` to the header your proxy
+sets (default `cf-connecting-ip`) so per-IP rate limiting keys on the real client
+IP — and only when the origin is reachable **solely** through that proxy (else the
+header is spoofable; set it empty to key on the socket peer instead).
 
 ## Environment variables
 
@@ -151,7 +192,7 @@ Split across two listeners (see `OPS_BIND`). Everything here is pre-auth and nev
 
 **Admission control** (`MAX_CONNECTIONS`): gates only *new* WS handshakes
 (engine.io requests without a `sid`). Established sessions, all API routes,
-and the ops endpoints are never gated — an in-flight ceremony's sends are
+and the ops endpoints are never gated — an in-flight session's sends are
 never nacked by capacity pressure. Rejections are `503` + `Retry-After: 5`
 with `ERR_SERVER_AT_CAPACITY` / `ERR_SERVER_DRAINING`.
 
@@ -201,7 +242,8 @@ they correct TS bugs or add enterprise behavior the client is agnostic to
 7. **Enterprise config & ops.** Delivery-fee in-memory cache (fees read at
    boot; restart or `MESSAGEBOX_FEES` to change), 10 MB body cap (vs TS's
    1 GB), saner port/env handling, plus the whole ops surface below
-   (health/readiness, metrics, admission control, graceful drain, Model B).
+   (health/readiness, private-port metrics, admission control, graceful drain,
+   per-IP rate limiting, Model B directed routing).
 
 One **contract pin** where TS disagrees with itself: `/permissions/list`
 rows are snake_case and the `message_box` filter param is accepted, because
@@ -243,7 +285,7 @@ Incoming WebSocket (Socket.IO)
 | `db` | MySQL (InnoDB) database: connection pool, migrations, queries |
 | `handlers` | HTTP handlers: send, list, acknowledge, devices, permissions |
 | `firebase` | FCM v1 push delivery + service-account OAuth2 (explicit `ENABLE_FIREBASE` opt-in; key material never logged) |
-| `docs` | `GET /docs` (Swagger UI) + `GET /openapi.json` (static OpenAPI 3.0 spec) |
+| `docs` | `GET /docs` (Swagger UI, pinned version + SRI + CSP) + `GET /openapi.json` (OpenAPI 3.0 with a BRC-103 security scheme and `servers[]` injected from `ROUTING_PREFIX`) |
 | `ws` | MessageBox app layer over the shared `authsocket` crate (BRC-103 sessions, rooms, signed broadcast, TS-parity failure events) |
 | `backplane` | Model B Redis pub/sub backplane: unsigned cross-instance envelopes, sign-on-owner delivery, degrade-don't-fail |
 | `ops` | Operational floor: admission control (connection ceiling), structured liveness/readiness, graceful drain |
