@@ -27,7 +27,7 @@ All routes require BRC-104 authentication (via `AuthLayer`). The authenticated c
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/sendMessage` | Send a message to a recipient's message box |
-| `POST` | `/listMessages` | List messages in a message box (supports `messageBox` filter) |
+| `POST` | `/listMessages` | List messages in a message box (`messageBox` is **required**; unknown box returns an empty list) |
 | `POST` | `/acknowledgeMessage` | Acknowledge (delete) messages by ID |
 | `POST` | `/registerDevice` | Register an FCM device token for push notifications (upsert on token) |
 | `GET` | `/devices` | List the caller's registered devices (token masked to last 10 chars) |
@@ -132,6 +132,10 @@ header is spoofable; set it empty to key on the socket peer instead).
 | `FIREBASE_PROJECT_ID` | *(none)* | Firebase project id — required when Firebase is enabled. |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | *(none)* | Service-account key JSON (inline). SECRET — never logged or Debug-printed. |
 | `FIREBASE_SERVICE_ACCOUNT_PATH` | *(none)* | Path to the service-account key file (alternative to the inline JSON). |
+| `WALLET_STORAGE_URL` | `https://storage.babbage.systems` | Wallet storage backend used to internalize BRC-29 delivery-fee payments. Only load-bearing once a box charges a fee. |
+| `REQUEST_TIMEOUT_SECS` | `30` | Per-request timeout on the API routes (not applied to `GET /` or `/health/live`). |
+| `MAX_BODY_BYTES` | `10485760` (10 MiB) | Max request body on the API routes. |
+| `LOG_FORMAT` | *(text)* | Set to `json` for structured JSON logs; anything else keeps human-readable text. Level comes from `RUST_LOG` (default `debug` in development, `info` in production). |
 
 ## Topology: Model A / Model B
 
@@ -252,10 +256,13 @@ that is what `@bsv/message-box-client` 2.1.0 actually sends/reads — the TS
 filter is silently dead against it). Parity is pinned to the client;
 `messageBox` is also accepted.
 
-Also carried as a **compat surface, not a control**: the fee/permission
-plane (`/permissions/*`, payments) matches TS wire-for-wire, but the WS
-`sendMessage` path bypasses it on **both** implementations — do not build
-authorization or monetization on it without new work (see
+Also carried as a **compat surface, not a general control**: the
+fee/permission plane (`/permissions/*`, payments) matches TS wire-for-wire,
+but only the **fee/payment** half is HTTP-only — the WS `sendMessage` path
+carries no fee gate on either implementation, so a `recipient_fee > 0` row
+is satisfied on HTTP and free over WS. Do not build monetization on it
+without new work. **Recipient blocks (`recipient_fee == -1`) are the
+exception and are enforced on both paths** (see above, and
 `handlers/permissions.rs` module docs).
 
 ## Auth stack

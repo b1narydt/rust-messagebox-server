@@ -12,9 +12,13 @@
 //!   [`crate::backplane::Backplane`] counters, socket counts) — so there is
 //!   exactly one source of truth per number and no double bookkeeping.
 //!
-//! The `GET /metrics` endpoint (wired in `main.rs`) is **unauthenticated**,
-//! like `GET /`: it exposes operational counts only (no identities, no
-//! message data, no key material). Bind it to a scrape network in production.
+//! The `GET /metrics` endpoint (wired in `main.rs`) carries no authentication
+//! — it exposes operational counts only (no identities, no message data, no
+//! key material). It is **network-gated instead**: together with
+//! `/health/ready` it is served on a private ops listener bound to `OPS_BIND`
+//! (default `127.0.0.1:9091`), never on the public port, so it is not part of
+//! the internet-facing surface. Set `OPS_BIND=0.0.0.0:<port>` only when the
+//! scrape network requires it.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;

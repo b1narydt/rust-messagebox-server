@@ -2,16 +2,22 @@
 //! upstream `@bsv` message-box-server (deliberate product contract: MBS is a
 //! drop-in-compatible open-source messagebox).
 //!
-//! This is a COMPAT SURFACE, NOT an enforced ACL. Two realities a reader must
-//! not mistake for a live access control:
-//! - The primary MPC delivery path — WS `sendMessage` (`ws.rs`) — carries no
-//!   fee/permission/payment check at all, so any `blocked`/`fee` row here can
-//!   be bypassed by sending over WS.
+//! This is a COMPAT SURFACE for the FEE plane, NOT a general enforced ACL.
+//! Three realities a reader must not mistake for a live access control:
+//! - **Blocks ARE enforced on both paths.** A `recipient_fee == -1` row is
+//!   honored by HTTP `sendMessage` and by WS `sendMessage` (`ws.rs`), which
+//!   fails closed on a lookup error and binds the payload `recipient` to the
+//!   `roomId` identity so the check cannot be sidestepped by targeting a room
+//!   directly.
+//! - **Fees/payments are not.** The WS `sendMessage` path carries no
+//!   fee/payment gate, so a `recipient_fee > 0` row is satisfied only on the
+//!   HTTP path; the same send over WS is free.
 //! - All boxes seed at delivery fee 0 (owner decision — free delivery, a
 //!   deviation from the TS `notifications=10` default), and every in-stack
 //!   caller sends with `check_permissions: false`. Operators can arm a fee per
-//!   box via `MESSAGEBOX_FEES`, at which point HTTP sends to that box require
-//!   payment (the WS path still bypasses it).
+//!   box via `MESSAGEBOX_FEES` (or `MESSAGEBOX_PARITY_FEES=true` for the TS
+//!   seed), and a recipient can arm one for itself via `/permissions/set`, at
+//!   which point HTTP sends to that box require payment (WS still bypasses it).
 //!
 //! Do not build authorization or monetization on this plane without new work
 //! (see the mbs-enterprise-production design; owner decision O1 keeps it).

@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "BSV MessageBox Server",
-    "description": "Rust reimplementation of @bsv/messagebox-server (Parity++: TS public API + intended behavior, with the TS bugs fixed). All API routes require BRC-103/104 mutual authentication via x-bsv-auth-* headers (see the BRC103Auth security scheme). GET / , /docs, /openapi.json and /health/live are pre-auth; the Prometheus /metrics and /health/ready probes are served on a separate private ops listener (OPS_BIND), not on the public port. Error responses share the shape {status:'error', code, description}.",
+    "description": "Rust reimplementation of @bsv/messagebox-server (Parity++: TS public API + intended behavior, with the TS bugs fixed). All API routes require BRC-103/104 mutual authentication via x-bsv-auth-* headers (see the BRC103Auth security scheme). GET / , /docs, /openapi.json and /health/live are pre-auth (declared as `security: []`); the Prometheus /metrics and /health/ready probes are served on a separate private ops listener (OPS_BIND), not on the public port, and are network-gated rather than auth-gated. Error responses share the shape {status:'error', code, description}. Cross-cutting statuses that any route may return, in addition to the per-operation errors below: 429 ERR_RATE_LIMITED (per-IP limiter; sends Retry-After), 503 ERR_SERVER_AT_CAPACITY / ERR_SERVER_DRAINING (new WebSocket handshakes only, also with Retry-After), 408 (REQUEST_TIMEOUT_SECS exceeded) and 413 (body larger than MAX_BODY_BYTES).",
     "version": "1.0.0"
   },
   "servers": [
@@ -25,7 +25,7 @@
     "/sendMessage": {
       "post": {
         "summary": "Store a message for one or more recipients (and push it live)",
-        "description": "Body: {message: {recipient|recipients, messageBox, messageId (string|string[]), body (string|object)}, payment?}. One messageId per recipient. Boxes with a delivery/recipient fee require a BRC-29 payment. Errors: 400 ERR_MESSAGE_REQUIRED | ERR_INVALID_MESSAGEBOX | ERR_INVALID_MESSAGE_BODY | ERR_RECIPIENT_REQUIRED | ERR_INVALID_RECIPIENT_KEY | ERR_MESSAGEID_REQUIRED | ERR_INVALID_MESSAGEID | ERR_MESSAGEID_COUNT_MISMATCH | ERR_MISSING_PAYMENT_TX | ERR_MISSING_DELIVERY_OUTPUT | ERR_INSUFFICIENT_PAYMENT, 403 ERR_DELIVERY_BLOCKED (+blockedRecipients), 500 ERR_INTERNALIZE_FAILED | ERR_INTERNAL_ERROR.",
+        "description": "Body: {message: {recipient|recipients, messageBox, messageId (string|string[]), body (string|object)}, payment?}. One messageId per recipient. Boxes with a delivery/recipient fee require a BRC-29 payment. Errors: 400 ERR_MESSAGE_REQUIRED | ERR_INVALID_MESSAGEBOX | ERR_INVALID_MESSAGE_BODY | ERR_RECIPIENT_REQUIRED | ERR_INVALID_RECIPIENT_KEY | ERR_MESSAGEID_REQUIRED | ERR_INVALID_MESSAGEID | ERR_MESSAGEID_COUNT_MISMATCH | ERR_MISSING_PAYMENT_TX | ERR_MISSING_DELIVERY_OUTPUT | ERR_INSUFFICIENT_PAYMENT | ERR_INVALID_PAYMENT (payment present but missing paymentRemittance / derivationPrefix / derivationSuffix / senderIdentityKey) | ERR_INSUFFICIENT_OUTPUTS (fewer payment outputs than recipients requiring one), 403 ERR_DELIVERY_BLOCKED (+blockedRecipients), 500 ERR_INTERNALIZE_FAILED | ERR_INTERNAL_ERROR.",
         "responses": {
           "200": {
             "description": "{status:'success', message:'Your message has been sent to N recipient(s).', results:[{recipient, messageId}]}"
@@ -76,14 +76,14 @@
     "/permissions/set": {
       "post": {
         "summary": "Set a recipient fee / block rule for a sender or box-wide",
-        "description": "Body: {sender?, messageBox, recipientFee} — -1 blocked, 0 always allow, >0 satoshis; omitted sender = box-wide. Errors: 400 ERR_INVALID_REQUEST | ERR_INVALID_PUBLIC_KEY.",
+        "description": "Body: {sender?, messageBox, recipientFee} — -1 blocked, 0 always allow, >0 satoshis; omitted sender = box-wide. Errors: 400 ERR_INVALID_REQUEST | ERR_INVALID_PUBLIC_KEY, 500 ERR_DATABASE_ERROR.",
         "responses": { "200": { "description": "{status:'success', description}" } }
       }
     },
     "/permissions/get": {
       "get": {
         "summary": "Read one permission setting",
-        "description": "Query: sender? and messageBox. Errors: 400 ERR_MISSING_PARAMETERS | ERR_INVALID_PUBLIC_KEY.",
+        "description": "Query: sender? and messageBox. Errors: 400 ERR_MISSING_PARAMETERS | ERR_INVALID_PUBLIC_KEY, 500 ERR_INTERNAL_ERROR.",
         "responses": {
           "200": {
             "description": "{status:'success', description, permission?: {sender, messageBox, recipientFee, status: blocked|always_allow|payment_required, createdAt, updatedAt}}"
@@ -105,43 +105,49 @@
     "/permissions/quote": {
       "get": {
         "summary": "Quote the delivery + recipient fees before sending",
-        "description": "Query: recipient (repeatable) and messageBox. Single recipient returns {quote:{deliveryFee, recipientFee}}; multiple return {quotesByRecipient, totals, blockedRecipients}. Errors: 400 ERR_MISSING_PARAMETERS | ERR_INVALID_PUBLIC_KEY.",
+        "description": "Query: recipient (repeatable) and messageBox. Single recipient returns {quote:{deliveryFee, recipientFee}}; multiple return {quotesByRecipient, totals, blockedRecipients}. Errors: 400 ERR_MISSING_PARAMETERS | ERR_INVALID_PUBLIC_KEY, 500 ERR_INTERNAL_ERROR.",
         "responses": { "200": { "description": "Quote response (single or multi shape)" } }
       }
     },
     "/docs": {
       "get": {
         "summary": "This documentation (Swagger UI, pre-auth)",
+        "security": [],
         "responses": { "200": { "description": "HTML" } }
       }
     },
     "/openapi.json": {
       "get": {
         "summary": "This OpenAPI document (pre-auth)",
+        "security": [],
         "responses": { "200": { "description": "OpenAPI 3.0 JSON" } }
       }
     },
     "/": {
       "get": {
         "summary": "Health banner (Rust extension; the TS server has no health route)",
+        "security": [],
         "responses": { "200": { "description": "text/plain 'BSV MessageBox Server'" } }
       }
     },
     "/health/live": {
       "get": {
         "summary": "Liveness probe (Rust extension)",
+        "security": [],
         "responses": { "200": { "description": "{status:'alive'}" } }
       }
     },
     "/health/ready": {
       "get": {
-        "summary": "Readiness probe — DB (and Redis in Model B) reachable, not draining (Rust extension)",
+        "summary": "Readiness probe — DB (and Redis in Model B) reachable, not draining (Rust extension). Served on the private ops listener (OPS_BIND), so it is reachable only from the scrape network, not from the public base URL above.",
+        "security": [],
         "responses": { "200": { "description": "ready" }, "503": { "description": "not ready" } }
       }
     },
     "/metrics": {
       "get": {
-        "summary": "Prometheus metrics (Rust extension)",
+        "summary": "Prometheus metrics (Rust extension). Served on the private ops listener (OPS_BIND), so it is reachable only from the scrape network, not from the public base URL above.",
+        "security": [],
         "responses": { "200": { "description": "text/plain; version=0.0.4" } }
       }
     }
