@@ -6,6 +6,9 @@ use tracing::{debug, error, warn};
 
 use crate::db::queries;
 use crate::firebase::send_fcm_notification::{send_fcm_notification, FcmPayload};
+
+/// Max `messageId` length, matching the `messages.messageId` VARCHAR(255).
+pub(crate) const MAX_MESSAGE_ID_CHARS: usize = 255;
 use crate::handlers::helpers::{
     build_per_recipient_outputs, error_response, is_valid_pub_key, AppState, AuthIdentity, FeeRow,
 };
@@ -224,13 +227,29 @@ pub async fn send_message(
         .into_response();
     }
 
-    // Validate each messageId is non-empty.
+    // Validate each messageId is non-empty and fits the column.
+    //
+    // The length cap is load-bearing, not cosmetic. `messageId` is stored in a
+    // VARCHAR(255) and is echoed into the FCM notification body, so an
+    // unbounded value (the body limit allows megabytes) lets a sender (a) push
+    // the FCM payload past its 4 KB limit, which returns the same error for
+    // every one of the recipient's devices, and (b) fail the INSERT with MySQL
+    // 1406, which is classified permanent and appends the whole oversized job
+    // to the dead-letter file. Rejecting here keeps both out of reach.
     for id in &message_ids {
         if id.trim().is_empty() {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "ERR_INVALID_MESSAGEID",
                 "Each messageId must be a non-empty string.",
+            )
+            .into_response();
+        }
+        if id.chars().count() > MAX_MESSAGE_ID_CHARS {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "ERR_INVALID_MESSAGEID",
+                "Each messageId must be at most 255 characters.",
             )
             .into_response();
         }

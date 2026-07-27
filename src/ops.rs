@@ -70,8 +70,13 @@ const DB_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// request also needs, so an unauthenticated flood starves genuine traffic —
 /// measured at a 100x latency penalty on `/sendMessage`'s pool. The probe is
 /// now bounded to at most one query per TTL no matter the request rate, which
-/// is orders of magnitude below any platform's healthcheck interval, so a
-/// prober never sees a materially stale answer.
+/// is orders of magnitude below any platform's healthcheck interval.
+///
+/// Staleness bound: a cached answer can be up to `TTL + DB_PROBE_TIMEOUT` old,
+/// because callers arriving while the elected prober is still blocked are
+/// served the previous value rather than queueing. A lone sequential prober —
+/// the platform healthcheck — is never served a stale answer that way: with no
+/// concurrent caller it becomes the prober and blocks for the real result.
 ///
 /// Only the DB probe is cached. `draining` and the Redis subscription flag are
 /// atomics — free to read and therefore always exact, so a draining instance

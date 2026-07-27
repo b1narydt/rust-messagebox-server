@@ -266,14 +266,22 @@ pub async fn get_valid_token() -> Option<(String, String, Client)> {
         let guard = state_lock.read().await;
         let state = guard.as_ref()?;
         let now = chrono::Utc::now().timestamp();
-        if now - state.last_refresh_failure_at < REFRESH_FAILURE_COOLDOWN_SECS
-            && now < state.token_expires_at
-        {
-            return Some((
-                state.project_id.clone(),
-                state.access_token.clone(),
-                state.http_client.clone(),
-            ));
+        if now - state.last_refresh_failure_at < REFRESH_FAILURE_COOLDOWN_SECS {
+            // The cooldown must apply whether or not the token is still usable.
+            // Gating it on "token not yet expired" made it inert in the only
+            // case that matters: once the token expires, every caller reaching
+            // here would re-attempt, each paying TOKEN_EXCHANGE_TIMEOUT while
+            // holding this gate. Notifications are spawned per message, so
+            // during an outage past the skew window they pile up on this lock
+            // at arrival rate and drain one per timeout — push then stays dead
+            // for hours after the provider recovers.
+            return (now < state.token_expires_at).then(|| {
+                (
+                    state.project_id.clone(),
+                    state.access_token.clone(),
+                    state.http_client.clone(),
+                )
+            });
         }
         state.service_account_json.clone()
     };
@@ -339,10 +347,11 @@ struct JwtClaims {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
-    /// Lifetime in seconds as reported by Google. Currently always 3600, but
-    /// trusting the response rather than a constant matters: if a shorter-lived
-    /// token were ever issued, a hardcoded hour would leave every push failing
-    /// with a stale token until the guess ran out.
+    /// Lifetime in seconds as reported by Google (currently always 3600).
+    /// Trusting the response rather than a hardcoded hour keeps the expiry
+    /// honest for any lifetime between the floor applied below and 3600 — a
+    /// hardcoded guess longer than the real lifetime would leave every push
+    /// failing against a token we believed was fresh.
     expires_in: Option<i64>,
 }
 

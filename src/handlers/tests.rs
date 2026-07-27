@@ -350,6 +350,47 @@ async fn test_send_message_missing_message_id() {
     assert_eq!(body["code"], "ERR_MESSAGEID_REQUIRED");
 }
 
+/// An oversized `messageId` is rejected rather than carried downstream. It is
+/// stored in a VARCHAR(255) and echoed into the FCM notification body, so an
+/// unbounded one both fails the INSERT as a permanent error (dead-lettering the
+/// whole job to disk) and inflates the FCM payload past its size limit, where
+/// FCM answers with the same error for every one of the recipient's devices.
+#[tokio::test]
+async fn test_send_message_rejects_oversized_message_id() {
+    let app = setup_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageBox": "notifications",
+                "messageId": "x".repeat(256),
+                "body": "hello"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INVALID_MESSAGEID");
+
+    // The boundary itself is still accepted.
+    let (status, _) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipient": RECIPIENT_KEY,
+                "messageBox": "inbox",
+                "messageId": "x".repeat(255),
+                "body": "hello"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
 #[tokio::test]
 async fn test_send_message_id_count_mismatch() {
     let app = setup_app().await;

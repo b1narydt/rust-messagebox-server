@@ -354,6 +354,14 @@ where
                 debug!("backplane delivery task ended (subscription stream closed)");
                 return;
             }
+            // A JoinError is a panic OR a cancellation. Only the first is the
+            // fault this supervisor exists to survive; reporting a shutdown
+            // cancellation as a panic would raise a false alert and restart a
+            // task that was deliberately stopped.
+            Err(join_err) if join_err.is_cancelled() => {
+                debug!("backplane delivery task cancelled — not restarting");
+                return;
+            }
             Err(join_err) => {
                 crate::metrics::BACKPLANE_DELIVERY_PANICS
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -782,6 +790,15 @@ async fn handle_ws_send_message(
             return;
         }
     };
+    // Same cap as the HTTP path: the id goes into a VARCHAR(255) and into the
+    // FCM notification body, so an oversized one fails the INSERT as a
+    // permanent error (dead-lettering the whole job) and can push the FCM
+    // payload past its size limit.
+    if message_id.chars().count() > crate::handlers::send_message::MAX_MESSAGE_ID_CHARS {
+        warn!(sid = %sid, "BRC-103 sendMessage: messageId exceeds the length limit");
+        message_failed(socket, ws, "messageId exceeds the length limit").await;
+        return;
+    }
     // Backfill the span fields declared Empty on the instrument attribute.
     let span = tracing::Span::current();
     span.record("msg_id", tracing::field::display(&message_id));

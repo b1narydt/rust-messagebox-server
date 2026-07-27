@@ -32,6 +32,14 @@ static CONSECUTIVE_DEACTIVATIONS: AtomicU32 = AtomicU32::new(0);
 /// resets only on a successful send, so a single recipient holding many dead
 /// handsets can rack up strikes with nothing to clear them — too low a value
 /// would trip on healthy cleanup and then block deactivation server-wide.
+///
+/// Know what this does NOT protect against: because any successful send
+/// anywhere in the process resets the count, a server carrying normal traffic
+/// interleaves successes with failures and will essentially never reach the
+/// trip point. The breaker only engages when the process is doing nothing but
+/// deactivating. It is a backstop for a total systemic fault, not a defense
+/// against a targeted or partial one — [`should_deactivate`]'s narrow gate is
+/// what has to be right.
 const DEACTIVATION_BREAKER_TRIP: u32 = 500;
 
 /// Claim permission to deactivate one device, advancing the breaker.
@@ -309,19 +317,28 @@ fn build_fcm_body(token: &str, payload: &FcmPayload) -> serde_json::Value {
 /// `error.details[].errorCode == "UNREGISTERED"`, so that (or the equally
 /// token-specific legacy codes) is what we require. A bare 404 is treated as
 /// transient: nothing is deactivated and the send simply fails.
+///
+/// ## Why 400 `INVALID_ARGUMENT` is NOT enough either — do not re-add it
+///
+/// It is tempting: Google suggests deleting the token on `INVALID_ARGUMENT`
+/// *when the request payload is known-good*, and it looks like the only
+/// remaining way to reap malformed tokens. But this server cannot satisfy that
+/// precondition. `FcmPayload.message_id` is client-supplied and reaches the
+/// request body, so a sender choosing an oversized `messageId` pushes the
+/// payload past FCM's 4 KB limit and gets `INVALID_ARGUMENT` for **every** one
+/// of the recipient's devices — letting any authenticated sender permanently
+/// wipe any recipient's push fleet with one ordinary `/sendMessage`. The same
+/// status also covers invalid TTL, reserved data keys, and malformed APNs
+/// blocks, none of which say anything about the token. Deactivation is
+/// irreversible here, so it stays gated on signals that name the token itself.
+/// Reaping malformed tokens needs a different mechanism (a `last_used` sweep),
+/// not a status a remote caller can provoke.
 fn should_deactivate(status: reqwest::StatusCode, response_body: &str) -> bool {
     // Unambiguous legacy-SDK token codes: safe to honor without a status gate.
     if response_body.contains("registration-token-not-registered")
         || response_body.contains("invalid-registration-token")
     {
         return true;
-    }
-
-    // A malformed token is reported as 400 INVALID_ARGUMENT, not 404.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(response_body) {
-        if is_invalid_token_argument(status, &v) {
-            return true;
-        }
     }
 
     // FCM v1: only a 404 can mean "token no longer registered".
@@ -337,23 +354,6 @@ fn should_deactivate(status: reqwest::StatusCode, response_body: &str) -> bool {
             .iter()
             .any(|d| d["errorCode"].as_str() == Some("UNREGISTERED"))
     })
-}
-
-/// `INVALID_ARGUMENT` on a 400 means the token itself is malformed.
-///
-/// Google documents deleting the token on `UNREGISTERED` **or** on
-/// `INVALID_ARGUMENT` when the request payload is known-good. That caveat is
-/// what makes this safe here: [`build_fcm_body`] is entirely server-generated
-/// and fixed-shape, so the only caller-varying field in the request is the
-/// token — if FCM calls the argument invalid, the token is the argument.
-///
-/// This matters because deactivation is the ONLY cleanup path that exists:
-/// nothing deletes device rows, there is no TTL and no sweeper, and a rotated
-/// token inserts a new row while leaving the old one active. Gating solely on
-/// `UNREGISTERED` would leave malformed tokens accumulating forever.
-fn is_invalid_token_argument(status: reqwest::StatusCode, v: &serde_json::Value) -> bool {
-    status == reqwest::StatusCode::BAD_REQUEST
-        && v["error"]["status"].as_str() == Some("INVALID_ARGUMENT")
 }
 
 /// Show only the last 10 characters of an FCM token for log safety.
@@ -426,12 +426,6 @@ mod tests {
             nf,
             r#"{"error":{"status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}"#
         ));
-        // A malformed token: 400 INVALID_ARGUMENT. Safe to honor because the
-        // request body is server-generated, so the token is the only argument.
-        assert!(should_deactivate(
-            StatusCode::BAD_REQUEST,
-            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"The registration token is not a valid FCM registration token"}}"#
-        ));
         // Legacy-SDK token codes: honored regardless of status.
         assert!(should_deactivate(nf, "registration-token-not-registered"));
         assert!(should_deactivate(
@@ -454,10 +448,19 @@ mod tests {
             StatusCode::FORBIDDEN,
             r#"{"error":{"code":403,"status":"PERMISSION_DENIED"}}"#
         ));
-        // INVALID_ARGUMENT is only honored on a 400.
+        // 400 INVALID_ARGUMENT must NEVER deactivate. `messageId` is
+        // client-supplied and lands in the FCM body, so an oversized one pushes
+        // the payload past FCM's 4 KB limit and returns this for EVERY device —
+        // any authenticated sender could otherwise wipe any recipient's fleet.
+        // The same status also covers invalid TTL / reserved keys / bad APNs
+        // blocks, none of which implicate the token.
         assert!(!should_deactivate(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            r#"{"error":{"status":"INVALID_ARGUMENT"}}"#
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Message is too big"}}"#
+        ));
+        assert!(!should_deactivate(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"The registration token is not a valid FCM registration token"}}"#
         ));
         // The old false-positive: a non-404 body that merely mentions the words.
         assert!(!should_deactivate(
