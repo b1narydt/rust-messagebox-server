@@ -94,9 +94,13 @@ and runs migrations on start.
 - All instances share the **same `SERVER_PRIVATE_KEY`** (they sign as one server
   identity) and the **same MySQL**.
 
-**Observability:** `/metrics` + `/health/ready` bind to the private `OPS_BIND`
-(loopback by default). Scrape them over the internal network, or set
-`OPS_BIND=0.0.0.0:<port>` and expose that port to your scraper. The slim runtime
+**Observability:** `/metrics` binds to the private `OPS_BIND` (loopback by
+default). Scrape it over the internal network, or set `OPS_BIND=0.0.0.0:<port>`
+and expose that port to your scraper. `/health/ready` is served on the **public**
+port — platforms like Railway route exactly one port per service, so the
+platform healthcheck can only reach the public listener; `railway.toml` points
+Railway's healthcheck at `/health/ready` so traffic never routes to a draining
+or DB-less instance. (It is mirrored on the ops listener too.) The slim runtime
 image has no shell tools (no `curl`), so scrape from a sidecar/agent rather than
 exec-ing into the container.
 
@@ -121,7 +125,7 @@ header is spoofable; set it empty to key on the socket peer instead).
 | `REDIS_URL` | *(none)* | Unset → **Model A** (single instance, in-process routing — the default). Set → **Model B**: Redis pub/sub backplane for cross-instance live push; run N replicas behind a **sticky** LB. See below. |
 | `MAX_CONNECTIONS` | `0` (unlimited) | Per-instance WebSocket connection ceiling (admission control). Past it, NEW connections get `503` + `Retry-After` (Model B: the LB sheds to another instance; Model A: the client retries). In-flight sessions are never affected. |
 | `DRAIN_TIMEOUT_SECS` | `30` | Per-phase bound on the SIGTERM graceful drain (in-flight send quiesce, persist-queue flush). |
-| `OPS_BIND` | `127.0.0.1:9091` | Private listener for `/metrics` + `/health/ready` — kept off the public port so an internet-facing deploy never exposes operational counts or the dependency-health probe. Prometheus/orchestrator scrape it over the internal network. Set `0.0.0.0:<port>` to publish deliberately. |
+| `OPS_BIND` | `127.0.0.1:9091` | Private listener for `/metrics` — kept off the public port so an internet-facing deploy never exposes operational counts. Prometheus scrapes it over the internal network; set `0.0.0.0:<port>` to publish deliberately. Also mirrors `/health/ready` for internal scrapers (the readiness probe itself is public — see Operations). |
 | `CORS_ALLOWED_ORIGINS` | *(none → permissive)* | Comma-separated browser-origin allowlist (e.g. `https://app.example.com`). Unset keeps the permissive default (safe: auth is BRC-103 request-signature based, no cookies). Set to lock the browser origin down. |
 | `RATE_LIMIT_RPS` | `50` | Per-client-IP sustained request rate on the public listener (protects the unauthenticated BRC-103 handshake). `0` disables rate limiting. |
 | `RATE_LIMIT_BURST` | `2×RPS` | Per-IP burst allowance. |
@@ -136,6 +140,7 @@ header is spoofable; set it empty to key on the socket peer instead).
 | `REQUEST_TIMEOUT_SECS` | `30` | Per-request timeout on the API routes (not applied to `GET /` or `/health/live`). |
 | `MAX_BODY_BYTES` | `10485760` (10 MiB) | Max request body on the API routes. |
 | `LOG_FORMAT` | *(text)* | Set to `json` for structured JSON logs; anything else keeps human-readable text. Level comes from `RUST_LOG` (default `debug` in development, `info` in production). |
+| `DEAD_LETTER_PATH` | `dead_letter.jsonl` (relative to the working directory) | Append-only capture file for messages that could not be persisted to MySQL — the last-resort durability record behind the WS ack. Writability is probed at boot and logged at ERROR if it fails; a nonzero `mbs_persist_dead_letter_failures_total` means messages were lost outright. The Docker image sets a writable `WORKDIR` (`/var/lib/messagebox`) so the default works, but that is still container-ephemeral: point this at a mounted volume if captures must outlive the container. |
 
 ## Topology: Model A / Model B
 
@@ -185,14 +190,18 @@ Split across two listeners (see `OPS_BIND`). Everything here is pre-auth and nev
 |--------|------|-------------|
 | `GET` | `/` | Plain-text banner (legacy uptime check) |
 | `GET` | `/health/live` | Liveness: the event loop answered — always `200` |
+| `GET` | `/health/ready` | Readiness: `200` when routable, else `503` + JSON `{ready, db, redis, draining}`. Unready on DB loss, on Redis-subscription loss in Model B (`redis: "down"`) or Redis < 6 (`redis: "unsupported"`); Model A skips the Redis check; and while draining. **Railway's deploy healthcheck probes this path** (`railway.toml`) — the platform routes one port per service, so readiness must be public for the platform to gate traffic on it. Also mirrored on the ops listener. |
 | `GET` | `/docs`, `/openapi.json` | API docs (pre-auth, like the TS/Go references) |
+
+The health probes are never rate-limited or admission-gated — they answer
+under load and while draining (`/health/ready` answers `503` then, which is
+the point).
 
 **Private ops listener** (`OPS_BIND`, default `127.0.0.1:9091` — never internet-exposed unless you set it to a public bind):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health/ready` | Readiness: `200` when routable, else `503` + JSON `{ready, db, redis, draining}`. Unready on DB loss, on Redis-subscription loss in Model B (`redis: "down"`) or Redis < 6 (`redis: "unsupported"`); Model A skips the Redis check; and while draining. |
-| `GET` | `/metrics` | Prometheus text: connections/rooms, fan-out + sign-latency histograms, persist queue depth / inline-fallback / dead-letter counters, Model B publish/drop/lag + room-subscription count, admission + drain gauges. Operational counts only — no identities, no message data, no key material. |
+| `GET` | `/metrics` | Prometheus text: connections/rooms, fan-out + sign-latency histograms, persist queue depth / inline-fallback / dead-letter counters, Model B publish/drop/lag + room-subscription count, admission + drain gauges. Operational counts only — no identities, no message data, no key material. (`/health/ready` is also served here, so existing scrape/orchestrator configs keep working.) |
 
 **Admission control** (`MAX_CONNECTIONS`): gates only *new* WS handshakes
 (engine.io requests without a `sid`). Established sessions, all API routes,

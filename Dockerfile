@@ -48,6 +48,17 @@ RUN useradd --system --uid 10001 --user-group --no-create-home --shell /usr/sbin
 
 COPY --from=builder /build/target/release/messagebox-server /usr/local/bin/messagebox-server
 
+# Writable state directory, and the process's cwd. The persist worker captures
+# messages it could not store to MySQL in an append-only dead-letter file at a
+# path that is relative by default (persist.rs / DEAD_LETTER_PATH); with the
+# default cwd of `/` and a non-root user that open() fails EACCES, silently
+# turning "captured for recovery" into a lost message. Note the layer is still
+# part of the container's ephemeral filesystem: this survives a process restart,
+# NOT a container replacement. Point DEAD_LETTER_PATH at a mounted volume where
+# the messages must outlive the container.
+RUN mkdir -p /var/lib/messagebox && chown messagebox:messagebox /var/lib/messagebox
+WORKDIR /var/lib/messagebox
+
 USER messagebox
 
 # Railway injects $PORT at runtime; 8080 is the documented dev default and

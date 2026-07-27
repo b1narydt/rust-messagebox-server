@@ -1,0 +1,17 @@
+# Railway config-as-code (https://docs.railway.com/reference/config-as-code).
+# Railway routes exactly ONE port per service, so the healthcheck must target
+# the public listener — /health/ready is mounted there (main.rs) precisely so
+# the platform stops routing to a draining or DB-less instance. /metrics stays
+# on the private OPS_BIND listener and is not reachable from Railway's edge.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Deploy goes live only once readiness passes (DB reachable, Redis in Model B,
+# not draining). Timeout is in seconds — covers a cold boot + migrations.
+healthcheckPath = "/health/ready"
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

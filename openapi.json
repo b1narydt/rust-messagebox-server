@@ -2,7 +2,7 @@
   "openapi": "3.0.3",
   "info": {
     "title": "BSV MessageBox Server",
-    "description": "Rust reimplementation of @bsv/messagebox-server (Parity++: TS public API + intended behavior, with the TS bugs fixed). All API routes require BRC-103/104 mutual authentication via x-bsv-auth-* headers (see the BRC103Auth security scheme). GET / , /docs, /openapi.json and /health/live are pre-auth (declared as `security: []`); the Prometheus /metrics and /health/ready probes are served on a separate private ops listener (OPS_BIND), not on the public port, and are network-gated rather than auth-gated. Error responses share the shape {status:'error', code, description}. Cross-cutting statuses that any route may return, in addition to the per-operation errors below: 429 ERR_RATE_LIMITED (per-IP limiter; sends Retry-After), 503 ERR_SERVER_AT_CAPACITY / ERR_SERVER_DRAINING (new WebSocket handshakes only, also with Retry-After), 408 (REQUEST_TIMEOUT_SECS exceeded) and 413 (body larger than MAX_BODY_BYTES).",
+    "description": "Rust reimplementation of @bsv/messagebox-server (Parity++: TS public API + intended behavior, with the TS bugs fixed). All API routes require BRC-103/104 mutual authentication via x-bsv-auth-* headers (see the BRC103Auth security scheme). GET / , /docs, /openapi.json, /health/live and /health/ready are pre-auth (declared as `security: []`); the Prometheus /metrics endpoint is served on a separate private ops listener (OPS_BIND), not on the public port, and is network-gated rather than auth-gated (/health/ready is additionally mirrored on that listener for internal scrapers). Error responses share the shape {status:'error', code, description}. Cross-cutting statuses that any route may return, in addition to the per-operation errors below: 429 ERR_RATE_LIMITED (per-IP limiter; sends Retry-After), 503 ERR_SERVER_AT_CAPACITY / ERR_SERVER_DRAINING (new WebSocket handshakes only, also with Retry-After), 408 (REQUEST_TIMEOUT_SECS exceeded) and 413 (body larger than MAX_BODY_BYTES).",
     "version": "1.0.0"
   },
   "servers": [
@@ -17,7 +17,7 @@
         "type": "apiKey",
         "in": "header",
         "name": "x-bsv-auth-identity-key",
-        "description": "BRC-103/104 mutual authentication. Every API route requires the BRC-103 handshake headers (x-bsv-auth-*); this apiKey entry documents the identity-key header, since OpenAPI 3.0 cannot natively model the full mutual-auth handshake. The pre-auth surface (GET /, /docs, /openapi.json, /health/live) does not require it."
+        "description": "BRC-103/104 mutual authentication. Every API route requires the BRC-103 handshake headers (x-bsv-auth-*); this apiKey entry documents the identity-key header, since OpenAPI 3.0 cannot natively model the full mutual-auth handshake. The pre-auth surface (GET /, /docs, /openapi.json, /health/live, /health/ready) does not require it."
       }
     }
   },
@@ -139,7 +139,7 @@
     },
     "/health/ready": {
       "get": {
-        "summary": "Readiness probe — DB (and Redis in Model B) reachable, not draining (Rust extension). Served on the private ops listener (OPS_BIND), so it is reachable only from the scrape network, not from the public base URL above.",
+        "summary": "Readiness probe — DB (and Redis in Model B) reachable, not draining (Rust extension). Served on the public port (it is the platform healthcheck target — Railway probes it via railway.toml) and mirrored on the private ops listener (OPS_BIND). Never rate-limited or admission-gated.",
         "security": [],
         "responses": { "200": { "description": "ready" }, "503": { "description": "not ready" } }
       }

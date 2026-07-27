@@ -228,6 +228,13 @@ pub fn render(s: &Snapshot) -> String {
     );
     counter(
         &mut out,
+        "mbs_persist_dead_letter_failures_total",
+        "Dead-letter captures that FAILED — the job is in neither MySQL nor the \
+         file. Any nonzero value is lost messages; alert on it.",
+        p.dead_letter_failures.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
         "mbs_persist_worker_panics_total",
         "Supervised persist-worker restarts after a panic.",
         p.worker_panics.load(Ordering::Relaxed),
@@ -326,6 +333,7 @@ mod tests {
     fn render_exposes_all_core_families() {
         let persist = crate::persist::PersistStats::default();
         persist.dead_lettered.store(3, Ordering::Relaxed);
+        persist.dead_letter_failures.store(1, Ordering::Relaxed);
         persist.inline_persists.store(2, Ordering::Relaxed);
         persist.enqueued.store(10, Ordering::Relaxed);
         persist.completed.store(9, Ordering::Relaxed);
@@ -361,6 +369,7 @@ mod tests {
             "mbs_persist_completed_total 9",
             "mbs_persist_inline_fallback_total 2",
             "mbs_persist_dead_letter_total 3",
+            "mbs_persist_dead_letter_failures_total 1",
             "mbs_persist_worker_panics_total 0",
             "mbs_backplane_published_total 100",
             "mbs_backplane_dropped_total 5",
