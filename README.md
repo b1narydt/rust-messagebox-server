@@ -195,7 +195,13 @@ Split across two listeners (see `OPS_BIND`). Everything here is pre-auth and nev
 
 The health probes are never rate-limited or admission-gated — they answer
 under load and while draining (`/health/ready` answers `503` then, which is
-the point).
+the point). A throttled probe would pull a *healthy* instance out of rotation,
+so the exemption is deliberate — but it does mean these two paths are the one
+public surface with no per-IP ceiling. The cost is bounded: `/health/ready`
+reuses a cached `SELECT 1` (see `DB_PROBE_CACHE_TTL`), so flooding it cannot
+consume database connections, and what remains is ordinary HTTP CPU. Put
+volumetric L7 protection at the edge (Cloudflare rate-limiting rules) if that
+matters for your deployment.
 
 **Private ops listener** (`OPS_BIND`, default `127.0.0.1:9091` — never internet-exposed unless you set it to a public bind):
 

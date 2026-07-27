@@ -391,7 +391,9 @@ mod tests {
             "mbs_backplane_published_total 100",
             "mbs_backplane_dropped_total 5",
             "mbs_backplane_subscribed 1",
-            "mbs_backplane_delivery_panics_total",
+            // Value included: matching the bare name would also match the
+            // HELP/TYPE lines, so the sample line itself could go missing.
+            "mbs_backplane_delivery_panics_total 0",
             "mbs_backplane_lag_seconds_count",
             "mbs_draining 0",
             "mbs_in_flight_sends 2",

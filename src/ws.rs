@@ -354,10 +354,10 @@ where
                 debug!("backplane delivery task ended (subscription stream closed)");
                 return;
             }
-            // A JoinError is a panic OR a cancellation. Only the first is the
-            // fault this supervisor exists to survive; reporting a shutdown
-            // cancellation as a panic would raise a false alert and restart a
-            // task that was deliberately stopped.
+            // A JoinError is a panic OR a cancellation. Nothing aborts this
+            // handle today, so this arm is unreachable as written; it is here
+            // so that adding an abort later cannot turn a deliberate stop into
+            // a false panic alert and a restart of a task meant to end.
             Err(join_err) if join_err.is_cancelled() => {
                 debug!("backplane delivery task cancelled — not restarting");
                 return;
@@ -790,10 +790,10 @@ async fn handle_ws_send_message(
             return;
         }
     };
-    // Same cap as the HTTP path: the id goes into a VARCHAR(255) and into the
-    // FCM notification body, so an oversized one fails the INSERT as a
-    // permanent error (dead-lettering the whole job) and can push the FCM
-    // payload past its size limit.
+    // Same cap as the HTTP path: the id goes into a VARCHAR(255), so an
+    // oversized one fails the INSERT as a permanent error, which dead-letters
+    // the whole job to disk. (The FCM half of the HTTP path's rationale does
+    // not apply here — this path never sends a push.)
     if message_id.chars().count() > crate::handlers::send_message::MAX_MESSAGE_ID_CHARS {
         warn!(sid = %sid, "BRC-103 sendMessage: messageId exceeds the length limit");
         message_failed(socket, ws, "messageId exceeds the length limit").await;

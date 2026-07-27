@@ -105,6 +105,9 @@ pub struct OpsState {
     /// Elects the single task that runs a probe when the cache is stale, so a
     /// burst arriving on an expired entry issues one query rather than N.
     db_probe_gate: tokio::sync::Mutex<()>,
+    /// Queries actually issued by the probe. The cache and the election exist
+    /// to keep this flat under load instead of proportional to request rate.
+    db_probes_run: AtomicU64,
 }
 
 impl OpsState {
@@ -116,7 +119,16 @@ impl OpsState {
             admission_rejected: AtomicU64::new(0),
             db_probe: parking_lot::Mutex::new(None),
             db_probe_gate: tokio::sync::Mutex::new(()),
+            db_probes_run: AtomicU64::new(0),
         })
+    }
+
+    /// Queries actually issued to MySQL by the readiness probe.
+    ///
+    /// This is the number the cache exists to hold down: it must stay flat
+    /// under load rather than tracking the request rate.
+    pub fn db_probes_run(&self) -> u64 {
+        self.db_probes_run.load(Ordering::Relaxed)
     }
 
     /// Cached `SELECT 1`. See [`DB_PROBE_CACHE_TTL`] for why this is cached at
@@ -146,6 +158,7 @@ impl OpsState {
             return ok;
         }
 
+        self.db_probes_run.fetch_add(1, Ordering::Relaxed);
         let ok = matches!(
             tokio::time::timeout(DB_PROBE_TIMEOUT, sqlx::query("SELECT 1").execute(db)).await,
             Ok(Ok(_))
@@ -695,6 +708,7 @@ mod tests {
         // it rather than issuing their own query.
         assert!(!readiness(&pool, None, &ops).await.ready);
         let probed_at = ops.db_probe.lock().expect("probe cached").0;
+        assert_eq!(ops.db_probes_run(), 1);
 
         for _ in 0..500 {
             assert!(!readiness(&pool, None, &ops).await.ready);
@@ -703,6 +717,11 @@ mod tests {
             ops.db_probe.lock().expect("still cached").0,
             probed_at,
             "a flood must reuse one probe, not re-query per request"
+        );
+        assert_eq!(
+            ops.db_probes_run(),
+            1,
+            "a sequential flood must issue exactly one query"
         );
 
         // Draining is read from an atomic, never cached, so it takes effect on
@@ -714,6 +733,54 @@ mod tests {
             ops.db_probe.lock().expect("still cached").0,
             probed_at,
             "reading drain state must not trigger a probe"
+        );
+    }
+
+    /// The TTL alone is NOT enough, and a sequential test cannot tell the
+    /// difference: with a cold or just-expired cache, N callers arriving
+    /// together each miss and each would issue their own query — the pool
+    /// amplification all over again, at exactly the moment a flood is worst.
+    /// The `try_lock` election is what collapses them to one, so assert on a
+    /// CONCURRENT burst; deleting the election must fail this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn readiness_db_probe_is_single_flighted_across_concurrent_callers() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("mysql://nobody@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let ops = OpsState::new(0);
+
+        // Cold cache: every one of these misses, so each is a candidate prober.
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let pool = pool.clone();
+            let ops = Arc::clone(&ops);
+            set.spawn(async move { readiness(&pool, None, &ops).await.ready });
+        }
+        while let Some(joined) = set.join_next().await {
+            assert!(!joined.expect("probe task"), "dead DB ⇒ unready");
+        }
+        assert_eq!(
+            ops.db_probes_run(),
+            1,
+            "a concurrent burst on a cold cache must elect ONE prober"
+        );
+
+        // Same again once the entry has expired — the steady-state flood case.
+        tokio::time::sleep(DB_PROBE_CACHE_TTL + Duration::from_millis(50)).await;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let pool = pool.clone();
+            let ops = Arc::clone(&ops);
+            set.spawn(async move { readiness(&pool, None, &ops).await.ready });
+        }
+        while let Some(joined) = set.join_next().await {
+            assert!(!joined.expect("probe task"));
+        }
+        assert_eq!(
+            ops.db_probes_run(),
+            2,
+            "a concurrent burst on an expired cache must add exactly one query"
         );
     }
 
