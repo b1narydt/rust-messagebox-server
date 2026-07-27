@@ -126,9 +126,8 @@ async fn live_load() {
             let mut lats = Vec::with_capacity(per);
             let deadline = Instant::now() + Duration::from_secs(20);
             while lats.len() < sent && Instant::now() < deadline {
-                match tokio::time::timeout(Duration::from_millis(500), rx_rx.recv()).await {
-                    Ok(Some(l)) => lats.push(l),
-                    _ => {}
+                if let Ok(Some(l)) = tokio::time::timeout(Duration::from_millis(500), rx_rx.recv()).await {
+                    lats.push(l);
                 }
             }
             let _ = client.disconnect().await;

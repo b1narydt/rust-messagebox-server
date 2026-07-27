@@ -434,3 +434,79 @@ async fn ws_send_to_blocked_recipient_is_rejected() {
 
     client.disconnect().await.expect("disconnect");
 }
+
+/// Regression: a blocked sender must NOT be able to bypass the recipient-block
+/// gate by pointing `roomId` at the victim while naming a DIFFERENT `recipient`.
+///
+/// The block check keys on the payload `recipient`, but the live broadcast
+/// targets `roomId`. If those two client-supplied fields are allowed to diverge,
+/// a sender blocked by victim V sends `{roomId: "<V>-inbox", recipient: "<self>"}`:
+/// the block lookup asks "has <self> blocked <self>?" (no) and the push still
+/// lands in `<V>-inbox`. The server now rejects any roomId/recipient identity
+/// mismatch before the broadcast, so the send is failed and never delivered.
+#[tokio::test]
+async fn ws_send_with_mismatched_room_and_recipient_is_rejected() {
+    let pool = migrated_pool().await;
+
+    let sender = identity_of(CLIENT_KEY).await; // the connecting (blocked) client
+    let victim = identity_of(RECIPIENT_KEY).await; // who blocked the sender
+    let victim_room = format!("{victim}-inbox");
+
+    // Victim blocks this sender for inbox.
+    messagebox_server::db::queries::set_message_permission(
+        &pool,
+        &victim,
+        Some(&sender),
+        "inbox",
+        -1,
+    )
+    .await
+    .expect("seed block permission");
+
+    let (url, _ws) = boot_with(pool).await;
+
+    let (client, mut failed_rx) = connect_with_listener(&url, "messageFailed").await;
+    let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<Value>();
+    client
+        .on(
+            format!("sendMessageAck-{victim_room}"),
+            Arc::new(move |data| {
+                let _ = ack_tx.send(data);
+            }),
+        )
+        .await;
+
+    // The bypass attempt: target the victim's room, but name the sender itself
+    // (unblocked) as `recipient` so the old block check would pass.
+    client
+        .emit(
+            "sendMessage",
+            &json!({
+                "roomId": victim_room,
+                "message": {
+                    "messageId": "ws-bypass-1",
+                    "recipient": sender,
+                    "body": "should never reach the victim"
+                }
+            }),
+        )
+        .await
+        .expect("emit sendMessage");
+
+    let failed = recv_within(&mut failed_rx, "messageFailed").await;
+    assert_eq!(
+        failed.get("reason").and_then(Value::as_str),
+        Some("roomId does not match recipient"),
+        "a roomId/recipient mismatch must be rejected before broadcast: {failed}"
+    );
+
+    // No ack for the victim's room ⇒ nothing was broadcast there.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), ack_rx.recv())
+            .await
+            .is_err(),
+        "a mismatched send must NOT be acked"
+    );
+
+    client.disconnect().await.expect("disconnect");
+}

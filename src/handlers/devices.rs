@@ -135,9 +135,14 @@ pub async fn list_devices(State(state): State<AppState>, auth: AuthIdentity) -> 
 }
 
 /// `fcmToken` MUST be masked in listings: `'...' + last 10 chars` (§4.2).
+///
+/// Counts by `char`, not by byte: FCM tokens are `utf8mb4`, so a byte-index
+/// slice at `len() - 10` panics when it lands inside a multi-byte character.
 fn mask_fcm_token(token: &str) -> String {
-    if token.len() > 10 {
-        format!("...{}", &token[token.len() - 10..])
+    let char_count = token.chars().count();
+    if char_count > 10 {
+        let tail: String = token.chars().skip(char_count - 10).collect();
+        format!("...{tail}")
     } else {
         token.to_string()
     }
@@ -152,5 +157,19 @@ mod unit {
         assert_eq!(mask_fcm_token("abcdefghijKLMNOPQRST"), "...KLMNOPQRST");
         assert_eq!(mask_fcm_token("short"), "short");
         assert_eq!(mask_fcm_token("exactly10c"), "exactly10c");
+    }
+
+    #[test]
+    fn masks_multibyte_token_without_panicking() {
+        // utf8mb4 token whose last 10 chars are multi-byte: a byte-index slice at
+        // len()-10 would land mid-character and panic. `register_device` accepts
+        // any non-empty string, so this is a remotely reachable input. Here the
+        // token is 6 ASCII + 10 emoji, so the mask is exactly the 10 emoji.
+        assert_eq!(
+            mask_fcm_token("xxxxxx🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉"),
+            "...🎉🎉🎉🎉🎉🎉🎉🎉🎉🎉"
+        );
+        // A short multi-byte token is returned whole, still no panic.
+        assert_eq!(mask_fcm_token("🎉🎉"), "🎉🎉");
     }
 }

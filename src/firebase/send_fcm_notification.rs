@@ -269,11 +269,15 @@ fn should_deactivate(status: reqwest::StatusCode, response_body: &str) -> bool {
 }
 
 /// Show only the last 10 characters of an FCM token for log safety.
+///
+/// Counts by `char`, not by byte: a byte-index slice at `len() - 10` panics when
+/// it lands inside a multi-byte character, and FCM tokens are arbitrary utf8mb4.
 fn truncate_token(token: &str) -> String {
-    if token.len() <= 10 {
+    let char_count = token.chars().count();
+    if char_count <= 10 {
         token.to_owned()
     } else {
-        token[token.len() - 10..].to_owned()
+        token.chars().skip(char_count - 10).collect()
     }
 }
 

@@ -761,15 +761,30 @@ async fn handle_ws_send_message(
         return;
     }
 
-    // Extract messageBox from roomId
-    let message_box = match authsocket::split_room_id(&room_id_str) {
-        Some((_key, mb)) => mb,
+    // Extract the identity key + messageBox from roomId. The key is the
+    // authoritative delivery target for this send.
+    let (room_key, message_box) = match authsocket::split_room_id(&room_id_str) {
+        Some((key, mb)) => (key, mb),
         None => {
             warn!(sid = %sid, room = %room_id_str, "BRC-103 sendMessage: invalid roomId format");
             message_failed(socket, ws, "Invalid roomId format").await;
             return;
         }
     };
+
+    // Bind the payload `recipient` to the roomId's identity key. These are two
+    // independent client-supplied fields: the block check below keys on
+    // `recipient`, but the live broadcast targets `room_id_str`. If they diverge,
+    // a sender blocked by victim V can push into `<V>-<box>` (a room only V can
+    // join, by own-room enforcement) while naming some OTHER `recipient` whose
+    // block row is absent — defeating recipient-block enforcement entirely.
+    // Legitimate clients always build roomId as `<recipient>-<box>`, so this
+    // equality holds for every honest send; reject any mismatch.
+    if room_key != recipient {
+        warn!(sid = %sid, room = %room_id_str, "BRC-103 sendMessage: roomId identity does not match recipient — rejected");
+        message_failed(socket, ws, "roomId does not match recipient").await;
+        return;
+    }
 
     // Recipient-block enforcement (parity with the HTTP path): a recipient can
     // block a sender (recipient_fee == -1). The WS path honors it too, so a
