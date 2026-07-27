@@ -979,8 +979,7 @@ async fn test_send_payable_without_payment_is_missing_payment_tx() {
         stub_wallet::Internalize::Accept,
     )))
     .await;
-    let (status, body) =
-        post_json(&app, "/sendMessage", payable_send_body("pay-1", None)).await;
+    let (status, body) = post_json(&app, "/sendMessage", payable_send_body("pay-1", None)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "ERR_MISSING_PAYMENT_TX");
 }

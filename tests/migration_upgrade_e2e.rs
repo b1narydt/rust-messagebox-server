@@ -26,7 +26,10 @@ async fn raw_pool() -> DbPool {
         .start()
         .await
         .expect("start MySQL testcontainer (Docker required)");
-    let port = container.get_host_port_ipv4(3306).await.expect("mysql port");
+    let port = container
+        .get_host_port_ipv4(3306)
+        .await
+        .expect("mysql port");
     // Leak the container handle so it outlives the pool for the test's duration.
     Box::leak(Box::new(container));
 

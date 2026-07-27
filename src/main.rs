@@ -265,7 +265,9 @@ async fn main() {
             for raw in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                 match raw.parse() {
                     Ok(v) => origins.push(v),
-                    Err(e) => tracing::warn!(origin = %raw, error = %e, "CORS_ALLOWED_ORIGINS: dropping unparseable origin"),
+                    Err(e) => {
+                        tracing::warn!(origin = %raw, error = %e, "CORS_ALLOWED_ORIGINS: dropping unparseable origin")
+                    }
                 }
             }
             if origins.is_empty() {
@@ -276,7 +278,10 @@ async fn main() {
                     "CORS_ALLOWED_ORIGINS was set but no entry parsed to a valid origin — ALL cross-origin requests will be blocked. Fix the values or unset the variable."
                 );
             } else {
-                tracing::info!(count = origins.len(), "CORS restricted to an explicit origin allowlist");
+                tracing::info!(
+                    count = origins.len(),
+                    "CORS restricted to an explicit origin allowlist"
+                );
             }
             CorsLayer::new()
                 .allow_origin(origins)
@@ -352,61 +357,62 @@ async fn main() {
     let ready_pool = pool.clone();
     let ready_backplane = backplane.clone();
     let ready_ops = ops.clone();
-    let ops_routes = Router::new()
-        .route(
-            "/health/ready",
-            get(move || {
-                let pool = ready_pool.clone();
-                let backplane = ready_backplane.clone();
-                let ops = ready_ops.clone();
-                async move {
-                    messagebox_server::ops::readiness(&pool, backplane.as_deref(), &ops).await
-                }
-            }),
-        )
-        .route(
-            "/metrics",
-            get(move || {
-                let ws = metrics_ws.clone();
-                let backplane = metrics_backplane.clone();
-                let ops = metrics_ops.clone();
-                async move {
-                    let (connections, identities) = ws.live_counts();
-                    let (depth, capacity) = ws.persist_queue();
-                    let persist = ws.persist_stats();
-                    let page = messagebox_server::metrics::render(
-                        &messagebox_server::metrics::Snapshot {
-                            connections,
-                            authenticated_identities: identities,
-                            persist_queue_depth: depth,
-                            persist_queue_capacity: capacity,
-                            persist: &persist,
-                            backplane: backplane.as_ref().map(|bp| {
-                                messagebox_server::metrics::BackplaneSnapshot {
-                                    published: bp.published(),
-                                    dropped: bp.dropped(),
-                                    subscribed: bp.is_subscribed(),
-                                    subscriptions: bp.active_subscription_count() as u64,
-                                }
-                            }),
-                            ops: Some(messagebox_server::metrics::OpsSnapshot {
-                                draining: ops.is_draining(),
-                                in_flight_sends: ops.in_flight_sends(),
-                                admission_rejected: ops.admission_rejected(),
-                                max_connections: ops.max_connections() as u64,
-                            }),
-                        },
-                    );
-                    (
-                        [(
-                            axum::http::header::CONTENT_TYPE,
-                            "text/plain; version=0.0.4",
-                        )],
-                        page,
-                    )
-                }
-            }),
-        );
+    let ops_routes =
+        Router::new()
+            .route(
+                "/health/ready",
+                get(move || {
+                    let pool = ready_pool.clone();
+                    let backplane = ready_backplane.clone();
+                    let ops = ready_ops.clone();
+                    async move {
+                        messagebox_server::ops::readiness(&pool, backplane.as_deref(), &ops).await
+                    }
+                }),
+            )
+            .route(
+                "/metrics",
+                get(move || {
+                    let ws = metrics_ws.clone();
+                    let backplane = metrics_backplane.clone();
+                    let ops = metrics_ops.clone();
+                    async move {
+                        let (connections, identities) = ws.live_counts();
+                        let (depth, capacity) = ws.persist_queue();
+                        let persist = ws.persist_stats();
+                        let page = messagebox_server::metrics::render(
+                            &messagebox_server::metrics::Snapshot {
+                                connections,
+                                authenticated_identities: identities,
+                                persist_queue_depth: depth,
+                                persist_queue_capacity: capacity,
+                                persist: &persist,
+                                backplane: backplane.as_ref().map(|bp| {
+                                    messagebox_server::metrics::BackplaneSnapshot {
+                                        published: bp.published(),
+                                        dropped: bp.dropped(),
+                                        subscribed: bp.is_subscribed(),
+                                        subscriptions: bp.active_subscription_count() as u64,
+                                    }
+                                }),
+                                ops: Some(messagebox_server::metrics::OpsSnapshot {
+                                    draining: ops.is_draining(),
+                                    in_flight_sends: ops.in_flight_sends(),
+                                    admission_rejected: ops.admission_rejected(),
+                                    max_connections: ops.max_connections() as u64,
+                                }),
+                            },
+                        );
+                        (
+                            [(
+                                axum::http::header::CONTENT_TYPE,
+                                "text/plain; version=0.0.4",
+                            )],
+                            page,
+                        )
+                    }
+                }),
+            );
 
     // Protected API routes — BRC-103/104 auth via bsv-sdk Peer middleware
     let api_routes = Router::new()

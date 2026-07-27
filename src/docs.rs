@@ -131,7 +131,10 @@ mod tests {
             spec["components"]["securitySchemes"]["BRC103Auth"].is_object(),
             "openapi must document the BRC-103 auth scheme"
         );
-        assert!(spec["security"].is_array(), "openapi must declare a security requirement");
+        assert!(
+            spec["security"].is_array(),
+            "openapi must declare a security requirement"
+        );
     }
 
     /// F5: the served spec carries a `servers[]` block reflecting the prefix.
@@ -160,7 +163,10 @@ mod tests {
         assert!(html.contains("openapi.json"));
         // Pinned version, not a floating major, and SRI on both assets.
         assert!(html.contains(&format!("swagger-ui-dist@{SWAGGER_UI_VERSION}")));
-        assert!(!html.contains("swagger-ui-dist@5/"), "must not use a floating tag");
+        assert!(
+            !html.contains("swagger-ui-dist@5/"),
+            "must not use a floating tag"
+        );
         assert!(html.contains(SWAGGER_CSS_SRI));
         assert!(html.contains(SWAGGER_JS_SRI));
         assert!(html.contains("crossorigin=\"anonymous\""));

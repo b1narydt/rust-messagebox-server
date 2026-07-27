@@ -198,7 +198,10 @@ async fn test_blocked_recipient_fee_is_minus_one() {
     let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
         .await
         .unwrap();
-    assert_eq!(fee, -1, "a blocked (recipient_fee=-1) permission must surface as -1");
+    assert_eq!(
+        fee, -1,
+        "a blocked (recipient_fee=-1) permission must surface as -1"
+    );
 }
 
 #[tokio::test]
@@ -209,7 +212,10 @@ async fn test_get_recipient_fee_auto_create_default() {
     let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "notifications")
         .await
         .unwrap();
-    assert_eq!(fee, 0, "every box smart-defaults to a 0 recipient fee (free delivery)");
+    assert_eq!(
+        fee, 0,
+        "every box smart-defaults to a 0 recipient fee (free delivery)"
+    );
 
     let fee = get_recipient_fee(&pool, TEST_KEY, TEST_KEY2, "inbox")
         .await

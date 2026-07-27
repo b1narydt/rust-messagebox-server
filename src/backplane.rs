@@ -647,7 +647,10 @@ mod tests {
         let msg = v["message"].as_object().expect("message object");
         assert_eq!(msg.len(), 7);
         for key in ["signature", "nonce", "yourNonce", "identityKey"] {
-            assert!(!msg.contains_key(key), "unsigned payload must not carry {key}");
+            assert!(
+                !msg.contains_key(key),
+                "unsigned payload must not carry {key}"
+            );
         }
         let back: BackplaneEnvelope = serde_json::from_value(v).expect("roundtrips");
         assert_eq!(back.message.message_id, "m1");
@@ -671,23 +674,38 @@ mod tests {
 
         // First join of a room → count 1.
         bp.on_room_join("sockA", "03bb-inbox");
-        assert_eq!(*bp.route.members.lock().counts.get("03bb-inbox").unwrap(), 1);
+        assert_eq!(
+            *bp.route.members.lock().counts.get("03bb-inbox").unwrap(),
+            1
+        );
         // Second local member of the same room → count 2 (no new subscribe).
         bp.on_room_join("sockB", "03bb-inbox");
-        assert_eq!(*bp.route.members.lock().counts.get("03bb-inbox").unwrap(), 2);
+        assert_eq!(
+            *bp.route.members.lock().counts.get("03bb-inbox").unwrap(),
+            2
+        );
         // A different room tracked independently.
         bp.on_room_join("sockA", "03cc-inbox");
-        assert_eq!(*bp.route.members.lock().counts.get("03cc-inbox").unwrap(), 1);
+        assert_eq!(
+            *bp.route.members.lock().counts.get("03cc-inbox").unwrap(),
+            1
+        );
 
         // One member leaves 03bb-inbox → count 1, still owned.
         bp.on_room_leave("sockA", "03bb-inbox");
-        assert_eq!(*bp.route.members.lock().counts.get("03bb-inbox").unwrap(), 1);
+        assert_eq!(
+            *bp.route.members.lock().counts.get("03bb-inbox").unwrap(),
+            1
+        );
 
         // Disconnect sockB → last member of 03bb-inbox gone → room dropped.
         bp.on_socket_disconnect("sockB");
         assert!(!bp.route.members.lock().counts.contains_key("03bb-inbox"));
         // sockA still owns 03cc-inbox.
-        assert_eq!(*bp.route.members.lock().counts.get("03cc-inbox").unwrap(), 1);
+        assert_eq!(
+            *bp.route.members.lock().counts.get("03cc-inbox").unwrap(),
+            1
+        );
 
         // Idempotent: re-leaving a room the socket isn't in is a no-op.
         bp.on_room_leave("sockA", "03bb-inbox");
@@ -708,7 +726,10 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while bp.dropped() == 0 {
-            assert!(tokio::time::Instant::now() < deadline, "drop must be observed");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drop must be observed"
+            );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert_eq!(bp.published(), 0);

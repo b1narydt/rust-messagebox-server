@@ -25,7 +25,10 @@ fn env(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
 fn now_ns() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
 }
 
 async fn identity_of(w: &ProtoWallet) -> String {
@@ -160,15 +163,35 @@ async fn live_load() {
 
     println!("--- results ---");
     println!("  sent:        {sent_total}");
-    println!("  received:    {recv_total}  ({:.1}% delivered live)", 100.0 * recv_total as f64 / sent_total.max(1) as f64);
+    println!(
+        "  received:    {recv_total}  ({:.1}% delivered live)",
+        100.0 * recv_total as f64 / sent_total.max(1) as f64
+    );
     println!("  wall:        {wall:.2}s");
-    println!("  throughput:  {:.0} msg/s (sent), {:.0} msg/s (delivered)", sent_total as f64 / wall, recv_total as f64 / wall);
-    println!("  latency ms:  p50={:.1}  p90={:.1}  p99={:.1}  max={:.1}", pct(0.50), pct(0.90), pct(0.99), pct(1.0));
+    println!(
+        "  throughput:  {:.0} msg/s (sent), {:.0} msg/s (delivered)",
+        sent_total as f64 / wall,
+        recv_total as f64 / wall
+    );
+    println!(
+        "  latency ms:  p50={:.1}  p90={:.1}  p99={:.1}  max={:.1}",
+        pct(0.50),
+        pct(0.90),
+        pct(0.99),
+        pct(1.0)
+    );
     if !errors.is_empty() {
-        println!("  client errors ({}): {:?}", errors.len(), &errors[..errors.len().min(5)]);
+        println!(
+            "  client errors ({}): {:?}",
+            errors.len(),
+            &errors[..errors.len().min(5)]
+        );
     }
 
     // Soft assertions: most messages should be delivered live and the server
     // should not have fallen over.
-    assert!(sent_total > 0, "no messages sent — connection/auth failed: {errors:?}");
+    assert!(
+        sent_total > 0,
+        "no messages sent — connection/auth failed: {errors:?}"
+    );
 }

@@ -259,13 +259,11 @@ fn should_deactivate(status: reqwest::StatusCode, response_body: &str) -> bool {
     if v["error"]["status"].as_str() == Some("NOT_FOUND") {
         return true;
     }
-    v["error"]["details"]
-        .as_array()
-        .is_some_and(|details| {
-            details
-                .iter()
-                .any(|d| d["errorCode"].as_str() == Some("UNREGISTERED"))
-        })
+    v["error"]["details"].as_array().is_some_and(|details| {
+        details
+            .iter()
+            .any(|d| d["errorCode"].as_str() == Some("UNREGISTERED"))
+    })
 }
 
 /// Show only the last 10 characters of an FCM token for log safety.

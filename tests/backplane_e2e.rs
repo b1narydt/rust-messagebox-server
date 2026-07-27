@@ -244,7 +244,10 @@ async fn own_origin_envelope_is_not_double_delivered() {
     let (client, mut msg_rx) = connect_and_join(&url_a, &room).await;
     // Owner IS subscribed to its own room channel here, so the own-origin skip
     // is actually exercised (the envelope round-trips back to this instance).
-    wait_until("subscribed to the room channel", || bp.is_room_active(&room)).await;
+    wait_until("subscribed to the room channel", || {
+        bp.is_room_active(&room)
+    })
+    .await;
 
     let msg = room_message("m-self-1", &recipient, "mpc_inbox");
     let delivered = ws_a

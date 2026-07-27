@@ -90,7 +90,10 @@ impl Limiter {
         tracing::info!(
             rps,
             burst,
-            trusted_ip_header = trusted_header.as_ref().map(|h| h.as_str()).unwrap_or("<peer>"),
+            trusted_ip_header = trusted_header
+                .as_ref()
+                .map(|h| h.as_str())
+                .unwrap_or("<peer>"),
             "per-IP rate limiting enabled"
         );
         Some(Arc::new(Self {
@@ -213,8 +216,8 @@ mod tests {
 
     #[test]
     fn burst_then_throttle() {
-        let quota = Quota::per_second(NonZeroU32::new(1).unwrap())
-            .allow_burst(NonZeroU32::new(2).unwrap());
+        let quota =
+            Quota::per_second(NonZeroU32::new(1).unwrap()).allow_burst(NonZeroU32::new(2).unwrap());
         let l = Limiter {
             inner: RateLimiter::keyed(quota),
             trusted_header: None,
@@ -226,6 +229,9 @@ mod tests {
         // Burst of 2 allowed, 3rd immediate request is limited.
         assert!(l.check(&h, Some(peer)).is_ok());
         assert!(l.check(&h, Some(peer)).is_ok());
-        assert!(l.check(&h, Some(peer)).is_err(), "3rd request within the second must be 429");
+        assert!(
+            l.check(&h, Some(peer)).is_err(),
+            "3rd request within the second must be 429"
+        );
     }
 }
