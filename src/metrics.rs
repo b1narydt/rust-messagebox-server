@@ -103,6 +103,15 @@ pub static BACKPLANE_LAG_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
     ])
 });
 
+/// Model B: restarts of the supervised backplane delivery task after a panic.
+///
+/// A free-standing counter rather than a [`BackplaneSnapshot`] field because the
+/// supervisor lives in `ws.rs` and outlives any single scrape. The persist
+/// worker's equivalent (`mbs_persist_worker_panics_total`) is the model: an
+/// event the system is designed to SURVIVE still has to be alertable, or the
+/// operator only learns about it by reading logs they have no reason to read.
+pub static BACKPLANE_DELIVERY_PANICS: AtomicU64 = AtomicU64::new(0);
+
 // ---------------------------------------------------------------------------
 // Scrape-time snapshot + render
 // ---------------------------------------------------------------------------
@@ -266,6 +275,13 @@ pub fn render(s: &Snapshot) -> String {
             "Room channels this instance is subscribed to (directed routing: one per owned room).",
             bp.subscriptions,
         );
+        counter(
+            &mut out,
+            "mbs_backplane_delivery_panics_total",
+            "Restarts of the supervised backplane delivery task after a panic. \
+             Delivery survives, but each one nearly disabled cross-instance push.",
+            BACKPLANE_DELIVERY_PANICS.load(Ordering::Relaxed),
+        );
         BACKPLANE_LAG_SECONDS.render_into(
             "mbs_backplane_lag_seconds",
             "Redis pub/sub round-trip lag observed on own-origin envelopes (same clock).",
@@ -374,6 +390,7 @@ mod tests {
             "mbs_backplane_published_total 100",
             "mbs_backplane_dropped_total 5",
             "mbs_backplane_subscribed 1",
+            "mbs_backplane_delivery_panics_total",
             "mbs_backplane_lag_seconds_count",
             "mbs_draining 0",
             "mbs_in_flight_sends 2",

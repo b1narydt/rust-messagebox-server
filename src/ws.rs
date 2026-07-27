@@ -355,6 +355,8 @@ where
                 return;
             }
             Err(join_err) => {
+                crate::metrics::BACKPLANE_DELIVERY_PANICS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 error!(
                     code = "ERR_BACKPLANE_DELIVERY_PANIC",
                     error = %join_err,

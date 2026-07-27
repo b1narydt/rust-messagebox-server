@@ -701,23 +701,23 @@ async fn append_dead_letter_line(path: &Path, line: &[u8]) -> std::io::Result<()
 }
 
 /// Boot-time writability probe: attempt the exact create/append open the
-/// capture path uses, removing the file again if the probe created it (an
-/// existing file — possibly holding pending records — is left untouched).
-/// Returns whether the path is writable; logs at ERROR when it is not. The
-/// server keeps running either way — see [`PersistHandle::spawn`].
+/// capture path uses. Returns whether the path is writable; logs at ERROR when
+/// it is not. The server keeps running either way — see [`PersistHandle::spawn`].
+///
+/// The probe deliberately does NOT clean up a file it created. "Remove it if it
+/// did not exist a moment ago" is a time-of-check/time-of-use race, and losing
+/// it destroys exactly what this module exists to protect: a peer sharing the
+/// path (replicas on one volume, a rolling restart, or two tests in the same
+/// binary) can append records between the check and the unlink, and they would
+/// be deleted while already counted as captured. An empty file costs nothing —
+/// the capture path opens with these same flags and appends to it.
 fn probe_dead_letter_path(path: &Path) -> bool {
-    let existed = path.exists();
     match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
     {
-        Ok(_) => {
-            if !existed {
-                let _ = std::fs::remove_file(path);
-            }
-            true
-        }
+        Ok(_) => true,
         Err(e) => {
             error!(
                 path = %path.display(),
@@ -1006,18 +1006,20 @@ mod tests {
     }
 
     #[test]
-    fn probe_reports_writability_and_leaves_no_artifact() {
+    fn probe_reports_writability_without_destroying_records() {
         let dir = unique_tmp_dir("probe");
         let path = dir.join("dead_letter.jsonl");
         assert!(probe_dead_letter_path(&path));
-        assert!(
-            !path.exists(),
-            "a probe that created the file must remove it"
-        );
-        // An existing file (possibly holding pending records) is left intact.
+        // The probe may leave an empty file behind; what it must NEVER do is
+        // unlink one, since a peer sharing the path could have appended real
+        // captures between any check and a removal.
         std::fs::write(&path, b"{}\n").unwrap();
         assert!(probe_dead_letter_path(&path));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{}\n",
+            "the probe must never destroy existing dead-letter records"
+        );
         // Unwritable (missing parent directory) reports false, does not panic.
         assert!(!probe_dead_letter_path(
             &dir.join("missing").join("dl.jsonl")

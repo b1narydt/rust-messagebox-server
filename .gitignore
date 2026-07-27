@@ -4,3 +4,7 @@
 *.db-wal
 .DS_Store
 .env
+
+# Dead-letter capture file (persist.rs / DEAD_LETTER_PATH) — a runtime
+# artifact; tests and local runs create it in the crate root.
+dead_letter.jsonl

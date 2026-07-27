@@ -34,7 +34,13 @@ const DEACTIVATION_BREAKER_TRIP: u32 = 50;
 /// Returns `false` once the trip count is exceeded. The ERROR fires only on the
 /// transition so a sustained outage doesn't flood the log.
 fn claim_deactivation() -> bool {
-    let n = CONSECUTIVE_DEACTIVATIONS.fetch_add(1, Ordering::Relaxed) + 1;
+    // `saturating_add` on the returned value: a plain `+ 1` would panic in debug
+    // builds at u32::MAX, and in release would wrap to 0 and silently re-close
+    // the breaker. Unreachable in practice, but the breaker exists precisely for
+    // the case where our reasoning about reachability was wrong.
+    let n = CONSECUTIVE_DEACTIVATIONS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
     if n <= DEACTIVATION_BREAKER_TRIP {
         return true;
     }
