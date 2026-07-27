@@ -146,8 +146,14 @@
     },
     "/metrics": {
       "get": {
-        "summary": "Prometheus metrics (Rust extension). Served on the private ops listener (OPS_BIND), so it is reachable only from the scrape network, not from the public base URL above.",
+        "summary": "Prometheus metrics (Rust extension). Served ONLY on the private ops listener (OPS_BIND) — the public base URL answers 401 here. The operation-level `servers` below points at that listener so generated clients do not call the public host.",
         "security": [],
+        "servers": [
+          {
+            "url": "http://127.0.0.1:9091",
+            "description": "Private ops listener (OPS_BIND). Reachable from the scrape network only."
+          }
+        ],
         "responses": { "200": { "description": "text/plain; version=0.0.4" } }
       }
     }
