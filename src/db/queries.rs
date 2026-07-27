@@ -8,6 +8,21 @@ use super::DbPool;
 
 static DELIVERY_FEE_CACHE: OnceLock<HashMap<String, i64>> = OnceLock::new();
 
+/// Whether reference (TS/Go/CF) pay-to-deliver economics are enabled for the
+/// `notifications` box (`MESSAGEBOX_PARITY_FEES=true`). Set once at boot from
+/// [`crate::config::Config::parity_fees`]; defaults to `false` (free delivery).
+static PARITY_FEES: OnceLock<bool> = OnceLock::new();
+
+/// Set the parity-fees mode at boot (before the first recipient-fee lookup).
+/// Idempotent: only the first call sticks (OnceLock).
+pub fn set_parity_fees(enabled: bool) {
+    let _ = PARITY_FEES.set(enabled);
+}
+
+fn parity_fees_enabled() -> bool {
+    PARITY_FEES.get().copied().unwrap_or(false)
+}
+
 /// Upsert a `server_fees` row. Creates the row if it does not exist; overwrites
 /// `delivery_fee` if it does. Must be called before `init_delivery_fee_cache`
 /// so the in-memory cache reflects the operator-supplied value.
@@ -200,8 +215,14 @@ pub async fn acknowledge_messages(
 // ---------------------------------------------------------------------------
 
 pub async fn get_server_delivery_fee(pool: &DbPool, message_box: &str) -> Result<i64, sqlx::Error> {
+    // The cache is a boot-time snapshot of every configured box. A hit is
+    // authoritative; a miss means the box was not configured at boot, so fall
+    // through to a live lookup rather than assuming 0 (correct if a fee was
+    // added out-of-band, and what lets tests arm a fee on a non-seeded box).
     if let Some(cache) = DELIVERY_FEE_CACHE.get() {
-        return Ok(cache.get(message_box).copied().unwrap_or(0));
+        if let Some(fee) = cache.get(message_box) {
+            return Ok(*fee);
+        }
     }
 
     let fee: Option<i64> =
@@ -212,9 +233,14 @@ pub async fn get_server_delivery_fee(pool: &DbPool, message_box: &str) -> Result
     Ok(fee.unwrap_or(0))
 }
 
-/// Smart default fee: notifications=10, everything else=0.
+/// Smart default recipient fee. Free (0) for every box by default — delivery
+/// is free out of the box (owner decision; deviates from the TS/Go/CF
+/// `notifications=10` default). With `MESSAGEBOX_PARITY_FEES=true` the
+/// `notifications` box returns the reference smart-default of 10, restoring
+/// byte-parity with the reference servers. A recipient who wants a fee on any
+/// box still sets it explicitly via `/permissions/set`.
 fn smart_default_fee(message_box: &str) -> i64 {
-    if message_box == "notifications" {
+    if parity_fees_enabled() && message_box == "notifications" {
         10
     } else {
         0
@@ -471,9 +497,17 @@ pub async fn list_permissions(
 }
 
 // ---------------------------------------------------------------------------
-// Device registrations
+// Device registrations (parity audit §4 — the TS notification/device contract)
 // ---------------------------------------------------------------------------
 
+/// Upsert a device registration keyed on the UNIQUE `fcm_token`.
+///
+/// On conflict the row is re-pointed at the caller's `identity_key` (token
+/// reassignment across accounts is deliberate — TS behavior), `device_id` /
+/// `platform` are refreshed, the device is reactivated, and `last_used` is
+/// bumped. Returns the row id; on an upsert-hit this is the EXISTING row's id
+/// (looked up explicitly — TS's knex `.onConflict().merge()` insert-id on
+/// update is driver-defined, so the lookup is the deterministic fix).
 pub async fn register_device(
     pool: &DbPool,
     identity_key: &str,
@@ -500,8 +534,8 @@ pub async fn register_device(
     .execute(pool)
     .await?;
 
-    // On an UPDATE (upsert hit an existing row) last_insert_id is the old row's id;
-    // on INSERT it is the new id. For the existing-row case, look it up.
+    // On an INSERT last_insert_id is the new id; on an UPDATE (upsert hit an
+    // existing row) MySQL may report 0. For the existing-row case, look it up.
     let id = result.last_insert_id() as i64;
     if id > 0 {
         return Ok(id);
@@ -515,6 +549,7 @@ pub async fn register_device(
     Ok(found)
 }
 
+/// All of the caller's devices, ordered `updated_at DESC` (TS contract H14).
 pub async fn list_devices(
     pool: &DbPool,
     identity_key: &str,
@@ -530,6 +565,7 @@ pub async fn list_devices(
     rows.into_iter().map(row_to_device).collect()
 }
 
+/// Active devices only — the FCM fan-out set for a recipient.
 pub async fn list_active_devices(
     pool: &DbPool,
     identity_key: &str,
@@ -562,6 +598,7 @@ fn row_to_device(row: sqlx::mysql::MySqlRow) -> Result<DeviceRow, sqlx::Error> {
     })
 }
 
+/// Successful FCM delivery: bump `last_used` (token lifecycle, §4.3).
 pub async fn update_device_last_used(pool: &DbPool, device_id: i64) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE device_registrations \
@@ -574,6 +611,7 @@ pub async fn update_device_last_used(pool: &DbPool, device_id: i64) -> Result<()
     Ok(())
 }
 
+/// FCM reported the token permanently invalid: deactivate (token lifecycle, §4.3).
 pub async fn deactivate_device(pool: &DbPool, device_id: i64) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE device_registrations \
@@ -586,6 +624,8 @@ pub async fn deactivate_device(pool: &DbPool, device_id: i64) -> Result<(), sqlx
     Ok(())
 }
 
+/// FCM delivery is gated on exactly one magic box name — `notifications`
+/// (TS `shouldUseFCMDelivery`).
 pub fn should_use_fcm_delivery(message_box: &str) -> bool {
     message_box == "notifications"
 }

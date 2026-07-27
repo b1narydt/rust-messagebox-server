@@ -78,7 +78,7 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, Instrument};
 
 use crate::db::{self, DbPool};
 
@@ -207,6 +207,13 @@ pub struct PersistStats {
     pub inline_persists: AtomicU64,
     /// Times the supervised worker restarted after a panic.
     pub worker_panics: AtomicU64,
+    /// Jobs successfully handed to the background worker (the fast path).
+    /// Inline persists are NOT counted here — they are durable (or
+    /// dead-lettered) before `enqueue` returns, so they never occupy the queue.
+    pub enqueued: AtomicU64,
+    /// Queued jobs the worker has finished (stored, duplicate, or
+    /// dead-lettered). `completed >= enqueued` ⇔ the queue is flushed.
+    pub completed: AtomicU64,
 }
 
 /// Classification of a `sqlx::Error` for retry purposes.
@@ -290,6 +297,43 @@ impl PersistHandle {
         &self.stats
     }
 
+    /// Jobs currently waiting in the bounded queue (scrape-time sample).
+    pub fn queue_depth(&self) -> usize {
+        self.cfg.queue_capacity.saturating_sub(self.tx.capacity())
+    }
+
+    /// Configured queue capacity.
+    pub fn queue_capacity(&self) -> usize {
+        self.cfg.queue_capacity
+    }
+
+    /// Wait (bounded) until every job handed to the background worker has been
+    /// handled — stored in MySQL, confirmed duplicate, or dead-lettered to
+    /// disk. Used by graceful drain: after callers stop enqueuing (in-flight
+    /// sends drained), a `true` return means zero queued messages remain
+    /// un-durable. Returns `false` if `timeout` elapsed first (the worker keeps
+    /// running; nothing is dropped — the drain is bounded, not lossy).
+    pub async fn flush(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let enqueued = self.stats.enqueued.load(Ordering::Acquire);
+            let completed = self.stats.completed.load(Ordering::Acquire);
+            if completed >= enqueued {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                warn!(
+                    enqueued,
+                    completed,
+                    "persist flush timed out — {} queued job(s) not yet durable (worker still draining)",
+                    enqueued - completed
+                );
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Enqueue a job for asynchronous persistence.
     ///
     /// Fast path: a non-blocking `try_send` onto the bounded queue, returning
@@ -300,7 +344,10 @@ impl PersistHandle {
     /// meter the bypass.
     pub async fn enqueue(&self, job: PersistJob) -> Enqueued {
         match self.tx.try_send(job) {
-            Ok(()) => Enqueued::Queued,
+            Ok(()) => {
+                self.stats.enqueued.fetch_add(1, Ordering::Release);
+                Enqueued::Queued
+            }
             Err(mpsc::error::TrySendError::Full(job)) => {
                 self.stats.inline_persists.fetch_add(1, Ordering::Relaxed);
                 warn!(
@@ -405,7 +452,19 @@ async fn run_drain(
         };
         match next {
             Some(job) => {
-                persist_with_retry(&db, &job, &cfg, &stats, persist_once_db).await;
+                let span = tracing::debug_span!(
+                    "persist_job",
+                    msg_id = %job.message_id,
+                    recipient = %job.recipient,
+                    message_box = %job.message_box,
+                );
+                persist_with_retry(&db, &job, &cfg, &stats, persist_once_db)
+                    .instrument(span)
+                    .await;
+                // Counted after the retry loop resolves (stored / duplicate /
+                // dead-lettered): `completed` means "no longer pending", which
+                // is what `flush` waits on during graceful drain.
+                stats.completed.fetch_add(1, Ordering::Release);
             }
             None => return DrainExit::ChannelClosed,
         }

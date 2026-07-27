@@ -44,12 +44,14 @@ pub struct SendMessageResponse {
     pub results: Vec<SendMessageResult>,
 }
 
+/// One row of `GET /devices` (H14). Absent `deviceId`/`platform`/`lastUsed`
+/// serialize as `null` — the TS shape (no `skip_serializing_if`, no ""
+/// placeholder). `fcmToken` is pre-masked by the handler.
 #[derive(Debug, Serialize)]
 pub struct DeviceOut {
     pub id: i64,
-    #[serde(rename = "deviceId", skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "deviceId")]
     pub device_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
     #[serde(rename = "fcmToken")]
     pub fcm_token: String,
@@ -59,7 +61,7 @@ pub struct DeviceOut {
     #[serde(rename = "updatedAt")]
     pub updated_at: String,
     #[serde(rename = "lastUsed")]
-    pub last_used: String,
+    pub last_used: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

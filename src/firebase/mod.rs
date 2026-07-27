@@ -1,3 +1,20 @@
+//! Firebase Cloud Messaging (FCM v1) client — the push-notification half of
+//! the TS-parity notification system (parity audit §4.3, rows H9/N3/N4).
+//!
+//! Enablement is EXPLICIT (TS parity + fail-safe): `main()` calls
+//! [`initialize`] only when `ENABLE_FIREBASE=true`, and initialization
+//! requires `FIREBASE_PROJECT_ID` plus one credential source
+//! (`FIREBASE_SERVICE_ACCOUNT_JSON` or `FIREBASE_SERVICE_ACCOUNT_PATH`).
+//! Initialization failure is non-fatal — the server runs without push.
+//!
+//! ## E2 guard — this module handles key material
+//!
+//! The service-account JSON (and the RSA private key inside it) must NEVER be
+//! logged, `Debug`-printed, or echoed into an error message. Upstream TS
+//! itself logs the first 100 chars of the service-account JSON at init — do
+//! NOT reproduce that. Nothing in this module formats the JSON or the parsed
+//! key; error paths carry only parser/HTTP error text.
+
 pub mod send_fcm_notification;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -15,7 +32,7 @@ use tokio::sync::{OnceCell, RwLock};
 
 struct FirebaseState {
     project_id: String,
-    service_account_json: String, // kept for re-signing on refresh
+    service_account_json: String, // kept for re-signing on refresh — never logged (E2)
     access_token: String,
     token_expires_at: i64, // unix timestamp
     http_client: Client,
@@ -24,8 +41,9 @@ struct FirebaseState {
 static FIREBASE_STATE: OnceCell<Arc<RwLock<Option<FirebaseState>>>> = OnceCell::const_new();
 
 /// Initialize the Firebase client. Returns `Some(())` on success, `None` if
-/// Firebase could not be configured (which is non-fatal — the server runs
-/// without push notifications).
+/// Firebase could not be configured (non-fatal — the server runs without
+/// push notifications). Only call when the operator explicitly enabled
+/// Firebase (`ENABLE_FIREBASE=true`).
 pub async fn initialize(
     project_id: Option<&str>,
     service_account_json: Option<&str>,
@@ -34,7 +52,9 @@ pub async fn initialize(
     let project_id = match project_id {
         Some(id) if !id.is_empty() => id.to_owned(),
         _ => {
-            tracing::warn!("Firebase project_id not provided; push notifications disabled");
+            tracing::warn!(
+                "ENABLE_FIREBASE=true but FIREBASE_PROJECT_ID is not set; push notifications disabled"
+            );
             FIREBASE_STATE
                 .get_or_init(|| async { Arc::new(RwLock::new(None)) })
                 .await;
@@ -42,7 +62,7 @@ pub async fn initialize(
         }
     };
 
-    // Resolve service account JSON: use the provided string, or read from file.
+    // Resolve service account JSON: the provided string, or read from file.
     let sa_json = if let Some(json) = service_account_json {
         Some(json.to_owned())
     } else if let Some(path) = service_account_path {
@@ -98,16 +118,8 @@ pub async fn initialize(
         .get_or_init(|| async { Arc::new(RwLock::new(Some(state))) })
         .await;
 
-    tracing::debug!("Firebase initialized successfully");
+    tracing::info!("Firebase initialized — FCM push notifications enabled");
     Some(())
-}
-
-/// Whether Firebase push notifications are enabled.
-pub fn is_enabled() -> bool {
-    match FIREBASE_STATE.get() {
-        Some(lock) => lock.try_read().map(|g| g.is_some()).unwrap_or(false),
-        None => false,
-    }
 }
 
 /// Return a valid (project_id, access_token, http_client) tuple, refreshing
@@ -171,6 +183,7 @@ pub async fn get_valid_token() -> Option<(String, String, Client)> {
 // OAuth2 token exchange
 // ---------------------------------------------------------------------------
 
+// NOTE (E2): no Debug derive — this struct holds the RSA private key.
 #[derive(Deserialize)]
 struct ServiceAccount {
     private_key: String,
@@ -259,7 +272,8 @@ fn build_rs256_jwt(claims: &JwtClaims, pem_key: &str) -> Result<String, String> 
 }
 
 /// Parse a PEM-encoded PKCS#8 RSA private key and return a closure that
-/// produces PKCS#1 v1.5 SHA-256 signatures.
+/// produces PKCS#1 v1.5 SHA-256 signatures. Errors carry only the parser's
+/// message — never the key text (E2).
 fn rsa_sign_pkcs1v15_sha256(
     pem_key: &str,
 ) -> Result<impl Fn(&[u8]) -> Result<Vec<u8>, String>, String> {
@@ -274,4 +288,22 @@ fn rsa_sign_pkcs1v15_sha256(
             .sign(Pkcs1v15Sign::new::<Sha256>(), &hash)
             .map_err(|e| format!("RSA signing failed: {e}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rsa_sign_pkcs1v15_sha256;
+
+    /// E2: a bad key must produce an error that does NOT echo the key text.
+    #[test]
+    fn key_parse_error_never_echoes_key_material() {
+        let fake_key = "-----BEGIN PRIVATE KEY-----\nSUPERSECRETBYTES\n-----END PRIVATE KEY-----";
+        let err = rsa_sign_pkcs1v15_sha256(fake_key)
+            .err()
+            .expect("fake key must not parse");
+        assert!(
+            !err.contains("SUPERSECRETBYTES"),
+            "E2: error text echoed key material: {err}"
+        );
+    }
 }
