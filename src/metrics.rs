@@ -14,11 +14,12 @@
 //!
 //! The `GET /metrics` endpoint (wired in `main.rs`) carries no authentication
 //! — it exposes operational counts only (no identities, no message data, no
-//! key material). It is **network-gated instead**: together with
-//! `/health/ready` it is served on a private ops listener bound to `OPS_BIND`
-//! (default `127.0.0.1:9091`), never on the public port, so it is not part of
-//! the internet-facing surface. Set `OPS_BIND=0.0.0.0:<port>` only when the
-//! scrape network requires it.
+//! key material). It is **network-gated instead**: it is served only on the
+//! private ops listener bound to `OPS_BIND` (default `127.0.0.1:9091`), never
+//! on the public port. Set `OPS_BIND=0.0.0.0:<port>` only when the scrape
+//! network requires it. (`/health/ready` is mirrored on that listener but is
+//! ALSO public — platforms route one port, so the healthcheck can only reach
+//! the public one. It exposes coarse booleans, not counts.)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;

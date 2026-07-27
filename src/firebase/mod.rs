@@ -156,13 +156,23 @@ pub async fn initialize(
         access_token,
         token_expires_at: expires_at,
         last_refresh_failure_at: 0,
-        http_client: Client::builder()
-            .timeout(FCM_HTTP_TIMEOUT)
-            .build()
-            .unwrap_or_else(|e| {
-                tracing::warn!("Failed to build FCM client with timeout ({e}); using default");
-                Client::new()
-            }),
+        // No `Client::new()` fallback: it panics on exactly the conditions that
+        // make `build()` fail (TLS backend / resolver init), so "degrade
+        // gracefully" would abort the process, and succeeding would hand back
+        // the untimed client FCM_HTTP_TIMEOUT exists to prevent. Push is
+        // optional — disable it and keep serving.
+        http_client: match Client::builder().timeout(FCM_HTTP_TIMEOUT).build() {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to build the FCM HTTP client ({e}); push notifications disabled"
+                );
+                FIREBASE_STATE
+                    .get_or_init(|| async { Arc::new(RwLock::new(None)) })
+                    .await;
+                return None;
+            }
+        },
     };
 
     FIREBASE_STATE
@@ -287,6 +297,17 @@ pub async fn get_valid_token() -> Option<(String, String, Client)> {
             tracing::error!("Failed to refresh Firebase access token: {e}");
         }
     }
+
+    // Past actual expiry there is nothing usable to hand out. Returning the
+    // token anyway would send every push against a credential FCM rejects,
+    // turning one outage into an indefinite stream of 401s that look like
+    // delivery failures. `None` reports push as unavailable, which is true.
+    if chrono::Utc::now().timestamp() >= state.token_expires_at {
+        tracing::error!(
+            "Firebase access token is expired and cannot be refreshed — push notifications unavailable until the token exchange recovers"
+        );
+        return None;
+    }
     Some((
         state.project_id.clone(),
         state.access_token.clone(),
@@ -367,9 +388,16 @@ async fn obtain_access_token(service_account_json: &str) -> Result<(String, i64)
         .await
         .map_err(|e| format!("failed to parse token response: {e}"))?;
 
-    // Record absolute expiry from what the server actually reported.
-    let expires_at = now + token_resp.expires_in.unwrap_or(3600);
-    Ok((token_resp.access_token, expires_at))
+    // Record absolute expiry from what the server actually reported, but floor
+    // the lifetime past the refresh skew. Freshness is `now < expires_at -
+    // TOKEN_REFRESH_SKEW_SECS`, so a reported lifetime at or below the skew
+    // would mark every token stale the instant it is minted — each send would
+    // trigger another exchange and none would ever be considered usable.
+    let lifetime = token_resp
+        .expires_in
+        .unwrap_or(3600)
+        .max(TOKEN_REFRESH_SKEW_SECS + 60);
+    Ok((token_resp.access_token, now + lifetime))
 }
 
 /// Construct an RS256-signed JWT from the given claims and PEM-encoded private

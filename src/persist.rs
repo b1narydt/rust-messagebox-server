@@ -214,11 +214,14 @@ impl Default for PersistConfig {
 
 impl PersistConfig {
     /// Defaults with the operator env overrides applied: `DEAD_LETTER_PATH`
-    /// sets [`Self::dead_letter_path`]. Deployments whose working directory is
-    /// not writable (the Docker image runs as non-root with cwd `/`) MUST point
-    /// it at a writable location or every capture fails at the moment it is
-    /// needed — [`PersistHandle::spawn`] probes this at boot. Env is read here,
-    /// not in [`Default`], so `default()` stays hermetic for tests.
+    /// sets [`Self::dead_letter_path`]. The default is relative, so any
+    /// deployment whose working directory is not writable MUST point this at a
+    /// writable location or every capture fails at the moment it is needed —
+    /// [`PersistHandle::spawn`] probes it at boot and logs at ERROR. (The
+    /// shipped Docker image sets a writable `WORKDIR` owned by its non-root
+    /// user, so the default works there; that directory is still part of the
+    /// container's ephemeral layer.) Env is read here, not in [`Default`], so
+    /// `default()` stays hermetic for tests.
     pub fn from_env() -> Self {
         Self {
             dead_letter_path: dead_letter_path_from(std::env::var("DEAD_LETTER_PATH").ok()),
