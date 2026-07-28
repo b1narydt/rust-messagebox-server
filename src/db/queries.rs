@@ -137,22 +137,39 @@ pub async fn get_message_box_id(
 // Messages
 // ---------------------------------------------------------------------------
 
-/// Insert a message. Returns Ok(true) on success, Ok(false) if this exact
-/// `messageId` is already stored (idempotent replay).
+/// What an attempted message insert actually did.
 ///
-/// "Nothing was inserted" is NOT by itself proof of a duplicate, and callers
-/// treat `Ok(false)` as success — so it is verified before being reported.
-/// `INSERT IGNORE` downgrades *every* error to a warning, and `messageId` is
-/// `utf8mb4_unicode_ci`: case-insensitive, PAD SPACE, and blind to the
-/// difference between supplementary characters. So `ABC-1` collides with
-/// `abc-1`, and two distinct emoji collide with each other, across the whole
-/// global messageId namespace. Reporting those as idempotent success loses a
-/// message while telling the sender it was stored.
+/// Distinguishes the two ways `INSERT IGNORE` can store nothing, because they
+/// need opposite handling: a genuine replay is success, while an id the unique
+/// index considers taken by *different* bytes is a rejected send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// The row was written.
+    Inserted,
+    /// This exact `messageId` is already stored — idempotent replay.
+    Duplicate,
+    /// Nothing was stored and no row carries this exact id: the unique index
+    /// matched a *collation-equal but byte-different* id (the column is
+    /// case-insensitive and PAD SPACE), or another constraint suppressed the
+    /// insert. Never retryable and never storable — the caller must reject the
+    /// send rather than report success.
+    IdConflict,
+}
+
+/// Insert a message. See [`InsertOutcome`] for what the result means.
 ///
-/// The follow-up compares raw bytes. A row that matches exactly is a genuine
-/// duplicate; anything else means the insert was swallowed for a reason the
-/// caller must not read as success, so it surfaces as an error — the job is
-/// then dead-lettered and logged instead of vanishing.
+/// "Nothing was inserted" is NOT by itself proof of a duplicate, and a
+/// duplicate is reported to the sender as success — so it is verified before
+/// being claimed. `INSERT IGNORE` downgrades *every* error to a warning, and
+/// `messageId` is `utf8mb4_unicode_ci`: case-insensitive, PAD SPACE, and blind
+/// to the difference between supplementary characters. So `ABC-1` collides with
+/// `abc-1`, and two distinct emoji collide with each other, across a messageId
+/// namespace that is global rather than scoped per recipient or box. Reporting
+/// those as idempotent success loses a message while telling the sender it was
+/// stored, and lets whoever writes an id first suppress every collation-equal
+/// id from anyone else.
+///
+/// The follow-up compares raw bytes, which the column's collation does not.
 pub async fn insert_message(
     pool: &DbPool,
     message_id: &str,
@@ -160,7 +177,7 @@ pub async fn insert_message(
     sender: &str,
     recipient: &str,
     body: &str,
-) -> Result<bool, sqlx::Error> {
+) -> Result<InsertOutcome, sqlx::Error> {
     let result = sqlx::query(
         "INSERT IGNORE INTO messages (messageId, messageBoxId, sender, recipient, body) \
          VALUES (?, ?, ?, ?, ?)",
@@ -174,7 +191,7 @@ pub async fn insert_message(
     .await?;
 
     if result.rows_affected() > 0 {
-        return Ok(true);
+        return Ok(InsertOutcome::Inserted);
     }
 
     // The `messageId = ?` predicate uses the unique index; the CAST comparison
@@ -189,13 +206,9 @@ pub async fn insert_message(
     .await?;
 
     if exact > 0 {
-        return Ok(false);
+        return Ok(InsertOutcome::Duplicate);
     }
-    Err(sqlx::Error::Protocol(format!(
-        "INSERT IGNORE stored no row for messageId {message_id} and no row with that exact id \
-         exists — the insert was suppressed by a collation-equal messageId or another \
-         constraint. Refusing to report it as stored."
-    )))
+    Ok(InsertOutcome::IdConflict)
 }
 
 pub async fn list_messages(

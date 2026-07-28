@@ -717,6 +717,10 @@ fn log_persist_outcome(
             sid = %sid, msg_id = %message_id, recipient = %recipient,
             "persist: inline write hit a permanent error — dead-lettered to disk; row NOT in MySQL"
         ),
+        Enqueued::Rejected => warn!(
+            sid = %sid, msg_id = %message_id, recipient = %recipient,
+            "persist: messageId conflicts with a stored id under the column collation — send rejected, nothing stored and nothing to replay"
+        ),
     }
 }
 

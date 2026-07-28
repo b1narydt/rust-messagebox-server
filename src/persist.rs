@@ -90,6 +90,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, warn, Instrument};
 
+use crate::db::queries::InsertOutcome;
 use crate::db::{self, DbPool};
 
 /// One unit of durable work: persist a single message to MySQL.
@@ -174,6 +175,10 @@ pub enum Enqueued {
     /// Persisted inline but the DB write hit a permanent error; the job was
     /// dead-lettered to disk. Never silently dropped.
     DeadLettered,
+    /// Not stored and deliberately NOT dead-lettered: the `messageId` collides
+    /// with an existing id under the column's collation, so it can never be
+    /// inserted and there is nothing to replay. The send is rejected, not lost.
+    Rejected,
 }
 
 /// Tunables for the persist worker. Defaults are sized for the relay's hot path.
@@ -255,6 +260,10 @@ pub struct PersistStats {
     /// is gone — not in MySQL, not on disk. Nonzero requires operator action
     /// (fix `DEAD_LETTER_PATH` / the disk under it).
     pub dead_letter_failures: AtomicU64,
+    /// Sends rejected because the `messageId` collides with a stored id that
+    /// differs only by case/padding/collation weight. Client-caused and not
+    /// dead-lettered; a sustained rate means a buggy or probing client.
+    pub id_conflicts: AtomicU64,
     /// Times the fast path was bypassed for an inline write (queue full / closed).
     pub inline_persists: AtomicU64,
     /// Times the supervised worker restarted after a panic.
@@ -433,6 +442,7 @@ impl PersistHandle {
     async fn persist_inline(&self, job: &PersistJob) -> Enqueued {
         match persist_with_retry(&self.db, job, &self.cfg, &self.stats, persist_once_db).await {
             PersistOutcome::Stored | PersistOutcome::Duplicate => Enqueued::InlineOk,
+            PersistOutcome::Rejected => Enqueued::Rejected,
             PersistOutcome::DeadLetteredTransient => Enqueued::InlineDeadLettered,
             PersistOutcome::DeadLetteredPermanent => Enqueued::DeadLettered,
         }
@@ -533,6 +543,10 @@ async fn run_drain(
 enum PersistOutcome {
     Stored,
     Duplicate,
+    /// The send was rejected, not failed: the messageId can never be stored.
+    /// Distinct from the dead-lettered variants because there is nothing to
+    /// capture or replay — see the `IdConflict` arm in [`persist_with_retry`].
+    Rejected,
     DeadLetteredTransient,
     DeadLetteredPermanent,
 }
@@ -549,7 +563,7 @@ enum PersistOutcome {
 /// and counted, so a message is never *silently* lost.
 ///
 /// Dedup: `insert_message` uses `INSERT IGNORE` on the unique `messageId`. A
-/// duplicate returns `Ok(false)`; we treat it as success. Because persistence
+/// duplicate returns [`InsertOutcome::Duplicate`]; we treat it as success. Because persistence
 /// now happens *after* the live push, the duplicate check lands at persist time
 /// — which is acceptable: the client treats a duplicate as idempotent success,
 /// and the unique constraint still prevents a second row from ever existing.
@@ -562,7 +576,7 @@ async fn persist_with_retry<F, Fut>(
 ) -> PersistOutcome
 where
     F: Fn(DbPool, PersistJob) -> Fut,
-    Fut: std::future::Future<Output = Result<bool, sqlx::Error>>,
+    Fut: std::future::Future<Output = Result<InsertOutcome, sqlx::Error>>,
 {
     let mut attempt: u32 = 0;
     let mut backoff = cfg.base_backoff;
@@ -570,7 +584,7 @@ where
     loop {
         attempt += 1;
         match persist(db.clone(), job.clone()).await {
-            Ok(true) => {
+            Ok(InsertOutcome::Inserted) => {
                 debug!(
                     msg_id = %job.message_id,
                     recipient = %job.recipient,
@@ -580,7 +594,7 @@ where
                 );
                 return PersistOutcome::Stored;
             }
-            Ok(false) => {
+            Ok(InsertOutcome::Duplicate) => {
                 // Duplicate messageId — already persisted. Idempotent success.
                 debug!(
                     msg_id = %job.message_id,
@@ -588,6 +602,27 @@ where
                     "async persist: duplicate messageId, treating as idempotent success"
                 );
                 return PersistOutcome::Duplicate;
+            }
+            Ok(InsertOutcome::IdConflict) => {
+                // A REJECTED SEND, not a failed one — deliberately NOT
+                // dead-lettered. The id can never be stored (the unique index
+                // considers it taken by different bytes), so capturing the body
+                // would burn the dead-letter budget on something no replay can
+                // ever land. Capture exists for messages that *should* be in
+                // MySQL and are not; this one must not be there at all.
+                // Counted so a spike is visible: the sender chose the id, and a
+                // client that keeps colliding is either buggy or probing.
+                stats.id_conflicts.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    msg_id = %job.message_id,
+                    recipient = %job.recipient,
+                    message_box = %job.message_box,
+                    "async persist: messageId conflicts with a stored id that differs only by \
+                     case, trailing space, or collation weight — message NOT stored and NOT \
+                     dead-lettered (it can never be inserted under this id). The sender must \
+                     retry with a distinct messageId."
+                );
+                return PersistOutcome::Rejected;
             }
             Err(e) => match classify(&e) {
                 ErrorClass::Permanent => {
@@ -754,9 +789,9 @@ fn probe_dead_letter_path(path: &Path) -> bool {
 /// Resolve the messageBox id (ensuring the box exists) and insert the message.
 /// This is the real DB-backed persist closure injected into [`persist_with_retry`].
 ///
-/// Returns `Ok(true)` on a fresh insert, `Ok(false)` on a duplicate `messageId`,
+/// Returns the [`InsertOutcome`] of the insert attempt,
 /// and `Err` on any DB error (transient or otherwise — `classify` decides).
-async fn persist_once_db(db: DbPool, job: PersistJob) -> Result<bool, sqlx::Error> {
+async fn persist_once_db(db: DbPool, job: PersistJob) -> Result<InsertOutcome, sqlx::Error> {
     // ensure_message_box both creates (INSERT IGNORE) and resolves the id, so a
     // box that was never created (or a worker that lost the race) still gets a
     // valid id here. This makes the worker fully self-sufficient.
@@ -868,7 +903,7 @@ mod tests {
                 if n < 2 {
                     Err(io_err()) // transient: fail first two attempts
                 } else {
-                    Ok(true) // then succeed
+                    Ok(InsertOutcome::Inserted) // then succeed
                 }
             }
         };
@@ -948,7 +983,7 @@ mod tests {
         let dir = unique_tmp_dir("dup");
         let cfg = test_cfg(&dir);
         let stats = PersistStats::default();
-        let persist = |_db: DbPool, _job: PersistJob| async { Ok(false) };
+        let persist = |_db: DbPool, _job: PersistJob| async { Ok(InsertOutcome::Duplicate) };
         let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
         assert_eq!(outcome, PersistOutcome::Duplicate);
         assert_eq!(stats.dead_lettered.load(Ordering::Relaxed), 0);
@@ -1067,6 +1102,39 @@ mod tests {
         );
         assert_eq!(stats.dead_letter_failures.load(Ordering::Relaxed), 1);
         assert!(!cfg.dead_letter_path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A messageId conflict is a REJECTED send, not a failed one: it must not
+    /// consume the dead-letter budget.
+    ///
+    /// The id can never be inserted (the unique index considers it taken by
+    /// different bytes), so a captured copy could never be replayed — while the
+    /// sender picks the id, making it an attacker-chosen input. Routing it
+    /// through the permanent-error path let one socket append a full message
+    /// body per collision: measured at 13.7 MiB/s, exhausting the ceiling in
+    /// ~19s, after which a genuine DB outage loses its captures too.
+    #[tokio::test]
+    async fn id_conflict_is_rejected_without_consuming_the_dead_letter_budget() {
+        let dir = unique_tmp_dir("dl-conflict");
+        let cfg = test_cfg(&dir);
+        let stats = PersistStats::default();
+        let persist = |_db: DbPool, _job: PersistJob| async { Ok(InsertOutcome::IdConflict) };
+
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+
+        assert_eq!(outcome, PersistOutcome::Rejected);
+        assert_eq!(
+            stats.id_conflicts.load(Ordering::Relaxed),
+            1,
+            "the rejection must be counted so a spike is visible"
+        );
+        assert_eq!(stats.dead_lettered.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.dead_letter_failures.load(Ordering::Relaxed), 0);
+        assert!(
+            !cfg.dead_letter_path.exists(),
+            "a conflict must not write to the dead-letter file at all"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

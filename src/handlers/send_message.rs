@@ -622,6 +622,10 @@ pub async fn send_message(
                 msg_id = %msg_id, recipient = %fr.recipient,
                 "persist: inline write hit a permanent error — dead-lettered to disk; row NOT in MySQL"
             ),
+            crate::persist::Enqueued::Rejected => warn!(
+                msg_id = %msg_id, recipient = %fr.recipient,
+                "persist: messageId conflicts with a stored id under the column collation — send rejected, nothing stored and nothing to replay"
+            ),
         }
 
         // FCM push for the `notifications` box (§4.3): after the send,

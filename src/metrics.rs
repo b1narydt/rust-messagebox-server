@@ -238,6 +238,14 @@ pub fn render(s: &Snapshot) -> String {
     );
     counter(
         &mut out,
+        "mbs_persist_id_conflicts_total",
+        "Sends rejected because the messageId collides with a stored id under \
+         the column collation. Client-caused; a sustained rate means a buggy \
+         or probing client.",
+        p.id_conflicts.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
         "mbs_persist_dead_letter_failures_total",
         "Dead-letter captures that FAILED — the job is in neither MySQL nor the \
          file. Any nonzero value is lost messages; alert on it.",
@@ -351,6 +359,7 @@ mod tests {
         let persist = crate::persist::PersistStats::default();
         persist.dead_lettered.store(3, Ordering::Relaxed);
         persist.dead_letter_failures.store(1, Ordering::Relaxed);
+        persist.id_conflicts.store(4, Ordering::Relaxed);
         persist.inline_persists.store(2, Ordering::Relaxed);
         persist.enqueued.store(10, Ordering::Relaxed);
         persist.completed.store(9, Ordering::Relaxed);
@@ -387,6 +396,7 @@ mod tests {
             "mbs_persist_inline_fallback_total 2",
             "mbs_persist_dead_letter_total 3",
             "mbs_persist_dead_letter_failures_total 1",
+            "mbs_persist_id_conflicts_total 4",
             "mbs_persist_worker_panics_total 0",
             "mbs_backplane_published_total 100",
             "mbs_backplane_dropped_total 5",

@@ -53,7 +53,7 @@ async fn test_insert_message() {
     let ok = insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello")
         .await
         .unwrap();
-    assert!(ok, "insert should succeed");
+    assert_eq!(ok, InsertOutcome::Inserted, "insert should succeed");
 }
 
 #[tokio::test]
@@ -66,7 +66,11 @@ async fn test_insert_message_duplicate() {
     let ok = insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello again")
         .await
         .unwrap();
-    assert!(!ok, "duplicate messageId should return false");
+    assert_eq!(
+        ok,
+        InsertOutcome::Duplicate,
+        "an exact-match messageId is an idempotent duplicate"
+    );
 }
 
 /// A DIFFERENT messageId that merely collides under the column's
@@ -83,25 +87,27 @@ async fn test_insert_message_collation_collision_is_not_reported_as_duplicate() 
     let pool = fresh_pool().await;
     let mb_id = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
 
-    assert!(
+    assert_eq!(
         insert_message(&pool, "MSG-CI", mb_id, TEST_KEY2, TEST_KEY, "first")
             .await
-            .unwrap()
+            .unwrap(),
+        InsertOutcome::Inserted
     );
 
-    let err = insert_message(&pool, "msg-ci", mb_id, TEST_KEY2, TEST_KEY, "second")
-        .await
-        .expect_err("a collation-equal but distinct id must not report success");
-    assert!(
-        err.to_string().contains("msg-ci"),
-        "the error must name the message that was not stored: {err}"
+    assert_eq!(
+        insert_message(&pool, "msg-ci", mb_id, TEST_KEY2, TEST_KEY, "second")
+            .await
+            .unwrap(),
+        InsertOutcome::IdConflict,
+        "a collation-equal but byte-different id is a conflict, not a duplicate"
     );
 
     // The exact-match duplicate path still works alongside it.
-    assert!(
-        !insert_message(&pool, "MSG-CI", mb_id, TEST_KEY2, TEST_KEY, "again")
+    assert_eq!(
+        insert_message(&pool, "MSG-CI", mb_id, TEST_KEY2, TEST_KEY, "again")
             .await
             .unwrap(),
+        InsertOutcome::Duplicate,
         "a byte-identical id is a genuine duplicate"
     );
 }
