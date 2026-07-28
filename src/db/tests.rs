@@ -69,6 +69,43 @@ async fn test_insert_message_duplicate() {
     assert!(!ok, "duplicate messageId should return false");
 }
 
+/// A DIFFERENT messageId that merely collides under the column's
+/// case-insensitive collation must NOT be reported as an idempotent duplicate.
+///
+/// `messageId` is `utf8mb4_unicode_ci`, so `MSG-CI` and `msg-ci` compare equal
+/// and `INSERT IGNORE` silently stores nothing for the second one. Callers read
+/// `Ok(false)` as "already stored, nothing to do" and ack the sender, so
+/// accepting that here would lose a real message while reporting success —
+/// and, because the namespace is global, would let whoever writes an id first
+/// suppress every collation-equal id from anyone else.
+#[tokio::test]
+async fn test_insert_message_collation_collision_is_not_reported_as_duplicate() {
+    let pool = fresh_pool().await;
+    let mb_id = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
+
+    assert!(
+        insert_message(&pool, "MSG-CI", mb_id, TEST_KEY2, TEST_KEY, "first")
+            .await
+            .unwrap()
+    );
+
+    let err = insert_message(&pool, "msg-ci", mb_id, TEST_KEY2, TEST_KEY, "second")
+        .await
+        .expect_err("a collation-equal but distinct id must not report success");
+    assert!(
+        err.to_string().contains("msg-ci"),
+        "the error must name the message that was not stored: {err}"
+    );
+
+    // The exact-match duplicate path still works alongside it.
+    assert!(
+        !insert_message(&pool, "MSG-CI", mb_id, TEST_KEY2, TEST_KEY, "again")
+            .await
+            .unwrap(),
+        "a byte-identical id is a genuine duplicate"
+    );
+}
+
 #[tokio::test]
 async fn test_list_messages() {
     let pool = fresh_pool().await;

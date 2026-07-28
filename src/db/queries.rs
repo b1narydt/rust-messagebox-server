@@ -137,7 +137,22 @@ pub async fn get_message_box_id(
 // Messages
 // ---------------------------------------------------------------------------
 
-/// Insert a message. Returns Ok(true) on success, Ok(false) if duplicate.
+/// Insert a message. Returns Ok(true) on success, Ok(false) if this exact
+/// `messageId` is already stored (idempotent replay).
+///
+/// "Nothing was inserted" is NOT by itself proof of a duplicate, and callers
+/// treat `Ok(false)` as success — so it is verified before being reported.
+/// `INSERT IGNORE` downgrades *every* error to a warning, and `messageId` is
+/// `utf8mb4_unicode_ci`: case-insensitive, PAD SPACE, and blind to the
+/// difference between supplementary characters. So `ABC-1` collides with
+/// `abc-1`, and two distinct emoji collide with each other, across the whole
+/// global messageId namespace. Reporting those as idempotent success loses a
+/// message while telling the sender it was stored.
+///
+/// The follow-up compares raw bytes. A row that matches exactly is a genuine
+/// duplicate; anything else means the insert was swallowed for a reason the
+/// caller must not read as success, so it surfaces as an error — the job is
+/// then dead-lettered and logged instead of vanishing.
 pub async fn insert_message(
     pool: &DbPool,
     message_id: &str,
@@ -157,7 +172,30 @@ pub async fn insert_message(
     .bind(body)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() > 0)
+
+    if result.rows_affected() > 0 {
+        return Ok(true);
+    }
+
+    // The `messageId = ?` predicate uses the unique index; the CAST comparison
+    // then demands byte equality, which the column's collation does not.
+    let exact: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages \
+         WHERE messageId = ? AND CAST(messageId AS BINARY) = CAST(? AS BINARY)",
+    )
+    .bind(message_id)
+    .bind(message_id)
+    .fetch_one(pool)
+    .await?;
+
+    if exact > 0 {
+        return Ok(false);
+    }
+    Err(sqlx::Error::Protocol(format!(
+        "INSERT IGNORE stored no row for messageId {message_id} and no row with that exact id \
+         exists — the insert was suppressed by a collation-equal messageId or another \
+         constraint. Refusing to report it as stored."
+    )))
 }
 
 pub async fn list_messages(
