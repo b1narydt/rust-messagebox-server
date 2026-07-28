@@ -123,6 +123,45 @@ async fn test_insert_message_another_users_id_is_a_conflict_not_a_duplicate() {
         .is_empty());
 }
 
+/// The case that bites honest clients with no attacker involved: the reference
+/// client derives `messageId` from `(body, recipient)` and NOT the message box,
+/// so the same body sent to the same person in two boxes produces one id. The
+/// second send must be reported as a conflict — it is a different message — and
+/// never waved through as an idempotent replay.
+#[tokio::test]
+async fn test_insert_message_same_id_different_box_is_a_conflict() {
+    let pool = fresh_pool().await;
+    let inbox = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
+    let payment_inbox = ensure_message_box(&pool, TEST_KEY, "payment_inbox")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        insert_message(&pool, "same-body-id", inbox, TEST_KEY2, TEST_KEY, "body")
+            .await
+            .unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(
+        insert_message(
+            &pool,
+            "same-body-id",
+            payment_inbox,
+            TEST_KEY2,
+            TEST_KEY,
+            "body"
+        )
+        .await
+        .unwrap(),
+        InsertOutcome::IdConflict,
+        "a different box is a different message, not a replay"
+    );
+    assert!(list_messages(&pool, TEST_KEY, payment_inbox)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
 /// The same sender re-sending the same id to the same recipient/box IS a
 /// replay, and must stay idempotent success rather than becoming a conflict.
 #[tokio::test]

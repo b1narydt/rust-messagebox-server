@@ -391,6 +391,29 @@ async fn test_send_message_rejects_oversized_message_id() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// Reusing one messageId across recipients stores only the first row, because
+/// the id is unique. Every recipient would still be reported successful, so the
+/// batch is rejected up front instead.
+#[tokio::test]
+async fn test_send_message_rejects_repeated_message_id_in_a_batch() {
+    let app = setup_app().await;
+    let (status, body) = post_json(
+        &app,
+        "/sendMessage",
+        json!({
+            "message": {
+                "recipients": [RECIPIENT_KEY, TEST_KEY],
+                "messageBox": "inbox",
+                "messageId": ["same-id", "same-id"],
+                "body": "hello"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INVALID_MESSAGEID");
+}
+
 #[tokio::test]
 async fn test_send_message_id_count_mismatch() {
     let app = setup_app().await;

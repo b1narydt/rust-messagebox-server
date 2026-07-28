@@ -160,7 +160,16 @@ pub async fn send_message(
 
     tracing::Span::current().record("recipients", recipients.len());
 
-    // Validate recipient keys.
+    // Validate recipient keys, then normalise them.
+    //
+    // Identity keys are hex, so `02AB…` and `02ab…` are the SAME key — but the
+    // storage layer and the live-push layer disagree about that: MySQL compares
+    // `recipient`/`identityKey` case-insensitively, while Socket.IO room names
+    // are exact strings. An uppercase key therefore stored a row in the
+    // recipient's real mailbox while broadcasting to a room nobody had joined,
+    // so the message arrived only on a later poll. Lowercasing here (hex's
+    // canonical form, and what every client already sends) keeps the two views
+    // of "who is this" identical.
     for r in &recipients {
         if !is_valid_pub_key(r.trim()) {
             return error_response(
@@ -171,6 +180,11 @@ pub async fn send_message(
             .into_response();
         }
     }
+
+    let recipients: Vec<String> = recipients
+        .iter()
+        .map(|r| r.trim().to_ascii_lowercase())
+        .collect();
 
     // ── messageId ─────────────────────────────────────────────────────
     let mid_raw = match msg.get("messageId") {
@@ -265,6 +279,22 @@ pub async fn send_message(
                 StatusCode::BAD_REQUEST,
                 "ERR_INVALID_MESSAGEID",
                 "Each messageId must be at most 255 characters.",
+            )
+            .into_response();
+        }
+    }
+
+    // Ids within one batch must be distinct. `messages.messageId` is unique, so
+    // reusing one across recipients stores only the first — and the response
+    // would still report every recipient as successful, because each is its own
+    // job and the later ones come back as conflicts after the reply is sent.
+    {
+        let mut seen = std::collections::HashSet::with_capacity(message_ids.len());
+        if let Some(dup) = message_ids.iter().find(|id| !seen.insert(*id)) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "ERR_INVALID_MESSAGEID",
+                &format!("messageId {dup} is repeated; each recipient needs a distinct id."),
             )
             .into_response();
         }

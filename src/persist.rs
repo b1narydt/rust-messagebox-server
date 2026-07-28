@@ -454,6 +454,30 @@ impl PersistHandle {
     }
 }
 
+/// Cap on a client-chosen string echoed into a per-event log line.
+const LOG_ECHO_MAX_CHARS: usize = 48;
+
+/// Bound a client-chosen value before it reaches the log.
+fn truncate_for_log(s: &str) -> String {
+    if s.chars().count() <= LOG_ECHO_MAX_CHARS {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(LOG_ECHO_MAX_CHARS).collect();
+    format!("{head}…")
+}
+
+/// Marks a dequeued job "no longer pending" on scope exit, panic included.
+///
+/// A dequeued job is already out of the channel, so if the worker unwinds
+/// before counting it, nothing will ever count it — see the call site.
+struct CompletedGuard<'a>(&'a PersistStats);
+
+impl Drop for CompletedGuard<'_> {
+    fn drop(&mut self) {
+        self.0.completed.fetch_add(1, Ordering::Release);
+    }
+}
+
 /// Supervise the drain loop: restart it (loudly) if it panics, end cleanly when
 /// the channel closes gracefully.
 async fn run_supervised(
@@ -530,13 +554,18 @@ async fn run_drain(
                     recipient = %job.recipient,
                     message_box = %job.message_box,
                 );
+                // Counted on the way out of this job whatever happens —
+                // including a panic inside the retry loop. `completed` means
+                // "no longer pending", and `flush` waits for it to reach
+                // `enqueued`; a job that vanished on a panic without being
+                // counted would leave that condition permanently unsatisfiable,
+                // so every later graceful drain would burn its full timeout and
+                // report messages as un-durable forever. The supervisor already
+                // expects panics here and restarts, so this must survive one.
+                let _completed = CompletedGuard(&stats);
                 persist_with_retry(&db, &job, &cfg, &stats, persist_once_db)
                     .instrument(span)
                     .await;
-                // Counted after the retry loop resolves (stored / duplicate /
-                // dead-lettered): `completed` means "no longer pending", which
-                // is what `flush` waits on during graceful drain.
-                stats.completed.fetch_add(1, Ordering::Release);
             }
             None => return DrainExit::ChannelClosed,
         }
@@ -620,7 +649,10 @@ where
                 // client that keeps colliding is either buggy or probing.
                 stats.id_conflicts.fetch_add(1, Ordering::Relaxed);
                 warn!(
-                    msg_id = %job.message_id,
+                    // Truncated: the id is client-chosen and up to 255 chars,
+                    // and this line is emitted once per rejected send, so the
+                    // full echo turns a conflict flood into a log-volume lever.
+                    msg_id = %truncate_for_log(&job.message_id),
                     recipient = %job.recipient,
                     message_box = %job.message_box,
                     "async persist: messageId conflicts with a stored id that differs only by \
