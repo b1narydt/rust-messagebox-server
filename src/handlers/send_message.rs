@@ -9,6 +9,14 @@ use crate::firebase::send_fcm_notification::{send_fcm_notification, FcmPayload};
 
 /// Max `messageId` length, matching the `messages.messageId` VARCHAR(255).
 pub(crate) const MAX_MESSAGE_ID_CHARS: usize = 255;
+
+/// Max `messageBox` name length, matching the `messageBox.type` VARCHAR(255).
+///
+/// Oversized values are not merely rejected downstream: `ensure_message_box`
+/// inserts with `INSERT IGNORE`, which truncates to 255, and then selects the
+/// untruncated value — so the row is never found and the send fails as a
+/// *permanent* error. Rejecting at the edge keeps that out of reach.
+pub(crate) const MAX_MESSAGE_BOX_CHARS: usize = 255;
 use crate::handlers::helpers::{
     build_per_recipient_outputs, error_response, is_valid_pub_key, AppState, AuthIdentity, FeeRow,
 };
@@ -49,7 +57,9 @@ pub async fn send_message(
 
     // ── messageBox ────────────────────────────────────────────────────
     let box_type = match msg.get("messageBox").and_then(|v| v.as_str()) {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        Some(s) if !s.trim().is_empty() && s.trim().chars().count() <= MAX_MESSAGE_BOX_CHARS => {
+            s.trim().to_string()
+        }
         _ => {
             return error_response(
                 StatusCode::BAD_REQUEST,

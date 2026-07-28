@@ -867,6 +867,33 @@ async fn handle_ws_send_message(
         return;
     }
 
+    // Bound the two remaining client-controlled strings that reach MySQL.
+    //
+    // `recipient` and `message_box` land in VARCHAR(255) columns via
+    // `ensure_message_box`, whose `INSERT IGNORE` TRUNCATES an oversized value
+    // to 255 while the follow-up SELECT looks for the full-length one — so the
+    // lookup misses, the job is classified permanent, and the whole message
+    // (body included, up to MAX_MESSAGE_BODY_BYTES) is appended to the
+    // dead-letter file. The sender is acked "success" and nothing is stored, so
+    // a single socket can both silently lose its own messages and fill the
+    // disk. The HTTP path is not exposed to this: it validates the recipient
+    // key and resolves the box synchronously, failing the request instead.
+    //
+    // A valid identity key is exactly 66 hex chars, so validating the key also
+    // bounds it; `message_box` gets the column's own limit.
+    if !crate::handlers::helpers::is_valid_pub_key(&recipient) {
+        warn!(sid = %sid, "BRC-103 sendMessage: recipient is not a valid identity key");
+        message_failed(socket, ws, "Invalid recipient identity key").await;
+        return;
+    }
+    if message_box.trim().is_empty()
+        || message_box.chars().count() > crate::handlers::send_message::MAX_MESSAGE_BOX_CHARS
+    {
+        warn!(sid = %sid, "BRC-103 sendMessage: messageBox missing or too long");
+        message_failed(socket, ws, "Invalid messageBox").await;
+        return;
+    }
+
     // Recipient-block enforcement (parity with the HTTP path): a recipient can
     // block a sender (recipient_fee == -1). The WS path honors it too, so a
     // blocked sender can't route around the block over WebSocket. We fail

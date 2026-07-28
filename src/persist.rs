@@ -200,6 +200,11 @@ pub struct PersistConfig {
 /// Default dead-letter file, relative to the process working directory.
 const DEFAULT_DEAD_LETTER_PATH: &str = "dead_letter.jsonl";
 
+/// Ceiling on the dead-letter file. Past this, capture fails loudly (counted in
+/// `dead_letter_failures`) rather than continuing to consume the disk the
+/// service itself needs to run.
+const DEAD_LETTER_MAX_BYTES: u64 = 256 * 1024 * 1024;
+
 impl Default for PersistConfig {
     fn default() -> Self {
         Self {
@@ -693,12 +698,26 @@ async fn dead_letter(
 /// failure — the flush included, which for `tokio::fs::File` is where a
 /// buffered write actually surfaces — funnels into the single failure
 /// accounting in [`dead_letter`].
+///
+/// Refuses to grow the file past [`DEAD_LETTER_MAX_BYTES`]. Capture is a
+/// last-resort safety net, not an unbounded sink: each record carries the full
+/// message body, and any input that reliably produces a *permanent* DB error
+/// turns a send loop into disk consumption on the host. Filling the disk takes
+/// down the whole service, which is strictly worse than losing the captures
+/// past the ceiling — those are counted and logged as losses.
 async fn append_dead_letter_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
     let mut f = tokio::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .await?;
+    let size = f.metadata().await?.len();
+    if size.saturating_add(line.len() as u64) > DEAD_LETTER_MAX_BYTES {
+        return Err(std::io::Error::other(format!(
+            "dead-letter file is at its {DEAD_LETTER_MAX_BYTES}-byte ceiling ({size} bytes); \
+             drain or rotate it (see DEAD_LETTER_PATH)"
+        )));
+    }
     f.write_all(line).await?;
     f.flush().await
 }
@@ -1048,6 +1067,47 @@ mod tests {
         );
         assert_eq!(stats.dead_letter_failures.load(Ordering::Relaxed), 1);
         assert!(!cfg.dead_letter_path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Capture is a safety net, not an unbounded sink. Each record carries the
+    /// full message body, so any input that reliably produces a permanent DB
+    /// error would otherwise let a send loop consume the host's disk — which
+    /// takes down the whole service, unlike losing captures past a ceiling.
+    #[tokio::test]
+    async fn dead_letter_stops_at_the_size_ceiling_instead_of_filling_the_disk() {
+        let dir = unique_tmp_dir("dl-ceiling");
+        let cfg = test_cfg(&dir);
+
+        // Pre-fill the file to the ceiling.
+        std::fs::write(
+            &cfg.dead_letter_path,
+            vec![b'x'; DEAD_LETTER_MAX_BYTES as usize],
+        )
+        .expect("prefill");
+
+        let stats = PersistStats::default();
+        let persist = |_db: DbPool, _job: PersistJob| async { Err(sqlx::Error::RowNotFound) };
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+
+        assert_eq!(outcome, PersistOutcome::DeadLetteredPermanent);
+        assert_eq!(
+            stats.dead_lettered.load(Ordering::Relaxed),
+            0,
+            "a refused write is not a capture"
+        );
+        assert_eq!(
+            stats.dead_letter_failures.load(Ordering::Relaxed),
+            1,
+            "the loss must be counted so it is alertable"
+        );
+        assert_eq!(
+            std::fs::metadata(&cfg.dead_letter_path)
+                .expect("still there")
+                .len(),
+            DEAD_LETTER_MAX_BYTES,
+            "the file must not grow past the ceiling"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }
