@@ -104,6 +104,21 @@ or DB-less instance. (It is mirrored on the ops listener too.) The slim runtime
 image has no shell tools (no `curl`), so scrape from a sidecar/agent rather than
 exec-ing into the container.
 
+**Counters worth alerting on.** These are the ones that mean a message did not
+reach the mailbox, so nothing else will tell you:
+
+| Metric | Meaning |
+|---|---|
+| `mbs_persist_dead_letter_failures_total` | A capture failed — the message is in neither MySQL nor the dead-letter file. Lost outright. Alert on any nonzero value. |
+| `mbs_persist_id_conflicts_total` | Sends rejected because the `messageId` is taken by a *different* message. Nothing was stored and nothing was captured (it could never be replayed under that id). Client-caused; a sustained rate means a client re-using ids or probing. |
+| `mbs_persist_duplicates_total` | Sends that matched an already-stored copy of the *same* message, so no new row was written. Idempotent and expected on retries — but a sustained rate means a client re-using message ids. |
+| `mbs_persist_worker_panics_total`, `mbs_backplane_delivery_panics_total` | A supervised task panicked and restarted. Delivery survived, but something is wrong. |
+
+Note the ack semantics behind these: both send paths ack **"accepted for
+delivery"**, not "committed to MySQL" — the live push happens first and the
+durable write is asynchronous. A conflict or a failed capture therefore reaches
+the sender as success, and these counters are the only server-side signal.
+
 **Behind a proxy/CDN:** set `TRUSTED_CLIENT_IP_HEADER` to the header your proxy
 sets (default `cf-connecting-ip`) so per-IP rate limiting keys on the real client
 IP — and only when the origin is reachable **solely** through that proxy (else the

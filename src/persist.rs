@@ -260,10 +260,15 @@ pub struct PersistStats {
     /// is gone — not in MySQL, not on disk. Nonzero requires operator action
     /// (fix `DEAD_LETTER_PATH` / the disk under it).
     pub dead_letter_failures: AtomicU64,
-    /// Sends rejected because the `messageId` collides with a stored id that
-    /// differs only by case/padding/collation weight. Client-caused and not
-    /// dead-lettered; a sustained rate means a buggy or probing client.
+    /// Sends rejected because the `messageId` is taken by a different message
+    /// (another sender/recipient/box, or a collation-equal id). Client-caused
+    /// and not dead-lettered; a sustained rate means a buggy or probing client.
     pub id_conflicts: AtomicU64,
+    /// Sends that matched an already-stored copy of the SAME message and were
+    /// therefore not written again. Idempotent success, but counted: a message
+    /// the sender believes was delivered produced no new row, so a sustained
+    /// rate means a client re-using message ids.
+    pub duplicates: AtomicU64,
     /// Times the fast path was bypassed for an inline write (queue full / closed).
     pub inline_persists: AtomicU64,
     /// Times the supervised worker restarted after a panic.
@@ -596,10 +601,11 @@ where
             }
             Ok(InsertOutcome::Duplicate) => {
                 // Duplicate messageId — already persisted. Idempotent success.
+                stats.duplicates.fetch_add(1, Ordering::Relaxed);
                 debug!(
                     msg_id = %job.message_id,
                     recipient = %job.recipient,
-                    "async persist: duplicate messageId, treating as idempotent success"
+                    "async persist: this message is already stored, treating as idempotent success"
                 );
                 return PersistOutcome::Duplicate;
             }
