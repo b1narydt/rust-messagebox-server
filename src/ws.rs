@@ -786,8 +786,11 @@ async fn handle_ws_send_message(
         }
     };
 
+    // Trimmed to match the HTTP path and the column: `messages.messageId` is
+    // PAD SPACE, so MySQL already treats "id" and "id  " as the same value.
+    // Storing them untrimmed would make a plain client typo a rejected send.
     let message_id = match message.get("messageId").and_then(|v| v.as_str()) {
-        Some(id) if !id.is_empty() => id.to_string(),
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
         _ => {
             warn!(sid = %sid, "BRC-103 sendMessage: missing messageId");
             message_failed(socket, ws, "Missing messageId").await;

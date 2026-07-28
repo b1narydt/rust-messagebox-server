@@ -185,10 +185,15 @@ pub async fn send_message(
         }
     };
 
+    // Trimmed on the way in. `messages.messageId` is PAD SPACE, so MySQL
+    // already considers "id" and "id  " the same value; storing them untrimmed
+    // makes our view disagree with the column's, turning a plain client typo
+    // into a rejected send. Normalising here collapses the whole
+    // trailing/leading-whitespace variant space into genuine duplicates.
     let message_ids: Vec<String> = if let Some(arr) = mid_raw.as_array() {
         match arr
             .iter()
-            .map(|v| v.as_str().map(|s| s.to_string()).ok_or(()))
+            .map(|v| v.as_str().map(|s| s.trim().to_string()).ok_or(()))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(v) => v,
@@ -202,7 +207,7 @@ pub async fn send_message(
             }
         }
     } else if let Some(s) = mid_raw.as_str() {
-        vec![s.to_string()]
+        vec![s.trim().to_string()]
     } else {
         return error_response(
             StatusCode::BAD_REQUEST,
