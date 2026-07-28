@@ -8,10 +8,73 @@
 
 use crate::db::DbPool;
 use serde_json::json;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 /// Max concurrent in-flight FCM HTTP requests per notification fan-out.
 const MAX_CONCURRENT_FCM_SENDS: usize = 16;
+
+/// Deactivation decisions taken since the last successful FCM send.
+///
+/// Second line of defense behind [`should_deactivate`]'s narrow gate. Losing a
+/// device row is irreversible from the server's side (the handset must
+/// re-register), so a long unbroken run of "deactivate" with not one success in
+/// between is treated as systemic — bad credentials, wrong project, or an FCM
+/// contract change — rather than as that many genuinely dead handsets. Past the
+/// trip count we stop writing and shout, leaving the rows intact for an
+/// operator to inspect. Stale-but-present rows are recoverable; a wiped fleet
+/// is not.
+static CONSECUTIVE_DEACTIVATIONS: AtomicU32 = AtomicU32::new(0);
+
+/// Consecutive deactivations tolerated before the breaker opens.
+///
+/// Set far above any plausible legitimate run. The count is process-global and
+/// resets only on a successful send, so a single recipient holding many dead
+/// handsets can rack up strikes with nothing to clear them — too low a value
+/// would trip on healthy cleanup and then block deactivation server-wide.
+///
+/// Know what this does NOT protect against: because any successful send
+/// anywhere in the process resets the count, a server carrying normal traffic
+/// interleaves successes with failures and will essentially never reach the
+/// trip point. The breaker only engages when the process is doing nothing but
+/// deactivating. It is a backstop for a total systemic fault, not a defense
+/// against a targeted or partial one — [`should_deactivate`]'s narrow gate is
+/// what has to be right.
+const DEACTIVATION_BREAKER_TRIP: u32 = 500;
+
+/// Claim permission to deactivate one device, advancing the breaker.
+///
+/// Returns `false` once the trip count is exceeded. The ERROR fires only on the
+/// transition so a sustained outage doesn't flood the log.
+fn claim_deactivation() -> bool {
+    // `saturating_add` on the returned value: a plain `+ 1` would panic in debug
+    // builds at u32::MAX, and in release would wrap to 0 and silently re-close
+    // the breaker. Unreachable in practice, but the breaker exists precisely for
+    // the case where our reasoning about reachability was wrong.
+    let n = CONSECUTIVE_DEACTIVATIONS
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    if n <= DEACTIVATION_BREAKER_TRIP {
+        return true;
+    }
+    if n == DEACTIVATION_BREAKER_TRIP + 1 {
+        tracing::error!(
+            consecutive = n,
+            "FCM deactivation breaker OPEN: {DEACTIVATION_BREAKER_TRIP} consecutive tokens were \
+             reported permanently invalid with no successful send in between. Refusing further \
+             deactivations and leaving the rows active. A run this long is more consistent with \
+             a systemic fault (credentials, project, or an FCM contract change) than with that \
+             many dead handsets — verify push is working before clearing it; any successful \
+             send resets the breaker."
+        );
+    }
+    false
+}
+
+/// Reset the breaker — a delivery proving the credentials and project are good.
+fn note_successful_send() {
+    CONSECUTIVE_DEACTIVATIONS.store(0, Ordering::Relaxed);
+}
 
 /// Payload describing the push notification to send via FCM.
 #[derive(Clone, Debug)]
@@ -120,6 +183,7 @@ pub async fn send_fcm_notification(
             let status = resp.status();
             if status.is_success() {
                 tracing::debug!("FCM sent successfully to device ...{}", token_tail);
+                note_successful_send();
                 if let Err(e) = crate::db::queries::update_device_last_used(&pool, device.id).await
                 {
                     tracing::warn!("Failed to update last_used for device {}: {e}", device.id);
@@ -136,9 +200,9 @@ pub async fn send_fcm_notification(
                 body_text
             );
 
-            if should_deactivate(status, &body_text) {
+            if should_deactivate(status, &body_text) && claim_deactivation() {
                 tracing::warn!(
-                    "Deactivating device ...{} due to invalid FCM token",
+                    "Deactivating device ...{} — FCM reported the token UNREGISTERED",
                     token_tail
                 );
                 if let Err(e) = crate::db::queries::deactivate_device(&pool, device.id).await {
@@ -239,6 +303,36 @@ fn build_fcm_body(token: &str, payload: &FcmPayload) -> serde_json::Value {
 /// This mirrors the TS reference (`registration-token-not-registered` /
 /// `invalid-registration-token`) and the Go reference (`IsUnregistered` /
 /// `IsInvalidArgument`), which both classify narrowly rather than by substring.
+///
+/// ## Why a bare 404 / `status: NOT_FOUND` is NOT enough
+///
+/// Deactivation is irreversible from the server's side — the user's handset has
+/// to re-register before it can be reached again — so the signal must identify
+/// THE TOKEN, not merely the request. `POST /v1/projects/{project_id}/messages:send`
+/// also 404s with `error.status == "NOT_FOUND"` when the *project path* is wrong
+/// (a typo'd `FIREBASE_PROJECT_ID`, a revoked project, an API path change). That
+/// response is identical for every device, so honoring it would deactivate the
+/// entire fleet on the first notification burst after a misconfigured deploy.
+/// The only token-specific signal in the v1 contract is
+/// `error.details[].errorCode == "UNREGISTERED"`, so that (or the equally
+/// token-specific legacy codes) is what we require. A bare 404 is treated as
+/// transient: nothing is deactivated and the send simply fails.
+///
+/// ## Why 400 `INVALID_ARGUMENT` is NOT enough either — do not re-add it
+///
+/// It is tempting: Google suggests deleting the token on `INVALID_ARGUMENT`
+/// *when the request payload is known-good*, and it looks like the only
+/// remaining way to reap malformed tokens. But this server cannot satisfy that
+/// precondition. `FcmPayload.message_id` is client-supplied and reaches the
+/// request body, so a sender choosing an oversized `messageId` pushes the
+/// payload past FCM's 4 KB limit and gets `INVALID_ARGUMENT` for **every** one
+/// of the recipient's devices — letting any authenticated sender permanently
+/// wipe any recipient's push fleet with one ordinary `/sendMessage`. The same
+/// status also covers invalid TTL, reserved data keys, and malformed APNs
+/// blocks, none of which say anything about the token. Deactivation is
+/// irreversible here, so it stays gated on signals that name the token itself.
+/// Reaping malformed tokens needs a different mechanism (a `last_used` sweep),
+/// not a status a remote caller can provoke.
 fn should_deactivate(status: reqwest::StatusCode, response_body: &str) -> bool {
     // Unambiguous legacy-SDK token codes: safe to honor without a status gate.
     if response_body.contains("registration-token-not-registered")
@@ -252,13 +346,9 @@ fn should_deactivate(status: reqwest::StatusCode, response_body: &str) -> bool {
         return false;
     }
     let Ok(v) = serde_json::from_str::<serde_json::Value>(response_body) else {
-        // A 404 with an unparseable body: treat as invalid-token (the v1 API
-        // only 404s for an unknown token target).
-        return true;
+        // A 404 whose body we cannot parse is not attributable to the token.
+        return false;
     };
-    if v["error"]["status"].as_str() == Some("NOT_FOUND") {
-        return true;
-    }
     v["error"]["details"].as_array().is_some_and(|details| {
         details
             .iter()
@@ -331,8 +421,7 @@ mod tests {
         use reqwest::StatusCode;
         let nf = StatusCode::NOT_FOUND;
 
-        // 404 + structured invalid-token signals → deactivate.
-        assert!(should_deactivate(nf, r#"{"error":{"status":"NOT_FOUND"}}"#));
+        // The one token-specific v1 signal → deactivate.
         assert!(should_deactivate(
             nf,
             r#"{"error":{"status":"NOT_FOUND","details":[{"errorCode":"UNREGISTERED"}]}}"#
@@ -353,14 +442,69 @@ mod tests {
             StatusCode::INTERNAL_SERVER_ERROR,
             r#"{"error":{"status":"INTERNAL"}}"#
         ));
+        // A 403 from a revoked/misconfigured project must never look like a
+        // token problem — that is the fleet-wipe path.
+        assert!(!should_deactivate(
+            StatusCode::FORBIDDEN,
+            r#"{"error":{"code":403,"status":"PERMISSION_DENIED"}}"#
+        ));
+        // 400 INVALID_ARGUMENT must NEVER deactivate. `messageId` is
+        // client-supplied and lands in the FCM body, so an oversized one pushes
+        // the payload past FCM's 4 KB limit and returns this for EVERY device —
+        // any authenticated sender could otherwise wipe any recipient's fleet.
+        // The same status also covers invalid TTL / reserved keys / bad APNs
+        // blocks, none of which implicate the token.
+        assert!(!should_deactivate(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"Message is too big"}}"#
+        ));
+        assert!(!should_deactivate(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"The registration token is not a valid FCM registration token"}}"#
+        ));
         // The old false-positive: a non-404 body that merely mentions the words.
         assert!(!should_deactivate(
             StatusCode::INTERNAL_SERVER_ERROR,
             r#"{"error":{"status":"INTERNAL","message":"upstream NOT_FOUND while reading config"}}"#
         ));
-        // A 404 whose body does not carry a token signal still deactivates
-        // (the v1 API only 404s for an unknown token target).
-        assert!(should_deactivate(nf, "Not Found"));
+        // A 404 that does not name THIS token must NOT deactivate: the wrong
+        // FIREBASE_PROJECT_ID returns exactly this for every device, so honoring
+        // it would wipe the fleet on the first notification burst.
+        assert!(!should_deactivate(
+            nf,
+            r#"{"error":{"code":404,"message":"Requested entity was not found.","status":"NOT_FOUND"}}"#
+        ));
+        // Same for a 404 whose body we cannot parse at all.
+        assert!(!should_deactivate(nf, "Not Found"));
+    }
+
+    /// The breaker stops an unbounded run of deactivations even when each one
+    /// carries a well-formed UNREGISTERED signal — the systemic-failure case
+    /// that the per-response gate cannot distinguish on its own.
+    #[test]
+    fn deactivation_breaker_opens_after_a_long_unbroken_run() {
+        note_successful_send(); // start from a known-closed breaker
+
+        for i in 1..=DEACTIVATION_BREAKER_TRIP {
+            assert!(
+                claim_deactivation(),
+                "claim {i} within budget must be allowed"
+            );
+        }
+        assert!(
+            !claim_deactivation(),
+            "the claim past the trip count must be refused"
+        );
+        assert!(!claim_deactivation(), "and it must stay refused");
+
+        // A single successful delivery proves the credentials/project are fine
+        // and re-arms normal cleanup.
+        note_successful_send();
+        assert!(
+            claim_deactivation(),
+            "a successful send must reset the breaker"
+        );
+        note_successful_send();
     }
 
     #[test]

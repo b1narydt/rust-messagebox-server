@@ -315,12 +315,13 @@ async fn main() {
     // only — no identities, no message data, no key material);
     // `/health/live` + `/health/ready` are the structured probes (readiness
     // fails on DB loss, Redis loss in Model B, and while draining).
-    // Public pre-auth surface. `/` + `/health/live` are harmless liveness
-    // probes; `/docs` + `/openapi.json` are pre-auth in the TS and Go references
-    // too (their swagger mounts sit before the auth middleware), so they stay
-    // public here. The operational surface that leaks live counts — `/metrics`
-    // and `/health/ready` — is NOT here; it moves to a private ops listener
-    // below (no reference exposes those on the public port).
+    // Public pre-auth surface. `/` is a harmless banner; `/docs` +
+    // `/openapi.json` are pre-auth in the TS and Go references too (their
+    // swagger mounts sit before the auth middleware), so they stay public
+    // here. The health probes are mounted further down, after the
+    // limiter/admission layers. The surface that leaks live operational
+    // counts — `/metrics` — is NOT here; it stays on the private ops listener
+    // (no reference exposes it on the public port).
     let openapi_prefix = prefix.clone();
     let public_routes = Router::new()
         .route(
@@ -339,80 +340,78 @@ async fn main() {
                 let prefix = openapi_prefix.clone();
                 async move { messagebox_server::docs::openapi_json(&prefix) }
             }),
-        )
-        .route(
-            "/health/live",
-            get(|| async { axum::Json(serde_json::json!({"status": "alive"})) }),
         );
 
-    // Private ops surface (Prometheus scrape + readiness). Bound to OPS_BIND
-    // (default 127.0.0.1:9091) on its own listener so an internet-facing
-    // deployment never exposes connection/identity/queue/admission counts or the
-    // dependency-health readiness probe. Scrapers and orchestrators reach it over
-    // the private/internal network. Use OPS_BIND=0.0.0.0:<port> to deliberately
-    // publish it. `/health/live` stays public for platform health checks.
-    let metrics_ws = ws_broadcast.clone();
-    let metrics_backplane = backplane.clone();
-    let metrics_ops = ops.clone();
+    // Readiness — ONE handler, mounted twice: on the public router (below,
+    // outside the limiter layers) because platforms like Railway route
+    // exactly one port per service, so the platform healthcheck can only
+    // reach the public listener; and on the private ops listener so internal
+    // scrapers/orchestrators keep working. It exposes only the coarse
+    // {ready, db, redis, draining} booleans — the count-leaking surface
+    // (/metrics) stays private.
     let ready_pool = pool.clone();
     let ready_backplane = backplane.clone();
     let ready_ops = ops.clone();
-    let ops_routes =
-        Router::new()
-            .route(
-                "/health/ready",
-                get(move || {
-                    let pool = ready_pool.clone();
-                    let backplane = ready_backplane.clone();
-                    let ops = ready_ops.clone();
-                    async move {
-                        messagebox_server::ops::readiness(&pool, backplane.as_deref(), &ops).await
-                    }
-                }),
-            )
-            .route(
-                "/metrics",
-                get(move || {
-                    let ws = metrics_ws.clone();
-                    let backplane = metrics_backplane.clone();
-                    let ops = metrics_ops.clone();
-                    async move {
-                        let (connections, identities) = ws.live_counts();
-                        let (depth, capacity) = ws.persist_queue();
-                        let persist = ws.persist_stats();
-                        let page = messagebox_server::metrics::render(
-                            &messagebox_server::metrics::Snapshot {
-                                connections,
-                                authenticated_identities: identities,
-                                persist_queue_depth: depth,
-                                persist_queue_capacity: capacity,
-                                persist: &persist,
-                                backplane: backplane.as_ref().map(|bp| {
-                                    messagebox_server::metrics::BackplaneSnapshot {
-                                        published: bp.published(),
-                                        dropped: bp.dropped(),
-                                        subscribed: bp.is_subscribed(),
-                                        subscriptions: bp.active_subscription_count() as u64,
-                                    }
-                                }),
-                                ops: Some(messagebox_server::metrics::OpsSnapshot {
-                                    draining: ops.is_draining(),
-                                    in_flight_sends: ops.in_flight_sends(),
-                                    admission_rejected: ops.admission_rejected(),
-                                    max_connections: ops.max_connections() as u64,
-                                }),
-                            },
-                        );
-                        (
-                            [(
-                                axum::http::header::CONTENT_TYPE,
-                                "text/plain; version=0.0.4",
-                            )],
-                            page,
-                        )
-                    }
-                }),
-            );
+    let readiness_route = get(move || {
+        let pool = ready_pool.clone();
+        let backplane = ready_backplane.clone();
+        let ops = ready_ops.clone();
+        async move { messagebox_server::ops::readiness(&pool, backplane.as_deref(), &ops).await }
+    });
+
+    // Private ops surface (Prometheus scrape + a readiness mirror). Bound to
+    // OPS_BIND (default 127.0.0.1:9091) on its own listener so an
+    // internet-facing deployment never exposes connection/identity/queue/
+    // admission counts. Scrapers and orchestrators reach it over the
+    // private/internal network. Use OPS_BIND=0.0.0.0:<port> to deliberately
+    // publish it.
+    let metrics_ws = ws_broadcast.clone();
+    let metrics_backplane = backplane.clone();
+    let metrics_ops = ops.clone();
+    let ops_routes = Router::new()
+        .route("/health/ready", readiness_route.clone())
+        .route(
+            "/metrics",
+            get(move || {
+                let ws = metrics_ws.clone();
+                let backplane = metrics_backplane.clone();
+                let ops = metrics_ops.clone();
+                async move {
+                    let (connections, identities) = ws.live_counts();
+                    let (depth, capacity) = ws.persist_queue();
+                    let persist = ws.persist_stats();
+                    let page =
+                        messagebox_server::metrics::render(&messagebox_server::metrics::Snapshot {
+                            connections,
+                            authenticated_identities: identities,
+                            persist_queue_depth: depth,
+                            persist_queue_capacity: capacity,
+                            persist: &persist,
+                            backplane: backplane.as_ref().map(|bp| {
+                                messagebox_server::metrics::BackplaneSnapshot {
+                                    published: bp.published(),
+                                    dropped: bp.dropped(),
+                                    subscribed: bp.is_subscribed(),
+                                    subscriptions: bp.active_subscription_count() as u64,
+                                }
+                            }),
+                            ops: Some(messagebox_server::metrics::OpsSnapshot {
+                                draining: ops.is_draining(),
+                                in_flight_sends: ops.in_flight_sends(),
+                                admission_rejected: ops.admission_rejected(),
+                                max_connections: ops.max_connections() as u64,
+                            }),
+                        });
+                    (
+                        [(
+                            axum::http::header::CONTENT_TYPE,
+                            "text/plain; version=0.0.4",
+                        )],
+                        page,
+                    )
+                }
+            }),
+        );
 
     // Protected API routes — BRC-103/104 auth via bsv-sdk Peer middleware
     let api_routes = Router::new()
@@ -506,11 +505,24 @@ async fn main() {
         app
     };
 
+    // Health probes mount AFTER the admission and rate-limit layers so
+    // neither ever gates them: a probe must answer while draining and under
+    // load, and a limiter 429 here would pull a healthy instance out of
+    // rotation. Railway's deploy healthcheck probes /health/ready on this
+    // listener (railway.toml) — the private ops listener is unreachable to it.
+    let app = app
+        .route(
+            "/health/live",
+            get(|| async { axum::Json(serde_json::json!({"status": "alive"})) }),
+        )
+        .route("/health/ready", readiness_route);
+
     let app = app.layer(cors);
 
-    // Private ops listener (Prometheus + readiness). Bind failure is non-fatal:
-    // the main server still serves; only /metrics + /health/ready are then
-    // unavailable. Bound to loopback by default so it is never internet-exposed.
+    // Private ops listener (Prometheus + a readiness mirror). Bind failure is
+    // non-fatal: the main server still serves; only /metrics is then
+    // unavailable (readiness stays on the public listener). Bound to loopback
+    // by default so it is never internet-exposed.
     let ops_bind = std::env::var("OPS_BIND")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -518,7 +530,7 @@ async fn main() {
     match tokio::net::TcpListener::bind(&ops_bind).await {
         Ok(ops_listener) => {
             tracing::info!(
-                "ops endpoints (/metrics, /health/ready) on private {ops_bind} (set OPS_BIND to change; 0.0.0.0:<port> to publish)"
+                "private ops listener (/metrics + /health/ready mirror) on {ops_bind} (set OPS_BIND to change; 0.0.0.0:<port> to publish)"
             );
             tokio::spawn(async move {
                 if let Err(e) = axum::serve(ops_listener, ops_routes).await {
@@ -528,7 +540,7 @@ async fn main() {
         }
         Err(e) => {
             tracing::error!(
-                "failed to bind OPS_BIND={ops_bind}: {e} — /metrics and /health/ready are unavailable"
+                "failed to bind OPS_BIND={ops_bind}: {e} — /metrics is unavailable (/health/ready is still served on the public port)"
             );
         }
     }

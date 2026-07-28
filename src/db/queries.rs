@@ -137,8 +137,85 @@ pub async fn get_message_box_id(
 // Messages
 // ---------------------------------------------------------------------------
 
-/// Insert a message. Returns Ok(true) on success, Ok(false) if duplicate.
+/// What an attempted message insert actually did.
+///
+/// Distinguishes the two ways `INSERT IGNORE` can store nothing, because they
+/// need opposite handling: a genuine replay is success, while an id the unique
+/// index considers taken by *different* bytes is a rejected send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InsertOutcome {
+    /// The row was written.
+    Inserted,
+    /// A row for THIS message already exists — same id bytes, same sender,
+    /// recipient and box. A genuine idempotent replay.
+    Duplicate,
+    /// The id is taken by something that is not this message: a row belonging
+    /// to a different sender/recipient/box, or a *collation-equal but
+    /// byte-different* id (the column is case-insensitive and PAD SPACE). The
+    /// send cannot be stored under this id, so the caller must reject it rather
+    /// than report success.
+    ///
+    /// Also reached if some other constraint suppressed the insert (`INSERT
+    /// IGNORE` downgrades every error to a warning) — e.g. a foreign-key
+    /// violation on `messageBoxId`. That is not client-caused and would be
+    /// storable once the referenced row exists, but nothing in this codebase
+    /// deletes `messageBox` rows, so it is unreachable today; if that changes,
+    /// it needs its own outcome rather than being folded in here.
+    IdConflict,
+}
+
+/// Insert a message. See [`InsertOutcome`] for what the result means.
+///
+/// "Nothing was inserted" is NOT proof of a duplicate, and a duplicate is
+/// reported to the sender as success — so the claim is verified before it is
+/// made, against the row that actually exists.
+///
+/// Two ways the unique key blocks an insert, needing opposite handling:
+///
+/// * **A different message owns the id.** `messages.messageId` is unique
+///   *globally* — not per recipient, sender or box — so anyone's id blocks
+///   everyone else's. Matching on the id alone would let a stranger's row be
+///   reported as "your idempotent replay": the sender is told `success`, the
+///   row is never written, the recipient never sees it in `listMessages`, and
+///   nothing is logged or counted. Whoever writes an id first would silently
+///   suppress every later use of it.
+/// * **Byte-different but collation-equal.** `utf8mb4_unicode_ci` is
+///   case-insensitive and PAD SPACE, so `ABC-1` collides with `abc-1`.
+///
+/// The follow-up therefore demands byte equality (which the collation does
+/// not) AND that the stored row is this sender's message to this recipient and
+/// box. `body` is deliberately not compared: the id is what identifies a
+/// message, so re-sending one id with a new body is a client bug, not a
+/// distinct message this server should store twice.
 pub async fn insert_message(
+    pool: &DbPool,
+    message_id: &str,
+    message_box_id: i64,
+    sender: &str,
+    recipient: &str,
+    body: &str,
+) -> Result<InsertOutcome, sqlx::Error> {
+    if try_insert_message(pool, message_id, message_box_id, sender, recipient, body).await? {
+        return Ok(InsertOutcome::Inserted);
+    }
+
+    if is_same_message_stored(pool, message_id, message_box_id, sender, recipient).await? {
+        return Ok(InsertOutcome::Duplicate);
+    }
+
+    // No row explains the block. The usual cause is a genuine conflict, but the
+    // blocking row may also have been acknowledged (deleted) between the two
+    // statements — they run on separate pooled connections. Retry once so a
+    // storable message is not rejected because of that race; a real conflict
+    // simply fails again.
+    if try_insert_message(pool, message_id, message_box_id, sender, recipient, body).await? {
+        return Ok(InsertOutcome::Inserted);
+    }
+    Ok(InsertOutcome::IdConflict)
+}
+
+/// One `INSERT IGNORE` attempt; `true` if a row was written.
+async fn try_insert_message(
     pool: &DbPool,
     message_id: &str,
     message_box_id: i64,
@@ -158,6 +235,32 @@ pub async fn insert_message(
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Is the stored row carrying this id actually THIS message?
+///
+/// `messageId = ?` uses the unique index (at most one row); the rest confirms
+/// the match is a replay rather than someone else's message wearing the id.
+async fn is_same_message_stored(
+    pool: &DbPool,
+    message_id: &str,
+    message_box_id: i64,
+    sender: &str,
+    recipient: &str,
+) -> Result<bool, sqlx::Error> {
+    let same: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM messages \
+         WHERE messageId = ? AND CAST(messageId AS BINARY) = CAST(? AS BINARY) \
+           AND messageBoxId = ? AND sender = ? AND recipient = ?",
+    )
+    .bind(message_id)
+    .bind(message_id)
+    .bind(message_box_id)
+    .bind(sender)
+    .bind(recipient)
+    .fetch_one(pool)
+    .await?;
+    Ok(same > 0)
 }
 
 pub async fn list_messages(

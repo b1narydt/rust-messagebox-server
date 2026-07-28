@@ -27,7 +27,7 @@ All routes require BRC-104 authentication (via `AuthLayer`). The authenticated c
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/sendMessage` | Send a message to a recipient's message box |
-| `POST` | `/listMessages` | List messages in a message box (supports `messageBox` filter) |
+| `POST` | `/listMessages` | List messages in a message box (`messageBox` is **required**; unknown box returns an empty list) |
 | `POST` | `/acknowledgeMessage` | Acknowledge (delete) messages by ID |
 | `POST` | `/registerDevice` | Register an FCM device token for push notifications (upsert on token) |
 | `GET` | `/devices` | List the caller's registered devices (token masked to last 10 chars) |
@@ -94,11 +94,30 @@ and runs migrations on start.
 - All instances share the **same `SERVER_PRIVATE_KEY`** (they sign as one server
   identity) and the **same MySQL**.
 
-**Observability:** `/metrics` + `/health/ready` bind to the private `OPS_BIND`
-(loopback by default). Scrape them over the internal network, or set
-`OPS_BIND=0.0.0.0:<port>` and expose that port to your scraper. The slim runtime
+**Observability:** `/metrics` binds to the private `OPS_BIND` (loopback by
+default). Scrape it over the internal network, or set `OPS_BIND=0.0.0.0:<port>`
+and expose that port to your scraper. `/health/ready` is served on the **public**
+port — platforms like Railway route exactly one port per service, so the
+platform healthcheck can only reach the public listener; `railway.toml` points
+Railway's healthcheck at `/health/ready` so traffic never routes to a draining
+or DB-less instance. (It is mirrored on the ops listener too.) The slim runtime
 image has no shell tools (no `curl`), so scrape from a sidecar/agent rather than
 exec-ing into the container.
+
+**Counters worth alerting on.** These are the ones that mean a message did not
+reach the mailbox, so nothing else will tell you:
+
+| Metric | Meaning |
+|---|---|
+| `mbs_persist_dead_letter_failures_total` | A capture failed — the message is in neither MySQL nor the dead-letter file. Lost outright. Alert on any nonzero value. |
+| `mbs_persist_id_conflicts_total` | Sends rejected because the `messageId` is taken by a *different* message. Nothing was stored and nothing was captured (it could never be replayed under that id). Client-caused; a sustained rate means a client re-using ids or probing. |
+| `mbs_persist_duplicates_total` | Sends that matched an already-stored copy of the *same* message, so no new row was written. Idempotent and expected on retries — but a sustained rate means a client re-using message ids. |
+| `mbs_persist_worker_panics_total`, `mbs_backplane_delivery_panics_total` | A supervised task panicked and restarted. Delivery survived, but something is wrong. |
+
+Note the ack semantics behind these: both send paths ack **"accepted for
+delivery"**, not "committed to MySQL" — the live push happens first and the
+durable write is asynchronous. A conflict or a failed capture therefore reaches
+the sender as success, and these counters are the only server-side signal.
 
 **Behind a proxy/CDN:** set `TRUSTED_CLIENT_IP_HEADER` to the header your proxy
 sets (default `cf-connecting-ip`) so per-IP rate limiting keys on the real client
@@ -121,7 +140,7 @@ header is spoofable; set it empty to key on the socket peer instead).
 | `REDIS_URL` | *(none)* | Unset → **Model A** (single instance, in-process routing — the default). Set → **Model B**: Redis pub/sub backplane for cross-instance live push; run N replicas behind a **sticky** LB. See below. |
 | `MAX_CONNECTIONS` | `0` (unlimited) | Per-instance WebSocket connection ceiling (admission control). Past it, NEW connections get `503` + `Retry-After` (Model B: the LB sheds to another instance; Model A: the client retries). In-flight sessions are never affected. |
 | `DRAIN_TIMEOUT_SECS` | `30` | Per-phase bound on the SIGTERM graceful drain (in-flight send quiesce, persist-queue flush). |
-| `OPS_BIND` | `127.0.0.1:9091` | Private listener for `/metrics` + `/health/ready` — kept off the public port so an internet-facing deploy never exposes operational counts or the dependency-health probe. Prometheus/orchestrator scrape it over the internal network. Set `0.0.0.0:<port>` to publish deliberately. |
+| `OPS_BIND` | `127.0.0.1:9091` | Private listener for `/metrics` — kept off the public port so an internet-facing deploy never exposes operational counts. Prometheus scrapes it over the internal network; set `0.0.0.0:<port>` to publish deliberately. Also mirrors `/health/ready` for internal scrapers (the readiness probe itself is public — see Operations). |
 | `CORS_ALLOWED_ORIGINS` | *(none → permissive)* | Comma-separated browser-origin allowlist (e.g. `https://app.example.com`). Unset keeps the permissive default (safe: auth is BRC-103 request-signature based, no cookies). Set to lock the browser origin down. |
 | `RATE_LIMIT_RPS` | `50` | Per-client-IP sustained request rate on the public listener (protects the unauthenticated BRC-103 handshake). `0` disables rate limiting. |
 | `RATE_LIMIT_BURST` | `2×RPS` | Per-IP burst allowance. |
@@ -132,6 +151,11 @@ header is spoofable; set it empty to key on the socket peer instead).
 | `FIREBASE_PROJECT_ID` | *(none)* | Firebase project id — required when Firebase is enabled. |
 | `FIREBASE_SERVICE_ACCOUNT_JSON` | *(none)* | Service-account key JSON (inline). SECRET — never logged or Debug-printed. |
 | `FIREBASE_SERVICE_ACCOUNT_PATH` | *(none)* | Path to the service-account key file (alternative to the inline JSON). |
+| `WALLET_STORAGE_URL` | `https://storage.babbage.systems` | Wallet storage backend used to internalize BRC-29 delivery-fee payments. Only load-bearing once a box charges a fee. |
+| `REQUEST_TIMEOUT_SECS` | `30` | Per-request timeout on the API routes (not applied to `GET /` or `/health/live`). |
+| `MAX_BODY_BYTES` | `10485760` (10 MiB) | Max request body on the API routes. |
+| `LOG_FORMAT` | *(text)* | Set to `json` for structured JSON logs; anything else keeps human-readable text. Level comes from `RUST_LOG` (default `debug` in development, `info` in production). |
+| `DEAD_LETTER_PATH` | `dead_letter.jsonl` (relative to the working directory) | Append-only capture file for messages that could not be persisted to MySQL — the last-resort durability record behind the WS ack. Writability is probed at boot and logged at ERROR if it fails; a nonzero `mbs_persist_dead_letter_failures_total` means messages were lost outright. The Docker image sets a writable `WORKDIR` (`/var/lib/messagebox`) so the default works, but that is still container-ephemeral: point this at a mounted volume if captures must outlive the container. |
 
 ## Topology: Model A / Model B
 
@@ -181,14 +205,24 @@ Split across two listeners (see `OPS_BIND`). Everything here is pre-auth and nev
 |--------|------|-------------|
 | `GET` | `/` | Plain-text banner (legacy uptime check) |
 | `GET` | `/health/live` | Liveness: the event loop answered — always `200` |
+| `GET` | `/health/ready` | Readiness: `200` when routable, else `503` + JSON `{ready, db, redis, draining}`. Unready on DB loss, on Redis-subscription loss in Model B (`redis: "down"`) or Redis < 6 (`redis: "unsupported"`); Model A skips the Redis check; and while draining. **Railway's deploy healthcheck probes this path** (`railway.toml`) — the platform routes one port per service, so readiness must be public for the platform to gate traffic on it. Also mirrored on the ops listener. |
 | `GET` | `/docs`, `/openapi.json` | API docs (pre-auth, like the TS/Go references) |
+
+The health probes are never rate-limited or admission-gated — they answer
+under load and while draining (`/health/ready` answers `503` then, which is
+the point). A throttled probe would pull a *healthy* instance out of rotation,
+so the exemption is deliberate — but it does mean these two paths are the one
+public surface with no per-IP ceiling. The cost is bounded: `/health/ready`
+reuses a cached `SELECT 1` (see `DB_PROBE_CACHE_TTL`), so flooding it cannot
+consume database connections, and what remains is ordinary HTTP CPU. Put
+volumetric L7 protection at the edge (Cloudflare rate-limiting rules) if that
+matters for your deployment.
 
 **Private ops listener** (`OPS_BIND`, default `127.0.0.1:9091` — never internet-exposed unless you set it to a public bind):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/health/ready` | Readiness: `200` when routable, else `503` + JSON `{ready, db, redis, draining}`. Unready on DB loss, on Redis-subscription loss in Model B (`redis: "down"`) or Redis < 6 (`redis: "unsupported"`); Model A skips the Redis check; and while draining. |
-| `GET` | `/metrics` | Prometheus text: connections/rooms, fan-out + sign-latency histograms, persist queue depth / inline-fallback / dead-letter counters, Model B publish/drop/lag + room-subscription count, admission + drain gauges. Operational counts only — no identities, no message data, no key material. |
+| `GET` | `/metrics` | Prometheus text: connections/rooms, fan-out + sign-latency histograms, persist queue depth / inline-fallback / dead-letter counters, Model B publish/drop/lag + room-subscription count, admission + drain gauges. Operational counts only — no identities, no message data, no key material. (`/health/ready` is also served here, so existing scrape/orchestrator configs keep working.) |
 
 **Admission control** (`MAX_CONNECTIONS`): gates only *new* WS handshakes
 (engine.io requests without a `sid`). Established sessions, all API routes,
@@ -252,10 +286,13 @@ that is what `@bsv/message-box-client` 2.1.0 actually sends/reads — the TS
 filter is silently dead against it). Parity is pinned to the client;
 `messageBox` is also accepted.
 
-Also carried as a **compat surface, not a control**: the fee/permission
-plane (`/permissions/*`, payments) matches TS wire-for-wire, but the WS
-`sendMessage` path bypasses it on **both** implementations — do not build
-authorization or monetization on it without new work (see
+Also carried as a **compat surface, not a general control**: the
+fee/permission plane (`/permissions/*`, payments) matches TS wire-for-wire,
+but only the **fee/payment** half is HTTP-only — the WS `sendMessage` path
+carries no fee gate on either implementation, so a `recipient_fee > 0` row
+is satisfied on HTTP and free over WS. Do not build monetization on it
+without new work. **Recipient blocks (`recipient_fee == -1`) are the
+exception and are enforced on both paths** (see above, and
 `handlers/permissions.rs` module docs).
 
 ## Auth stack

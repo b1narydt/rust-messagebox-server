@@ -138,22 +138,55 @@ mod tests {
     }
 
     /// F5: the served spec carries a `servers[]` block reflecting the prefix.
-    #[test]
-    fn openapi_injects_servers_from_prefix() {
+    ///
+    /// Drives the REAL handler and parses its response body. The previous
+    /// version of this test called a local helper that re-implemented the
+    /// injection, so it would have kept passing even if `openapi_json` stopped
+    /// injecting `servers[]` altogether.
+    #[tokio::test]
+    async fn openapi_injects_servers_from_prefix() {
+        async fn served(prefix: &str) -> serde_json::Value {
+            let resp = openapi_json(prefix).into_response();
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_TYPE)
+                    .expect("content-type"),
+                "application/json"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            serde_json::from_slice(&bytes).expect("served spec must be valid JSON")
+        }
+
         // No prefix → base "/".
-        let rendered = render_openapi_body("");
-        assert_eq!(rendered["servers"][0]["url"], "/");
+        assert_eq!(served("").await["servers"][0]["url"], "/");
         // A routing prefix is reflected so documented paths resolve correctly.
-        let rendered = render_openapi_body("/mbs");
-        assert_eq!(rendered["servers"][0]["url"], "/mbs");
+        assert_eq!(served("/mbs").await["servers"][0]["url"], "/mbs");
     }
 
-    /// Test helper mirroring `openapi_json`'s body construction.
-    fn render_openapi_body(prefix: &str) -> serde_json::Value {
-        let base = if prefix.is_empty() { "/" } else { prefix };
-        let mut v: serde_json::Value = serde_json::from_str(OPENAPI_JSON).unwrap();
-        v["servers"] = serde_json::json!([{ "url": base }]);
-        v
+    /// The pre-auth surface must be declared `security: []`. Without the
+    /// per-operation override, the global `security` block applies and any
+    /// codegen/gateway built from this spec would demand BRC-103 headers on
+    /// the health, banner, and docs routes — which the server serves pre-auth.
+    #[test]
+    fn preauth_routes_opt_out_of_the_global_security_requirement() {
+        let spec: serde_json::Value =
+            serde_json::from_str(OPENAPI_JSON).expect("openapi.json must parse");
+        for route in [
+            "/",
+            "/docs",
+            "/openapi.json",
+            "/health/live",
+            "/health/ready",
+            "/metrics",
+        ] {
+            let sec = &spec["paths"][route]["get"]["security"];
+            assert!(
+                sec.as_array().is_some_and(|a| a.is_empty()),
+                "{route} must declare `security: []` (found {sec})"
+            );
+        }
     }
 
     #[test]

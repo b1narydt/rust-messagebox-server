@@ -12,9 +12,14 @@
 //!   [`crate::backplane::Backplane`] counters, socket counts) — so there is
 //!   exactly one source of truth per number and no double bookkeeping.
 //!
-//! The `GET /metrics` endpoint (wired in `main.rs`) is **unauthenticated**,
-//! like `GET /`: it exposes operational counts only (no identities, no
-//! message data, no key material). Bind it to a scrape network in production.
+//! The `GET /metrics` endpoint (wired in `main.rs`) carries no authentication
+//! — it exposes operational counts only (no identities, no message data, no
+//! key material). It is **network-gated instead**: it is served only on the
+//! private ops listener bound to `OPS_BIND` (default `127.0.0.1:9091`), never
+//! on the public port. Set `OPS_BIND=0.0.0.0:<port>` only when the scrape
+//! network requires it. (`/health/ready` is mirrored on that listener but is
+//! ALSO public — platforms route one port, so the healthcheck can only reach
+//! the public one. It exposes coarse booleans, not counts.)
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -98,6 +103,15 @@ pub static BACKPLANE_LAG_SECONDS: LazyLock<Histogram> = LazyLock::new(|| {
         0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
     ])
 });
+
+/// Model B: restarts of the supervised backplane delivery task after a panic.
+///
+/// A free-standing counter rather than a [`BackplaneSnapshot`] field because the
+/// supervisor lives in `ws.rs` and outlives any single scrape. The persist
+/// worker's equivalent (`mbs_persist_worker_panics_total`) is the model: an
+/// event the system is designed to SURVIVE still has to be alertable, or the
+/// operator only learns about it by reading logs they have no reason to read.
+pub static BACKPLANE_DELIVERY_PANICS: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Scrape-time snapshot + render
@@ -224,6 +238,29 @@ pub fn render(s: &Snapshot) -> String {
     );
     counter(
         &mut out,
+        "mbs_persist_duplicates_total",
+        "Sends that matched an already-stored copy of the same message, so no \
+         new row was written. Idempotent, but a sustained rate means a client \
+         re-using message ids.",
+        p.duplicates.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "mbs_persist_id_conflicts_total",
+        "Sends rejected because the messageId collides with a stored id under \
+         the column collation. Client-caused; a sustained rate means a buggy \
+         or probing client.",
+        p.id_conflicts.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
+        "mbs_persist_dead_letter_failures_total",
+        "Dead-letter captures that FAILED — the job is in neither MySQL nor the \
+         file. Any nonzero value is lost messages; alert on it.",
+        p.dead_letter_failures.load(Ordering::Relaxed),
+    );
+    counter(
+        &mut out,
         "mbs_persist_worker_panics_total",
         "Supervised persist-worker restarts after a panic.",
         p.worker_panics.load(Ordering::Relaxed),
@@ -254,6 +291,13 @@ pub fn render(s: &Snapshot) -> String {
             "mbs_backplane_room_subscriptions",
             "Room channels this instance is subscribed to (directed routing: one per owned room).",
             bp.subscriptions,
+        );
+        counter(
+            &mut out,
+            "mbs_backplane_delivery_panics_total",
+            "Restarts of the supervised backplane delivery task after a panic. \
+             Delivery survives, but each one nearly disabled cross-instance push.",
+            BACKPLANE_DELIVERY_PANICS.load(Ordering::Relaxed),
         );
         BACKPLANE_LAG_SECONDS.render_into(
             "mbs_backplane_lag_seconds",
@@ -322,6 +366,9 @@ mod tests {
     fn render_exposes_all_core_families() {
         let persist = crate::persist::PersistStats::default();
         persist.dead_lettered.store(3, Ordering::Relaxed);
+        persist.dead_letter_failures.store(1, Ordering::Relaxed);
+        persist.id_conflicts.store(4, Ordering::Relaxed);
+        persist.duplicates.store(6, Ordering::Relaxed);
         persist.inline_persists.store(2, Ordering::Relaxed);
         persist.enqueued.store(10, Ordering::Relaxed);
         persist.completed.store(9, Ordering::Relaxed);
@@ -357,10 +404,16 @@ mod tests {
             "mbs_persist_completed_total 9",
             "mbs_persist_inline_fallback_total 2",
             "mbs_persist_dead_letter_total 3",
+            "mbs_persist_dead_letter_failures_total 1",
+            "mbs_persist_id_conflicts_total 4",
+            "mbs_persist_duplicates_total 6",
             "mbs_persist_worker_panics_total 0",
             "mbs_backplane_published_total 100",
             "mbs_backplane_dropped_total 5",
             "mbs_backplane_subscribed 1",
+            // Value included: matching the bare name would also match the
+            // HELP/TYPE lines, so the sample line itself could go missing.
+            "mbs_backplane_delivery_panics_total 0",
             "mbs_backplane_lag_seconds_count",
             "mbs_draining 0",
             "mbs_in_flight_sends 2",

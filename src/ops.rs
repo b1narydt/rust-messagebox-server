@@ -41,7 +41,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{header, Request, StatusCode};
@@ -61,6 +61,28 @@ pub const RETRY_AFTER_SECS: u64 = 5;
 /// answer within this is unreachable for readiness purposes.
 const DB_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// How long one `SELECT 1` result is reused across readiness requests.
+///
+/// `/health/ready` is unauthenticated, reachable from the internet, and exempt
+/// from the per-IP limiter (a platform healthcheck must never be throttled).
+/// Without this cache it is a query amplifier: each probe takes a permit from
+/// the shared sqlx pool (`DB_MAX_CONNECTIONS`, default 50) that every API
+/// request also needs, so an unauthenticated flood starves genuine traffic —
+/// measured at a 100x latency penalty on `/sendMessage`'s pool. The probe is
+/// now bounded to at most one query per TTL no matter the request rate, which
+/// is orders of magnitude below any platform's healthcheck interval.
+///
+/// Staleness bound: a cached answer can be up to `TTL + DB_PROBE_TIMEOUT` old,
+/// because callers arriving while the elected prober is still blocked are
+/// served the previous value rather than queueing. A lone sequential prober —
+/// the platform healthcheck — is never served a stale answer that way: with no
+/// concurrent caller it becomes the prober and blocks for the real result.
+///
+/// Only the DB probe is cached. `draining` and the Redis subscription flag are
+/// atomics — free to read and therefore always exact, so a draining instance
+/// still reports unready on the very next request.
+const DB_PROBE_CACHE_TTL: Duration = Duration::from_millis(1000);
+
 /// Poll interval for [`OpsState::wait_send_idle`].
 const IDLE_POLL: Duration = Duration::from_millis(25);
 
@@ -77,6 +99,15 @@ pub struct OpsState {
     draining: AtomicBool,
     in_flight_sends: AtomicU64,
     admission_rejected: AtomicU64,
+    /// Last readiness DB probe: when it ran and what it found. Shared by the
+    /// public and ops listeners so the two cannot double the query rate.
+    db_probe: parking_lot::Mutex<Option<(Instant, bool)>>,
+    /// Elects the single task that runs a probe when the cache is stale, so a
+    /// burst arriving on an expired entry issues one query rather than N.
+    db_probe_gate: tokio::sync::Mutex<()>,
+    /// Queries actually issued by the probe. The cache and the election exist
+    /// to keep this flat under load instead of proportional to request rate.
+    db_probes_run: AtomicU64,
 }
 
 impl OpsState {
@@ -86,7 +117,61 @@ impl OpsState {
             draining: AtomicBool::new(false),
             in_flight_sends: AtomicU64::new(0),
             admission_rejected: AtomicU64::new(0),
+            db_probe: parking_lot::Mutex::new(None),
+            db_probe_gate: tokio::sync::Mutex::new(()),
+            db_probes_run: AtomicU64::new(0),
         })
+    }
+
+    /// Queries actually issued to MySQL by the readiness probe.
+    ///
+    /// This is the number the cache exists to hold down: it must stay flat
+    /// under load rather than tracking the request rate.
+    pub fn db_probes_run(&self) -> u64 {
+        self.db_probes_run.load(Ordering::Relaxed)
+    }
+
+    /// Cached `SELECT 1`. See [`DB_PROBE_CACHE_TTL`] for why this is cached at
+    /// all — the endpoint is an unauthenticated, unthrottled path to the shared
+    /// connection pool.
+    async fn db_ok_cached(&self, db: &DbPool) -> bool {
+        if let Some(ok) = self.fresh_db_probe() {
+            return ok;
+        }
+
+        // Stale. Exactly one caller probes; the rest reuse the previous answer
+        // instead of piling onto the pool, which is the whole point of the
+        // cache under flood. Only a caller with no previous answer at all waits.
+        let _gate = match self.db_probe_gate.try_lock() {
+            Ok(gate) => gate,
+            Err(_) => {
+                let last = *self.db_probe.lock();
+                match last {
+                    Some((_, ok)) => return ok,
+                    None => self.db_probe_gate.lock().await,
+                }
+            }
+        };
+
+        // The winner of a race for the gate may have just refreshed it.
+        if let Some(ok) = self.fresh_db_probe() {
+            return ok;
+        }
+
+        self.db_probes_run.fetch_add(1, Ordering::Relaxed);
+        let ok = matches!(
+            tokio::time::timeout(DB_PROBE_TIMEOUT, sqlx::query("SELECT 1").execute(db)).await,
+            Ok(Ok(_))
+        );
+        *self.db_probe.lock() = Some((Instant::now(), ok));
+        ok
+    }
+
+    /// The cached probe result, if it is still within the TTL. Scoped so no
+    /// lock guard is ever alive across an `.await` (the guard is `!Send`).
+    fn fresh_db_probe(&self) -> Option<bool> {
+        let cached = *self.db_probe.lock();
+        cached.and_then(|(at, ok)| (at.elapsed() < DB_PROBE_CACHE_TTL).then_some(ok))
     }
 
     /// Mark a send (HTTP or WS) as in flight for the guard's lifetime. Held
@@ -293,10 +378,7 @@ pub async fn readiness(
     backplane: Option<&Backplane>,
     ops: &OpsState,
 ) -> ReadinessReport {
-    let db_ok = matches!(
-        tokio::time::timeout(DB_PROBE_TIMEOUT, sqlx::query("SELECT 1").execute(db)).await,
-        Ok(Ok(_))
-    );
+    let db_ok = ops.db_ok_cached(db).await;
     let redis = backplane.map(|bp| {
         if bp.is_unsupported() {
             "unsupported"
@@ -610,6 +692,98 @@ mod tests {
         assert!(!report.draining);
     }
 
+    /// The probe is unauthenticated, internet-reachable and exempt from the
+    /// per-IP limiter, so its cost must NOT scale with request rate: without
+    /// the cache a flood takes a pool permit per request and starves the API
+    /// traffic sharing that pool. A burst must collapse to a single query.
+    #[tokio::test]
+    async fn readiness_db_probe_is_bounded_under_flood() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("mysql://nobody@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let ops = OpsState::new(0);
+
+        // First call populates the cache; the next 500 must all be served from
+        // it rather than issuing their own query.
+        assert!(!readiness(&pool, None, &ops).await.ready);
+        let probed_at = ops.db_probe.lock().expect("probe cached").0;
+        assert_eq!(ops.db_probes_run(), 1);
+
+        for _ in 0..500 {
+            assert!(!readiness(&pool, None, &ops).await.ready);
+        }
+        assert_eq!(
+            ops.db_probe.lock().expect("still cached").0,
+            probed_at,
+            "a flood must reuse one probe, not re-query per request"
+        );
+        assert_eq!(
+            ops.db_probes_run(),
+            1,
+            "a sequential flood must issue exactly one query"
+        );
+
+        // Draining is read from an atomic, never cached, so it takes effect on
+        // the very next request even while the DB probe is still fresh.
+        ops.start_drain();
+        let report = readiness(&pool, None, &ops).await;
+        assert!(report.draining, "drain must not wait for the probe TTL");
+        assert_eq!(
+            ops.db_probe.lock().expect("still cached").0,
+            probed_at,
+            "reading drain state must not trigger a probe"
+        );
+    }
+
+    /// The TTL alone is NOT enough, and a sequential test cannot tell the
+    /// difference: with a cold or just-expired cache, N callers arriving
+    /// together each miss and each would issue their own query — the pool
+    /// amplification all over again, at exactly the moment a flood is worst.
+    /// The `try_lock` election is what collapses them to one, so assert on a
+    /// CONCURRENT burst; deleting the election must fail this test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn readiness_db_probe_is_single_flighted_across_concurrent_callers() {
+        let pool = sqlx::mysql::MySqlPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("mysql://nobody@127.0.0.1:1/none")
+            .expect("lazy pool");
+        let ops = OpsState::new(0);
+
+        // Cold cache: every one of these misses, so each is a candidate prober.
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let pool = pool.clone();
+            let ops = Arc::clone(&ops);
+            set.spawn(async move { readiness(&pool, None, &ops).await.ready });
+        }
+        while let Some(joined) = set.join_next().await {
+            assert!(!joined.expect("probe task"), "dead DB ⇒ unready");
+        }
+        assert_eq!(
+            ops.db_probes_run(),
+            1,
+            "a concurrent burst on a cold cache must elect ONE prober"
+        );
+
+        // Same again once the entry has expired — the steady-state flood case.
+        tokio::time::sleep(DB_PROBE_CACHE_TTL + Duration::from_millis(50)).await;
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..64 {
+            let pool = pool.clone();
+            let ops = Arc::clone(&ops);
+            set.spawn(async move { readiness(&pool, None, &ops).await.ready });
+        }
+        while let Some(joined) = set.join_next().await {
+            assert!(!joined.expect("probe task"));
+        }
+        assert_eq!(
+            ops.db_probes_run(),
+            2,
+            "a concurrent burst on an expired cache must add exactly one query"
+        );
+    }
+
     #[test]
     fn readiness_report_serializes_structured() {
         let report = ReadinessReport {
@@ -651,6 +825,12 @@ mod ops_db_tests {
 
         // Dependency loss: the pool closes (DB unreachable from this process).
         pool.close().await;
+
+        // The probe is cached to keep this unauthenticated endpoint from being
+        // a query amplifier (see DB_PROBE_CACHE_TTL), so the flip is bounded by
+        // the TTL rather than instant — far below any healthcheck interval.
+        tokio::time::sleep(DB_PROBE_CACHE_TTL + Duration::from_millis(50)).await;
+
         let report = readiness(&pool, None, &ops).await;
         assert!(!report.ready, "DB loss must flip readiness");
         assert_eq!(report.db, "unreachable");

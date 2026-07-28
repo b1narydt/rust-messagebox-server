@@ -418,3 +418,29 @@ async fn redis_down_degrades_to_local_delivery_without_failing() {
 
     client.disconnect().await.expect("disconnect");
 }
+
+/// Losing the delivery consumer must flip readiness truthfully: the
+/// subscriber notices the dropped receiver, unwinds, and reports
+/// not-subscribed with no active room subscriptions — a correctly-failing
+/// instance the LB deregisters, never one that keeps claiming `redis: ok`
+/// while every cross-instance push to it is lost.
+#[tokio::test]
+async fn dropped_delivery_consumer_flips_subscribed_off() {
+    let (_redis, url) = redis_container().await;
+    let bp = Backplane::new(&url);
+    wait_until("subscribed", || bp.is_subscribed()).await;
+    bp.on_room_join("sock1", "03aa-mpc_inbox");
+    wait_until("room channel active", || {
+        bp.is_room_active("03aa-mpc_inbox")
+    })
+    .await;
+
+    // No WsBroadcast is attached in this test, so the raw stream stands in
+    // for the delivery task; dropping it is the consumer-death scenario. The
+    // flip must not need any inbound traffic to be noticed.
+    drop(bp.take_delivery_rx().expect("delivery stream"));
+
+    wait_until("subscribed flipped off", || !bp.is_subscribed()).await;
+    assert!(!bp.is_room_active("03aa-mpc_inbox"));
+    assert_eq!(bp.active_subscription_count(), 0);
+}

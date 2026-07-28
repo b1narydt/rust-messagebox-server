@@ -53,7 +53,7 @@ async fn test_insert_message() {
     let ok = insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello")
         .await
         .unwrap();
-    assert!(ok, "insert should succeed");
+    assert_eq!(ok, InsertOutcome::Inserted, "insert should succeed");
 }
 
 #[tokio::test]
@@ -66,7 +66,160 @@ async fn test_insert_message_duplicate() {
     let ok = insert_message(&pool, "msg-1", mb_id, TEST_KEY2, TEST_KEY, "hello again")
         .await
         .unwrap();
-    assert!(!ok, "duplicate messageId should return false");
+    assert_eq!(
+        ok,
+        InsertOutcome::Duplicate,
+        "an exact-match messageId is an idempotent duplicate"
+    );
+}
+
+/// `messages.messageId` is unique GLOBALLY — not per recipient, sender or box —
+/// so another user's id blocks yours. Matching on the id alone would report a
+/// stranger's row as your idempotent replay: the sender is acked `success`, no
+/// row is written, and `listMessages` never shows it. Whoever writes an id
+/// first would silently suppress every later use of it, for everyone.
+#[tokio::test]
+async fn test_insert_message_another_users_id_is_a_conflict_not_a_duplicate() {
+    let pool = fresh_pool().await;
+    let squatter_box = ensure_message_box(&pool, TEST_KEY2, "inbox").await.unwrap();
+    let victim_box = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
+
+    // The id is taken first by a message to a completely different recipient.
+    assert_eq!(
+        insert_message(
+            &pool,
+            "shared-id",
+            squatter_box,
+            TEST_KEY,
+            TEST_KEY2,
+            "squatter payload"
+        )
+        .await
+        .unwrap(),
+        InsertOutcome::Inserted
+    );
+
+    // The victim's own message must NOT be waved through as already-stored.
+    assert_eq!(
+        insert_message(
+            &pool,
+            "shared-id",
+            victim_box,
+            TEST_KEY2,
+            TEST_KEY,
+            "victim payload"
+        )
+        .await
+        .unwrap(),
+        InsertOutcome::IdConflict,
+        "another user's row must never be reported as this sender's replay"
+    );
+
+    // And the victim's mailbox is genuinely empty — the row that exists is the
+    // squatter's, which is exactly why claiming "duplicate" would lose data.
+    assert!(list_messages(&pool, TEST_KEY, victim_box)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// The case that bites honest clients with no attacker involved: the reference
+/// client derives `messageId` from `(body, recipient)` and NOT the message box,
+/// so the same body sent to the same person in two boxes produces one id. The
+/// second send must be reported as a conflict — it is a different message — and
+/// never waved through as an idempotent replay.
+#[tokio::test]
+async fn test_insert_message_same_id_different_box_is_a_conflict() {
+    let pool = fresh_pool().await;
+    let inbox = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
+    let payment_inbox = ensure_message_box(&pool, TEST_KEY, "payment_inbox")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        insert_message(&pool, "same-body-id", inbox, TEST_KEY2, TEST_KEY, "body")
+            .await
+            .unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(
+        insert_message(
+            &pool,
+            "same-body-id",
+            payment_inbox,
+            TEST_KEY2,
+            TEST_KEY,
+            "body"
+        )
+        .await
+        .unwrap(),
+        InsertOutcome::IdConflict,
+        "a different box is a different message, not a replay"
+    );
+    assert!(list_messages(&pool, TEST_KEY, payment_inbox)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// The same sender re-sending the same id to the same recipient/box IS a
+/// replay, and must stay idempotent success rather than becoming a conflict.
+#[tokio::test]
+async fn test_insert_message_same_sender_replay_is_still_a_duplicate() {
+    let pool = fresh_pool().await;
+    let mb_id = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
+
+    assert_eq!(
+        insert_message(&pool, "replay-1", mb_id, TEST_KEY2, TEST_KEY, "hello")
+            .await
+            .unwrap(),
+        InsertOutcome::Inserted
+    );
+    assert_eq!(
+        insert_message(&pool, "replay-1", mb_id, TEST_KEY2, TEST_KEY, "hello")
+            .await
+            .unwrap(),
+        InsertOutcome::Duplicate
+    );
+}
+
+/// A DIFFERENT messageId that merely collides under the column's
+/// case-insensitive collation must NOT be reported as an idempotent duplicate.
+///
+/// `messageId` is `utf8mb4_unicode_ci`, so `MSG-CI` and `msg-ci` compare equal
+/// and `INSERT IGNORE` silently stores nothing for the second one. Callers read
+/// `Ok(false)` as "already stored, nothing to do" and ack the sender, so
+/// accepting that here would lose a real message while reporting success —
+/// and, because the namespace is global, would let whoever writes an id first
+/// suppress every collation-equal id from anyone else.
+#[tokio::test]
+async fn test_insert_message_collation_collision_is_not_reported_as_duplicate() {
+    let pool = fresh_pool().await;
+    let mb_id = ensure_message_box(&pool, TEST_KEY, "inbox").await.unwrap();
+
+    assert_eq!(
+        insert_message(&pool, "MSG-CI", mb_id, TEST_KEY2, TEST_KEY, "first")
+            .await
+            .unwrap(),
+        InsertOutcome::Inserted
+    );
+
+    assert_eq!(
+        insert_message(&pool, "msg-ci", mb_id, TEST_KEY2, TEST_KEY, "second")
+            .await
+            .unwrap(),
+        InsertOutcome::IdConflict,
+        "a collation-equal but byte-different id is a conflict, not a duplicate"
+    );
+
+    // The exact-match duplicate path still works alongside it.
+    assert_eq!(
+        insert_message(&pool, "MSG-CI", mb_id, TEST_KEY2, TEST_KEY, "again")
+            .await
+            .unwrap(),
+        InsertOutcome::Duplicate,
+        "a byte-identical id is a genuine duplicate"
+    );
 }
 
 #[tokio::test]

@@ -451,23 +451,74 @@ fn url_has_path(redis_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Why the subscriber loop ended. It never ends while healthy, so every
+/// variant is a terminal condition worth logging.
+enum SubscriberExit {
+    /// `REDIS_URL` failed to parse — Model B subscribe never started.
+    InvalidUrl(redis::RedisError),
+    /// The delivery receiver was dropped: the consumer (delivery task and its
+    /// supervisor) is gone, so cross-instance pushes have nowhere to go.
+    DeliveryClosed,
+    /// The `Backplane` handle was dropped (route command sender gone) —
+    /// graceful teardown.
+    ControlClosed,
+}
+
 /// Holds a RESP3 connection, dynamically SUBSCRIBEs/UNSUBSCRIBEs room channels
 /// as local membership changes, and forwards every message payload into
 /// `delivery_tx`. Reconnects with capped backoff, replaying the owned-room set.
+///
+/// Structured as a thin wrapper around [`subscriber_loop`] so that the
+/// truth-restoring epilogue (`subscribed = false`, `active` cleared) runs on
+/// EVERY exit path — readiness reads these flags, and an exit that skipped
+/// them would leave `/health/ready` reporting a live subscription that no
+/// longer exists while cross-instance pushes are silently lost.
 async fn subscriber_task(
     redis_url: String,
     delivery_tx: mpsc::Sender<String>,
     subscribed: Arc<AtomicBool>,
     unsupported: Arc<AtomicBool>,
     route: Arc<RouteState>,
-    mut control_rx: mpsc::UnboundedReceiver<RouteCmd>,
+    control_rx: mpsc::UnboundedReceiver<RouteCmd>,
 ) {
-    let client = match resp3_client(&redis_url) {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "backplane: invalid REDIS_URL — Model B subscribe disabled");
-            return;
+    let exit = subscriber_loop(
+        &redis_url,
+        &delivery_tx,
+        &subscribed,
+        &unsupported,
+        &route,
+        control_rx,
+    )
+    .await;
+    subscribed.store(false, Ordering::Relaxed);
+    route.active.lock().clear();
+    match exit {
+        SubscriberExit::InvalidUrl(e) => {
+            error!(error = %e, "backplane: invalid REDIS_URL — Model B subscribe disabled; cross-instance live push will never work on this instance");
         }
+        SubscriberExit::DeliveryClosed => {
+            error!("backplane: delivery consumer gone — subscriber stopped; cross-instance live push DISABLED on this instance (readiness now reports redis down)");
+        }
+        SubscriberExit::ControlClosed => {
+            info!("backplane: subscriber stopped (backplane handle dropped — shutdown)");
+        }
+    }
+}
+
+/// The subscriber's connect/replay/event loop. Returns (instead of exiting the
+/// task directly) so [`subscriber_task`] can restore the observable state
+/// unconditionally.
+async fn subscriber_loop(
+    redis_url: &str,
+    delivery_tx: &mpsc::Sender<String>,
+    subscribed: &AtomicBool,
+    unsupported: &AtomicBool,
+    route: &RouteState,
+    mut control_rx: mpsc::UnboundedReceiver<RouteCmd>,
+) -> SubscriberExit {
+    let client = match resp3_client(redis_url) {
+        Ok(c) => c,
+        Err(e) => return SubscriberExit::InvalidUrl(e),
     };
 
     let mut backoff = RECONNECT_MIN;
@@ -501,15 +552,15 @@ async fn subscriber_task(
                     unsupported.store(false, Ordering::Relaxed);
                     debug!(error = %e, "backplane: subscriber connect failed — retrying");
                 }
-                if !reconnect_wait(&delivery_tx, &mut backoff).await {
-                    return;
+                if !reconnect_wait(delivery_tx, &mut backoff).await {
+                    return SubscriberExit::DeliveryClosed;
                 }
                 continue;
             }
             Err(_) => {
                 debug!("backplane: subscriber connect timed out — retrying");
-                if !reconnect_wait(&delivery_tx, &mut backoff).await {
-                    return;
+                if !reconnect_wait(delivery_tx, &mut backoff).await {
+                    return SubscriberExit::DeliveryClosed;
                 }
                 continue;
             }
@@ -527,8 +578,9 @@ async fn subscriber_task(
         }
         if !replay_ok {
             subscribed.store(false, Ordering::Relaxed);
-            if !reconnect_wait(&delivery_tx, &mut backoff).await {
-                return;
+            route.active.lock().clear();
+            if !reconnect_wait(delivery_tx, &mut backoff).await {
+                return SubscriberExit::DeliveryClosed;
             }
             continue;
         }
@@ -542,23 +594,29 @@ async fn subscriber_task(
             "backplane: subscriber connected (RESP3, directed routing)"
         );
 
-        // Event loop: subscription control + inbound pushes.
-        let reconnect = loop {
+        // Event loop: subscription control + inbound pushes + consumer
+        // liveness. `None` = the connection died, reconnect; `Some(exit)` =
+        // terminal, bubble up to the epilogue in `subscriber_task`.
+        let exit: Option<SubscriberExit> = loop {
             tokio::select! {
                 cmd = control_rx.recv() => match cmd {
                     Some(RouteCmd::Subscribe(room)) => {
                         if conn.subscribe(room_channel(&room)).await.is_ok() {
                             route.active.lock().insert(room);
                         } else {
-                            break true; // connection bad — reconnect + replay
+                            break None; // connection bad — reconnect + replay
                         }
                     }
                     Some(RouteCmd::Unsubscribe(room)) => {
                         let _ = conn.unsubscribe(room_channel(&room)).await;
                         route.active.lock().remove(&room);
                     }
-                    None => return, // Backplane dropped — shut down
+                    None => break Some(SubscriberExit::ControlClosed),
                 },
+                // A dropped delivery receiver must flip readiness NOW — not at
+                // the next inbound push, which for a quiet instance may be
+                // never (leaving it lying "subscribed" indefinitely).
+                _ = delivery_tx.closed() => break Some(SubscriberExit::DeliveryClosed),
                 push = push_rx.recv() => match push {
                     Some(info) => match info.kind {
                         redis::PushKind::Message => {
@@ -573,26 +631,28 @@ async fn subscriber_task(
                                     Err(mpsc::error::TrySendError::Full(_)) => warn!(
                                         "backplane: local delivery queue full — dropping cross-instance push (mailbox fallback covers delivery)"
                                     ),
-                                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        break Some(SubscriberExit::DeliveryClosed)
+                                    }
                                 }
                             }
                         }
-                        redis::PushKind::Disconnection => break true,
+                        redis::PushKind::Disconnection => break None,
                         _ => {} // subscribe/unsubscribe confirmations
                     },
-                    None => break true, // push stream closed — reconnect
+                    None => break None, // push stream closed — reconnect
                 },
             }
         };
 
         subscribed.store(false, Ordering::Relaxed);
         route.active.lock().clear();
-        if !reconnect {
-            return;
+        if let Some(exit) = exit {
+            return exit;
         }
         warn!("backplane: subscription connection lost — reconnecting");
-        if !reconnect_wait(&delivery_tx, &mut backoff).await {
-            return;
+        if !reconnect_wait(delivery_tx, &mut backoff).await {
+            return SubscriberExit::DeliveryClosed;
         }
     }
 }

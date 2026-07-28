@@ -34,9 +34,15 @@
 //!   idempotent success — it does not consume retries.
 //! * On a permanent error **or** retry exhaustion on a sustained transient
 //!   outage, the failed job is **dead-lettered**: appended as one JSON line to a
-//!   durable file on disk ([`PersistConfig::dead_letter_path`]), logged at
+//!   file on disk ([`PersistConfig::dead_letter_path`], `DEAD_LETTER_PATH` env;
+//!   default `dead_letter.jsonl` in the process working directory), logged at
 //!   **ERROR** with full context, and counted (see [`PersistHandle::stats`]).
 //!   A file (not a DB table) because the DB may be the thing that is down.
+//!   [`PersistHandle::spawn`] probes the path for writability at boot and logs
+//!   at ERROR if capture cannot work (e.g. a read-only working directory in a
+//!   container image) so the operator learns at startup, not at the moment of
+//!   data loss. `dead_lettered` counts only records actually on disk; a failed
+//!   capture increments `dead_letter_failures` instead — that job is LOST.
 //!   The dead-letter file is recoverable by an operator / a future startup
 //!   replay (see the `replay` TODO below).
 //!
@@ -64,14 +70,18 @@
 //! last `PersistHandle` dropped → channel closed) is distinguished from a panic
 //! and ends the supervisor cleanly.
 //!
-//! ## TODO (follow-up): startup replay
+//! ## TODO (follow-up): startup replay + durable sink
 //!
-//! Capturing failed jobs to `dead_letter.jsonl` is implemented here. A clean
+//! Capturing failed jobs to the dead-letter file is implemented here. A clean
 //! follow-up is a startup pass that reads the file, re-enqueues each line, and
 //! truncates on success. Not implemented now to keep this change focused on the
-//! capture path (the durability-critical half).
+//! capture path (the durability-critical half). The capture is also only as
+//! durable as the disk under it: on ephemeral-filesystem deploys (Railway, most
+//! containers) the file survives process crashes and restarts but NOT container
+//! replacement — it narrows the loss window rather than closing it. A durable
+//! sink (object storage / a second store) belongs with the replay work.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -80,6 +90,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, warn, Instrument};
 
+use crate::db::queries::InsertOutcome;
 use crate::db::{self, DbPool};
 
 /// One unit of durable work: persist a single message to MySQL.
@@ -164,6 +175,10 @@ pub enum Enqueued {
     /// Persisted inline but the DB write hit a permanent error; the job was
     /// dead-lettered to disk. Never silently dropped.
     DeadLettered,
+    /// Not stored and deliberately NOT dead-lettered: the `messageId` collides
+    /// with an existing id under the column's collation, so it can never be
+    /// inserted and there is nothing to replay. The send is rejected, not lost.
+    Rejected,
 }
 
 /// Tunables for the persist worker. Defaults are sized for the relay's hot path.
@@ -181,10 +196,19 @@ pub struct PersistConfig {
     pub base_backoff: Duration,
     pub max_backoff: Duration,
     /// Append-only file that captures jobs that could not be persisted
-    /// (permanent error, or transient exhaustion). Defaults to `dead_letter.jsonl`
-    /// in the process working directory (the data dir).
+    /// (permanent error, or transient exhaustion). Overridable via the
+    /// `DEAD_LETTER_PATH` env ([`PersistConfig::from_env`]); defaults to
+    /// `dead_letter.jsonl` in the process working directory.
     pub dead_letter_path: PathBuf,
 }
+
+/// Default dead-letter file, relative to the process working directory.
+const DEFAULT_DEAD_LETTER_PATH: &str = "dead_letter.jsonl";
+
+/// Ceiling on the dead-letter file. Past this, capture fails loudly (counted in
+/// `dead_letter_failures`) rather than continuing to consume the disk the
+/// service itself needs to run.
+const DEAD_LETTER_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 impl Default for PersistConfig {
     fn default() -> Self {
@@ -193,16 +217,58 @@ impl Default for PersistConfig {
             max_attempts: 8,
             base_backoff: Duration::from_millis(50),
             max_backoff: Duration::from_secs(5),
-            dead_letter_path: PathBuf::from("dead_letter.jsonl"),
+            dead_letter_path: PathBuf::from(DEFAULT_DEAD_LETTER_PATH),
         }
+    }
+}
+
+impl PersistConfig {
+    /// Defaults with the operator env overrides applied: `DEAD_LETTER_PATH`
+    /// sets [`Self::dead_letter_path`]. The default is relative, so any
+    /// deployment whose working directory is not writable MUST point this at a
+    /// writable location or every capture fails at the moment it is needed —
+    /// [`PersistHandle::spawn`] probes it at boot and logs at ERROR. (The
+    /// shipped Docker image sets a writable `WORKDIR` owned by its non-root
+    /// user, so the default works there; that directory is still part of the
+    /// container's ephemeral layer.) Env is read here, not in [`Default`], so
+    /// `default()` stays hermetic for tests.
+    pub fn from_env() -> Self {
+        Self {
+            dead_letter_path: dead_letter_path_from(std::env::var("DEAD_LETTER_PATH").ok()),
+            ..Self::default()
+        }
+    }
+}
+
+/// `DEAD_LETTER_PATH` value → path; unset/blank → the default. Separate from
+/// [`PersistConfig::from_env`] so resolution is testable without mutating
+/// process-global env.
+fn dead_letter_path_from(var: Option<String>) -> PathBuf {
+    match var {
+        Some(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => PathBuf::from(DEFAULT_DEAD_LETTER_PATH),
     }
 }
 
 /// Counters for observability. Cloneable handles share one set via `Arc`.
 #[derive(Debug, Default)]
 pub struct PersistStats {
-    /// Jobs that ended up dead-lettered (permanent error or transient exhaustion).
+    /// Jobs captured to the dead-letter file (permanent error or transient
+    /// exhaustion). Counted only once the record is actually on disk.
     pub dead_lettered: AtomicU64,
+    /// Dead-letter captures that FAILED (serialize/open/write/flush): the job
+    /// is gone — not in MySQL, not on disk. Nonzero requires operator action
+    /// (fix `DEAD_LETTER_PATH` / the disk under it).
+    pub dead_letter_failures: AtomicU64,
+    /// Sends rejected because the `messageId` is taken by a different message
+    /// (another sender/recipient/box, or a collation-equal id). Client-caused
+    /// and not dead-lettered; a sustained rate means a buggy or probing client.
+    pub id_conflicts: AtomicU64,
+    /// Sends that matched an already-stored copy of the SAME message and were
+    /// therefore not written again. Idempotent success, but counted: a message
+    /// the sender believes was delivered produced no new row, so a sustained
+    /// rate means a client re-using message ids.
+    pub duplicates: AtomicU64,
     /// Times the fast path was bypassed for an inline write (queue full / closed).
     pub inline_persists: AtomicU64,
     /// Times the supervised worker restarted after a panic.
@@ -281,6 +347,11 @@ impl PersistHandle {
             cfg.queue_capacity >= 1,
             "PersistConfig.queue_capacity must be >= 1 (got 0); a zero-capacity persist queue cannot accept jobs"
         );
+        // Fail loud at boot, not at the moment of data loss: an unwritable
+        // dead-letter path means every future capture fails and those messages
+        // are lost. Deliberately not fatal — a server that cannot dead-letter
+        // should still serve (failures are counted and logged as they happen).
+        probe_dead_letter_path(&cfg.dead_letter_path);
         let (tx, rx) = mpsc::channel(cfg.queue_capacity);
         let stats = Arc::new(PersistStats::default());
         let worker_db = db.clone();
@@ -376,9 +447,34 @@ impl PersistHandle {
     async fn persist_inline(&self, job: &PersistJob) -> Enqueued {
         match persist_with_retry(&self.db, job, &self.cfg, &self.stats, persist_once_db).await {
             PersistOutcome::Stored | PersistOutcome::Duplicate => Enqueued::InlineOk,
+            PersistOutcome::Rejected => Enqueued::Rejected,
             PersistOutcome::DeadLetteredTransient => Enqueued::InlineDeadLettered,
             PersistOutcome::DeadLetteredPermanent => Enqueued::DeadLettered,
         }
+    }
+}
+
+/// Cap on a client-chosen string echoed into a per-event log line.
+const LOG_ECHO_MAX_CHARS: usize = 48;
+
+/// Bound a client-chosen value before it reaches the log.
+fn truncate_for_log(s: &str) -> String {
+    if s.chars().count() <= LOG_ECHO_MAX_CHARS {
+        return s.to_owned();
+    }
+    let head: String = s.chars().take(LOG_ECHO_MAX_CHARS).collect();
+    format!("{head}…")
+}
+
+/// Marks a dequeued job "no longer pending" on scope exit, panic included.
+///
+/// A dequeued job is already out of the channel, so if the worker unwinds
+/// before counting it, nothing will ever count it — see the call site.
+struct CompletedGuard<'a>(&'a PersistStats);
+
+impl Drop for CompletedGuard<'_> {
+    fn drop(&mut self) {
+        self.0.completed.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -458,13 +554,18 @@ async fn run_drain(
                     recipient = %job.recipient,
                     message_box = %job.message_box,
                 );
+                // Counted on the way out of this job whatever happens —
+                // including a panic inside the retry loop. `completed` means
+                // "no longer pending", and `flush` waits for it to reach
+                // `enqueued`; a job that vanished on a panic without being
+                // counted would leave that condition permanently unsatisfiable,
+                // so every later graceful drain would burn its full timeout and
+                // report messages as un-durable forever. The supervisor already
+                // expects panics here and restarts, so this must survive one.
+                let _completed = CompletedGuard(&stats);
                 persist_with_retry(&db, &job, &cfg, &stats, persist_once_db)
                     .instrument(span)
                     .await;
-                // Counted after the retry loop resolves (stored / duplicate /
-                // dead-lettered): `completed` means "no longer pending", which
-                // is what `flush` waits on during graceful drain.
-                stats.completed.fetch_add(1, Ordering::Release);
             }
             None => return DrainExit::ChannelClosed,
         }
@@ -476,6 +577,10 @@ async fn run_drain(
 enum PersistOutcome {
     Stored,
     Duplicate,
+    /// The send was rejected, not failed: the messageId can never be stored.
+    /// Distinct from the dead-lettered variants because there is nothing to
+    /// capture or replay — see the `IdConflict` arm in [`persist_with_retry`].
+    Rejected,
     DeadLetteredTransient,
     DeadLetteredPermanent,
 }
@@ -492,7 +597,7 @@ enum PersistOutcome {
 /// and counted, so a message is never *silently* lost.
 ///
 /// Dedup: `insert_message` uses `INSERT IGNORE` on the unique `messageId`. A
-/// duplicate returns `Ok(false)`; we treat it as success. Because persistence
+/// duplicate returns [`InsertOutcome::Duplicate`]; we treat it as success. Because persistence
 /// now happens *after* the live push, the duplicate check lands at persist time
 /// — which is acceptable: the client treats a duplicate as idempotent success,
 /// and the unique constraint still prevents a second row from ever existing.
@@ -505,7 +610,7 @@ async fn persist_with_retry<F, Fut>(
 ) -> PersistOutcome
 where
     F: Fn(DbPool, PersistJob) -> Fut,
-    Fut: std::future::Future<Output = Result<bool, sqlx::Error>>,
+    Fut: std::future::Future<Output = Result<InsertOutcome, sqlx::Error>>,
 {
     let mut attempt: u32 = 0;
     let mut backoff = cfg.base_backoff;
@@ -513,7 +618,7 @@ where
     loop {
         attempt += 1;
         match persist(db.clone(), job.clone()).await {
-            Ok(true) => {
+            Ok(InsertOutcome::Inserted) => {
                 debug!(
                     msg_id = %job.message_id,
                     recipient = %job.recipient,
@@ -523,14 +628,39 @@ where
                 );
                 return PersistOutcome::Stored;
             }
-            Ok(false) => {
+            Ok(InsertOutcome::Duplicate) => {
                 // Duplicate messageId — already persisted. Idempotent success.
+                stats.duplicates.fetch_add(1, Ordering::Relaxed);
                 debug!(
                     msg_id = %job.message_id,
                     recipient = %job.recipient,
-                    "async persist: duplicate messageId, treating as idempotent success"
+                    "async persist: this message is already stored, treating as idempotent success"
                 );
                 return PersistOutcome::Duplicate;
+            }
+            Ok(InsertOutcome::IdConflict) => {
+                // A REJECTED SEND, not a failed one — deliberately NOT
+                // dead-lettered. The id can never be stored (the unique index
+                // considers it taken by different bytes), so capturing the body
+                // would burn the dead-letter budget on something no replay can
+                // ever land. Capture exists for messages that *should* be in
+                // MySQL and are not; this one must not be there at all.
+                // Counted so a spike is visible: the sender chose the id, and a
+                // client that keeps colliding is either buggy or probing.
+                stats.id_conflicts.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    // Truncated: the id is client-chosen and up to 255 chars,
+                    // and this line is emitted once per rejected send, so the
+                    // full echo turns a conflict flood into a log-volume lever.
+                    msg_id = %truncate_for_log(&job.message_id),
+                    recipient = %job.recipient,
+                    message_box = %job.message_box,
+                    "async persist: messageId conflicts with a stored id that differs only by \
+                     case, trailing space, or collation weight — message NOT stored and NOT \
+                     dead-lettered (it can never be inserted under this id). The sender must \
+                     retry with a distinct messageId."
+                );
+                return PersistOutcome::Rejected;
             }
             Err(e) => match classify(&e) {
                 ErrorClass::Permanent => {
@@ -589,9 +719,11 @@ struct DeadLetterRecord<'a> {
     job: &'a PersistJob,
 }
 
-/// Append the failed job to the durable dead-letter file as one JSON line, bump
-/// the counter. A failure to even write the dead-letter file is itself logged at
-/// ERROR (we cannot do more — the DB is also down).
+/// Append the failed job to the dead-letter file as one JSON line. The
+/// `dead_lettered` counter is bumped only once the line is on disk (open +
+/// write + flush all succeeded) — a capture that failed must not be reported
+/// as a capture. Failures bump `dead_letter_failures` and are logged at ERROR
+/// (we cannot do more — the DB is also down).
 async fn dead_letter(
     job: &PersistJob,
     cfg: &PersistConfig,
@@ -599,7 +731,6 @@ async fn dead_letter(
     err: &sqlx::Error,
     reason: &str,
 ) {
-    stats.dead_lettered.fetch_add(1, Ordering::Relaxed);
     let record = DeadLetterRecord {
         dead_lettered_at: chrono::Utc::now().to_rfc3339(),
         reason,
@@ -609,42 +740,86 @@ async fn dead_letter(
     let mut line = match serde_json::to_string(&record) {
         Ok(s) => s,
         Err(e) => {
+            stats.dead_letter_failures.fetch_add(1, Ordering::Relaxed);
             error!(
                 msg_id = %job.message_id,
                 error = %e,
-                "FATAL: could not serialize dead-letter record — message lost from disk capture"
+                "FATAL: could not serialize dead-letter record — message LOST (not in MySQL, not on disk)"
             );
             return;
         }
     };
     line.push('\n');
 
-    let open = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&cfg.dead_letter_path)
-        .await;
-    match open {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()).await {
-                error!(
-                    msg_id = %job.message_id,
-                    path = %cfg.dead_letter_path.display(),
-                    error = %e,
-                    "FATAL: could not write dead-letter record to disk"
-                );
-            } else {
-                // Best-effort durability of the dead-letter line itself.
-                let _ = f.flush().await;
-            }
+    match append_dead_letter_line(&cfg.dead_letter_path, line.as_bytes()).await {
+        Ok(()) => {
+            stats.dead_lettered.fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {
+            stats.dead_letter_failures.fetch_add(1, Ordering::Relaxed);
             error!(
                 msg_id = %job.message_id,
                 path = %cfg.dead_letter_path.display(),
                 error = %e,
-                "FATAL: could not open dead-letter file"
+                "FATAL: could not write dead-letter record — message LOST (not in MySQL, not on disk). Fix DEAD_LETTER_PATH."
             );
+        }
+    }
+}
+
+/// Open-append-flush of one dead-letter record. Split out so every I/O
+/// failure — the flush included, which for `tokio::fs::File` is where a
+/// buffered write actually surfaces — funnels into the single failure
+/// accounting in [`dead_letter`].
+///
+/// Refuses to grow the file past [`DEAD_LETTER_MAX_BYTES`]. Capture is a
+/// last-resort safety net, not an unbounded sink: each record carries the full
+/// message body, and any input that reliably produces a *permanent* DB error
+/// turns a send loop into disk consumption on the host. Filling the disk takes
+/// down the whole service, which is strictly worse than losing the captures
+/// past the ceiling — those are counted and logged as losses.
+async fn append_dead_letter_line(path: &Path, line: &[u8]) -> std::io::Result<()> {
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    let size = f.metadata().await?.len();
+    if size.saturating_add(line.len() as u64) > DEAD_LETTER_MAX_BYTES {
+        return Err(std::io::Error::other(format!(
+            "dead-letter file is at its {DEAD_LETTER_MAX_BYTES}-byte ceiling ({size} bytes); \
+             drain or rotate it (see DEAD_LETTER_PATH)"
+        )));
+    }
+    f.write_all(line).await?;
+    f.flush().await
+}
+
+/// Boot-time writability probe: attempt the exact create/append open the
+/// capture path uses. Returns whether the path is writable; logs at ERROR when
+/// it is not. The server keeps running either way — see [`PersistHandle::spawn`].
+///
+/// The probe deliberately does NOT clean up a file it created. "Remove it if it
+/// did not exist a moment ago" is a time-of-check/time-of-use race, and losing
+/// it destroys exactly what this module exists to protect: a peer sharing the
+/// path (replicas on one volume, a rolling restart, or two tests in the same
+/// binary) can append records between the check and the unlink, and they would
+/// be deleted while already counted as captured. An empty file costs nothing —
+/// the capture path opens with these same flags and appends to it.
+fn probe_dead_letter_path(path: &Path) -> bool {
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(_) => true,
+        Err(e) => {
+            error!(
+                path = %path.display(),
+                error = %e,
+                "dead-letter path is NOT writable — persist failures cannot be captured and WILL be lost. Point DEAD_LETTER_PATH at a writable location."
+            );
+            false
         }
     }
 }
@@ -652,9 +827,9 @@ async fn dead_letter(
 /// Resolve the messageBox id (ensuring the box exists) and insert the message.
 /// This is the real DB-backed persist closure injected into [`persist_with_retry`].
 ///
-/// Returns `Ok(true)` on a fresh insert, `Ok(false)` on a duplicate `messageId`,
+/// Returns the [`InsertOutcome`] of the insert attempt,
 /// and `Err` on any DB error (transient or otherwise — `classify` decides).
-async fn persist_once_db(db: DbPool, job: PersistJob) -> Result<bool, sqlx::Error> {
+async fn persist_once_db(db: DbPool, job: PersistJob) -> Result<InsertOutcome, sqlx::Error> {
     // ensure_message_box both creates (INSERT IGNORE) and resolves the id, so a
     // box that was never created (or a worker that lost the race) still gets a
     // valid id here. This makes the worker fully self-sufficient.
@@ -766,7 +941,7 @@ mod tests {
                 if n < 2 {
                     Err(io_err()) // transient: fail first two attempts
                 } else {
-                    Ok(true) // then succeed
+                    Ok(InsertOutcome::Inserted) // then succeed
                 }
             }
         };
@@ -846,7 +1021,7 @@ mod tests {
         let dir = unique_tmp_dir("dup");
         let cfg = test_cfg(&dir);
         let stats = PersistStats::default();
-        let persist = |_db: DbPool, _job: PersistJob| async { Ok(false) };
+        let persist = |_db: DbPool, _job: PersistJob| async { Ok(InsertOutcome::Duplicate) };
         let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
         assert_eq!(outcome, PersistOutcome::Duplicate);
         assert_eq!(stats.dead_lettered.load(Ordering::Relaxed), 0);
@@ -905,6 +1080,140 @@ mod tests {
             "channel-closed bypass must persist inline, got {outcome:?}"
         );
         assert_eq!(handle.stats.inline_persists.load(Ordering::Relaxed), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dead_letter_path_env_resolution() {
+        assert_eq!(
+            dead_letter_path_from(Some("/data/dl.jsonl".into())),
+            PathBuf::from("/data/dl.jsonl")
+        );
+        // Unset or blank falls back to the default.
+        assert_eq!(
+            dead_letter_path_from(None),
+            PathBuf::from(DEFAULT_DEAD_LETTER_PATH)
+        );
+        assert_eq!(
+            dead_letter_path_from(Some("  ".into())),
+            PathBuf::from(DEFAULT_DEAD_LETTER_PATH)
+        );
+    }
+
+    #[test]
+    fn probe_reports_writability_without_destroying_records() {
+        let dir = unique_tmp_dir("probe");
+        let path = dir.join("dead_letter.jsonl");
+        assert!(probe_dead_letter_path(&path));
+        // The probe may leave an empty file behind; what it must NEVER do is
+        // unlink one, since a peer sharing the path could have appended real
+        // captures between any check and a removal.
+        std::fs::write(&path, b"{}\n").unwrap();
+        assert!(probe_dead_letter_path(&path));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{}\n",
+            "the probe must never destroy existing dead-letter records"
+        );
+        // Unwritable (missing parent directory) reports false, does not panic.
+        assert!(!probe_dead_letter_path(
+            &dir.join("missing").join("dl.jsonl")
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A capture that never reached disk must not be reported as a capture:
+    /// `dead_lettered` stays 0 and the loss lands on the failure counter.
+    #[tokio::test]
+    async fn failed_dead_letter_write_counts_as_failure_not_capture() {
+        let dir = unique_tmp_dir("dl-fail");
+        let mut cfg = test_cfg(&dir);
+        cfg.dead_letter_path = dir.join("missing-subdir").join("dead_letter.jsonl");
+        let stats = PersistStats::default();
+        let persist = |_db: DbPool, _job: PersistJob| async { Err(sqlx::Error::RowNotFound) };
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+        assert_eq!(outcome, PersistOutcome::DeadLetteredPermanent);
+        assert_eq!(
+            stats.dead_lettered.load(Ordering::Relaxed),
+            0,
+            "nothing landed on disk — must not be counted as captured"
+        );
+        assert_eq!(stats.dead_letter_failures.load(Ordering::Relaxed), 1);
+        assert!(!cfg.dead_letter_path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A messageId conflict is a REJECTED send, not a failed one: it must not
+    /// consume the dead-letter budget.
+    ///
+    /// The id can never be inserted (the unique index considers it taken by
+    /// different bytes), so a captured copy could never be replayed — while the
+    /// sender picks the id, making it an attacker-chosen input. Routing it
+    /// through the permanent-error path let one socket append a full message
+    /// body per collision: measured at 13.7 MiB/s, exhausting the ceiling in
+    /// ~19s, after which a genuine DB outage loses its captures too.
+    #[tokio::test]
+    async fn id_conflict_is_rejected_without_consuming_the_dead_letter_budget() {
+        let dir = unique_tmp_dir("dl-conflict");
+        let cfg = test_cfg(&dir);
+        let stats = PersistStats::default();
+        let persist = |_db: DbPool, _job: PersistJob| async { Ok(InsertOutcome::IdConflict) };
+
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+
+        assert_eq!(outcome, PersistOutcome::Rejected);
+        assert_eq!(
+            stats.id_conflicts.load(Ordering::Relaxed),
+            1,
+            "the rejection must be counted so a spike is visible"
+        );
+        assert_eq!(stats.dead_lettered.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.dead_letter_failures.load(Ordering::Relaxed), 0);
+        assert!(
+            !cfg.dead_letter_path.exists(),
+            "a conflict must not write to the dead-letter file at all"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Capture is a safety net, not an unbounded sink. Each record carries the
+    /// full message body, so any input that reliably produces a permanent DB
+    /// error would otherwise let a send loop consume the host's disk — which
+    /// takes down the whole service, unlike losing captures past a ceiling.
+    #[tokio::test]
+    async fn dead_letter_stops_at_the_size_ceiling_instead_of_filling_the_disk() {
+        let dir = unique_tmp_dir("dl-ceiling");
+        let cfg = test_cfg(&dir);
+
+        // Pre-fill the file to the ceiling.
+        std::fs::write(
+            &cfg.dead_letter_path,
+            vec![b'x'; DEAD_LETTER_MAX_BYTES as usize],
+        )
+        .expect("prefill");
+
+        let stats = PersistStats::default();
+        let persist = |_db: DbPool, _job: PersistJob| async { Err(sqlx::Error::RowNotFound) };
+        let outcome = persist_with_retry(&lazy_pool(), &job(), &cfg, &stats, persist).await;
+
+        assert_eq!(outcome, PersistOutcome::DeadLetteredPermanent);
+        assert_eq!(
+            stats.dead_lettered.load(Ordering::Relaxed),
+            0,
+            "a refused write is not a capture"
+        );
+        assert_eq!(
+            stats.dead_letter_failures.load(Ordering::Relaxed),
+            1,
+            "the loss must be counted so it is alertable"
+        );
+        assert_eq!(
+            std::fs::metadata(&cfg.dead_letter_path)
+                .expect("still there")
+                .len(),
+            DEAD_LETTER_MAX_BYTES,
+            "the file must not grow past the ceiling"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

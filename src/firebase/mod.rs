@@ -24,7 +24,34 @@ use rsa::{Pkcs1v15Sign, RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tokio::sync::{OnceCell, RwLock};
+use std::time::Duration;
+use tokio::sync::{Mutex, OnceCell, RwLock};
+
+/// Refresh this many seconds before the token actually expires. Also the window
+/// during which a concurrent refresh is invisible to readers: they keep using
+/// the current token, which stays valid for this whole period.
+const TOKEN_REFRESH_SKEW_SECS: i64 = 300;
+
+/// Bound on the OAuth2 token exchange. `reqwest` defaults to NO timeout, and
+/// this call runs under the refresh lock — an unbounded hang against
+/// `oauth2.googleapis.com` would stall every later refresh behind it.
+const TOKEN_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on an FCM send. Covers the whole request *including reading the body*;
+/// the send path's own `tokio::time::timeout` wraps only `send()`, leaving the
+/// body read unbounded while holding a concurrency permit.
+const FCM_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// After a failed exchange, suppress further attempts for this long.
+///
+/// Single-flighting alone collapses N exchanges into one only when the refresh
+/// SUCCEEDS: on failure the expiry never advances, so the next caller is still
+/// stale, takes the lock, and spends another [`TOKEN_EXCHANGE_TIMEOUT`]. During
+/// a Google OAuth outage that serializes every notification behind its own
+/// timeout — a burst arriving faster than one per timeout becomes an
+/// ever-growing queue of spawned tasks. The cooldown makes a failed refresh
+/// cheap for everyone who arrives during it.
+const REFRESH_FAILURE_COOLDOWN_SECS: i64 = 30;
 
 // ---------------------------------------------------------------------------
 // Shared state with token refresh support
@@ -35,10 +62,27 @@ struct FirebaseState {
     service_account_json: String, // kept for re-signing on refresh — never logged (E2)
     access_token: String,
     token_expires_at: i64, // unix timestamp
+    /// Unix timestamp of the last failed token exchange (0 = none since the
+    /// last success). Gates [`REFRESH_FAILURE_COOLDOWN_SECS`].
+    last_refresh_failure_at: i64,
     http_client: Client,
 }
 
 static FIREBASE_STATE: OnceCell<Arc<RwLock<Option<FirebaseState>>>> = OnceCell::const_new();
+
+/// Elects the single task that performs a token exchange.
+///
+/// Deliberately separate from the state `RwLock`, and acquired with `try_lock`:
+/// the network round-trip runs with no state lock held, and a caller that loses
+/// the election does not queue — it uses the current token, which is still
+/// valid throughout the refresh window. Holding the state write lock across the
+/// exchange instead would queue every sender behind an untimed HTTP call
+/// (tokio's `RwLock` is write-preferring), wedging push process-wide.
+static REFRESH_LOCK: OnceCell<Mutex<()>> = OnceCell::const_new();
+
+async fn refresh_lock() -> &'static Mutex<()> {
+    REFRESH_LOCK.get_or_init(|| async { Mutex::new(()) }).await
+}
 
 /// Initialize the Firebase client. Returns `Some(())` on success, `None` if
 /// Firebase could not be configured (non-fatal — the server runs without
@@ -111,7 +155,24 @@ pub async fn initialize(
         service_account_json: sa_json,
         access_token,
         token_expires_at: expires_at,
-        http_client: Client::new(),
+        last_refresh_failure_at: 0,
+        // No `Client::new()` fallback: it panics on exactly the conditions that
+        // make `build()` fail (TLS backend / resolver init), so "degrade
+        // gracefully" would abort the process, and succeeding would hand back
+        // the untimed client FCM_HTTP_TIMEOUT exists to prevent. Push is
+        // optional — disable it and keep serving.
+        http_client: match Client::builder().timeout(FCM_HTTP_TIMEOUT).build() {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to build the FCM HTTP client ({e}); push notifications disabled"
+                );
+                FIREBASE_STATE
+                    .get_or_init(|| async { Arc::new(RwLock::new(None)) })
+                    .await;
+                return None;
+            }
+        },
     };
 
     FIREBASE_STATE
@@ -122,61 +183,144 @@ pub async fn initialize(
     Some(())
 }
 
-/// Return a valid (project_id, access_token, http_client) tuple, refreshing
-/// the OAuth2 token if it is about to expire (within 5 minutes).
-/// Returns `None` if Firebase is not configured.
-pub async fn get_valid_token() -> Option<(String, String, Client)> {
-    let state_lock = FIREBASE_STATE.get()?.clone();
-
-    // Fast path: read lock, check if token is still valid.
-    {
-        let guard = state_lock.read().await;
-        let state = guard.as_ref()?;
-        let now = chrono::Utc::now().timestamp();
-        if now < state.token_expires_at - 300 {
-            return Some((
-                state.project_id.clone(),
-                state.access_token.clone(),
-                state.http_client.clone(),
-            ));
-        }
-    }
-
-    // Slow path: token expiring soon, take write lock and refresh.
-    let mut guard = state_lock.write().await;
-    let state = guard.as_mut()?;
-
-    // Double-check: another task may have refreshed while we waited.
+/// Clone out (project_id, access_token, http_client) iff the token is not yet
+/// inside the refresh window. `None` also covers "Firebase not configured".
+async fn token_if_fresh(
+    state_lock: &Arc<RwLock<Option<FirebaseState>>>,
+) -> Option<(String, String, Client)> {
+    let guard = state_lock.read().await;
+    let state = guard.as_ref()?;
     let now = chrono::Utc::now().timestamp();
-    if now < state.token_expires_at - 300 {
-        return Some((
+    (now < state.token_expires_at - TOKEN_REFRESH_SKEW_SECS).then(|| {
+        (
             state.project_id.clone(),
             state.access_token.clone(),
             state.http_client.clone(),
-        ));
+        )
+    })
+}
+
+/// Clone out the credentials iff the token has not actually expired yet —
+/// ignoring the refresh skew. This is what a caller should use while some other
+/// task is mid-refresh: the token is still accepted by FCM, just due for
+/// renewal.
+async fn token_if_unexpired(
+    state_lock: &Arc<RwLock<Option<FirebaseState>>>,
+) -> Option<(String, String, Client)> {
+    let guard = state_lock.read().await;
+    let state = guard.as_ref()?;
+    (chrono::Utc::now().timestamp() < state.token_expires_at).then(|| {
+        (
+            state.project_id.clone(),
+            state.access_token.clone(),
+            state.http_client.clone(),
+        )
+    })
+}
+
+/// Return a valid (project_id, access_token, http_client) tuple, refreshing
+/// the OAuth2 token if it is about to expire (within [`TOKEN_REFRESH_SKEW_SECS`]).
+/// Returns `None` if Firebase is not configured.
+///
+/// No state lock is held across the network round-trip — see [`REFRESH_LOCK`] —
+/// and a caller only ever waits on the refresh when it has nothing usable.
+pub async fn get_valid_token() -> Option<(String, String, Client)> {
+    let state_lock = FIREBASE_STATE.get()?.clone();
+
+    // Fast path: the current token is good for a while yet.
+    if let Some(creds) = token_if_fresh(&state_lock).await {
+        return Some(creds);
     }
 
+    // We are inside the skew window. Exactly one task performs the exchange;
+    // everyone else keeps using the current token, which FCM still accepts for
+    // up to TOKEN_REFRESH_SKEW_SECS — that head start is the entire point of
+    // refreshing early. Queueing here instead would serialize every sender
+    // behind one network round-trip, which is the bug this window prevents.
+    let lock = refresh_lock().await;
+    let _refresh_guard = match lock.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            if let Some(creds) = token_if_unexpired(&state_lock).await {
+                return Some(creds);
+            }
+            // Truly expired and someone else is already refreshing: we have
+            // nothing to send with, so wait for their result.
+            let guard = lock.lock().await;
+            if let Some(creds) = token_if_fresh(&state_lock).await {
+                return Some(creds);
+            }
+            guard
+        }
+    };
+
+    // Re-check: the winner of a race for this lock may have just refreshed.
+    if let Some(creds) = token_if_fresh(&state_lock).await {
+        return Some(creds);
+    }
+
+    // Snapshot the credential and RELEASE the lock before going to the network.
+    // Also back off if the provider just failed us, rather than spending
+    // another TOKEN_EXCHANGE_TIMEOUT per caller against something that is down.
+    let service_account_json = {
+        let guard = state_lock.read().await;
+        let state = guard.as_ref()?;
+        let now = chrono::Utc::now().timestamp();
+        if now - state.last_refresh_failure_at < REFRESH_FAILURE_COOLDOWN_SECS {
+            // The cooldown must apply whether or not the token is still usable.
+            // Gating it on "token not yet expired" made it inert in the only
+            // case that matters: once the token expires, every caller reaching
+            // here would re-attempt, each paying TOKEN_EXCHANGE_TIMEOUT while
+            // holding this gate. Notifications are spawned per message, so
+            // during an outage past the skew window they pile up on this lock
+            // at arrival rate and drain one per timeout — push then stays dead
+            // for hours after the provider recovers.
+            return (now < state.token_expires_at).then(|| {
+                (
+                    state.project_id.clone(),
+                    state.access_token.clone(),
+                    state.http_client.clone(),
+                )
+            });
+        }
+        state.service_account_json.clone()
+    };
+
     tracing::debug!("Refreshing Firebase OAuth2 access token");
-    match obtain_access_token(&state.service_account_json).await {
+    let refreshed = obtain_access_token(&service_account_json).await;
+
+    // Re-acquire only to publish the result: no I/O happens under this guard.
+    let mut guard = state_lock.write().await;
+    let state = guard.as_mut()?;
+    match refreshed {
         Ok((new_token, new_expires)) => {
             state.access_token = new_token;
             state.token_expires_at = new_expires;
-            Some((
-                state.project_id.clone(),
-                state.access_token.clone(),
-                state.http_client.clone(),
-            ))
+            state.last_refresh_failure_at = 0;
         }
         Err(e) => {
+            // Keep the stale token: it has up to TOKEN_REFRESH_SKEW_SECS of
+            // life left, so a transient exchange failure need not fail sends.
+            state.last_refresh_failure_at = chrono::Utc::now().timestamp();
             tracing::error!("Failed to refresh Firebase access token: {e}");
-            // Return the stale token — it might still work for a few minutes.
-            Some((
-                state.project_id.clone(),
-                state.access_token.clone(),
-                state.http_client.clone(),
-            ))
         }
     }
+
+    // Past actual expiry there is nothing usable to hand out. Returning the
+    // token anyway would send every push against a credential FCM rejects,
+    // turning one outage into an indefinite stream of 401s that look like
+    // delivery failures. `None` reports push as unavailable, which is true.
+    if chrono::Utc::now().timestamp() >= state.token_expires_at {
+        tracing::error!(
+            "Firebase access token is expired and cannot be refreshed — push notifications unavailable until the token exchange recovers"
+        );
+        return None;
+    }
+    Some((
+        state.project_id.clone(),
+        state.access_token.clone(),
+        state.http_client.clone(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +347,12 @@ struct JwtClaims {
 #[derive(Deserialize)]
 struct TokenResponse {
     access_token: String,
+    /// Lifetime in seconds as reported by Google (currently always 3600).
+    /// Trusting the response rather than a hardcoded hour keeps the expiry
+    /// honest for any lifetime between the floor applied below and 3600 — a
+    /// hardcoded guess longer than the real lifetime would leave every push
+    /// failing against a token we believed was fresh.
+    expires_in: Option<i64>,
 }
 
 /// Build a self-signed JWT, exchange it at Google's token endpoint, and return
@@ -222,7 +372,10 @@ async fn obtain_access_token(service_account_json: &str) -> Result<(String, i64)
 
     let jwt = build_rs256_jwt(&claims, &sa.private_key)?;
 
-    let client = Client::new();
+    let client = Client::builder()
+        .timeout(TOKEN_EXCHANGE_TIMEOUT)
+        .build()
+        .map_err(|e| format!("failed to build token-exchange client: {e}"))?;
     let resp = client
         .post(&sa.token_uri)
         .form(&[
@@ -244,9 +397,16 @@ async fn obtain_access_token(service_account_json: &str) -> Result<(String, i64)
         .await
         .map_err(|e| format!("failed to parse token response: {e}"))?;
 
-    // Google tokens are valid for 3600s; record absolute expiry.
-    let expires_at = now + 3600;
-    Ok((token_resp.access_token, expires_at))
+    // Record absolute expiry from what the server actually reported, but floor
+    // the lifetime past the refresh skew. Freshness is `now < expires_at -
+    // TOKEN_REFRESH_SKEW_SECS`, so a reported lifetime at or below the skew
+    // would mark every token stale the instant it is minted — each send would
+    // trigger another exchange and none would ever be considered usable.
+    let lifetime = token_resp
+        .expires_in
+        .unwrap_or(3600)
+        .max(TOKEN_REFRESH_SKEW_SECS + 60);
+    Ok((token_resp.access_token, now + lifetime))
 }
 
 /// Construct an RS256-signed JWT from the given claims and PEM-encoded private

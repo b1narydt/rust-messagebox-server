@@ -6,6 +6,17 @@ use tracing::{debug, error, warn};
 
 use crate::db::queries;
 use crate::firebase::send_fcm_notification::{send_fcm_notification, FcmPayload};
+
+/// Max `messageId` length, matching the `messages.messageId` VARCHAR(255).
+pub(crate) const MAX_MESSAGE_ID_CHARS: usize = 255;
+
+/// Max `messageBox` name length, matching the `messageBox.type` VARCHAR(255).
+///
+/// Oversized values are not merely rejected downstream: `ensure_message_box`
+/// inserts with `INSERT IGNORE`, which truncates to 255, and then selects the
+/// untruncated value — so the row is never found and the send fails as a
+/// *permanent* error. Rejecting at the edge keeps that out of reach.
+pub(crate) const MAX_MESSAGE_BOX_CHARS: usize = 255;
 use crate::handlers::helpers::{
     build_per_recipient_outputs, error_response, is_valid_pub_key, AppState, AuthIdentity, FeeRow,
 };
@@ -46,7 +57,9 @@ pub async fn send_message(
 
     // ── messageBox ────────────────────────────────────────────────────
     let box_type = match msg.get("messageBox").and_then(|v| v.as_str()) {
-        Some(s) if !s.trim().is_empty() => s.trim().to_string(),
+        Some(s) if !s.trim().is_empty() && s.trim().chars().count() <= MAX_MESSAGE_BOX_CHARS => {
+            s.trim().to_string()
+        }
         _ => {
             return error_response(
                 StatusCode::BAD_REQUEST,
@@ -147,7 +160,16 @@ pub async fn send_message(
 
     tracing::Span::current().record("recipients", recipients.len());
 
-    // Validate recipient keys.
+    // Validate recipient keys, then normalise them.
+    //
+    // Identity keys are hex, so `02AB…` and `02ab…` are the SAME key — but the
+    // storage layer and the live-push layer disagree about that: MySQL compares
+    // `recipient`/`identityKey` case-insensitively, while Socket.IO room names
+    // are exact strings. An uppercase key therefore stored a row in the
+    // recipient's real mailbox while broadcasting to a room nobody had joined,
+    // so the message arrived only on a later poll. Lowercasing here (hex's
+    // canonical form, and what every client already sends) keeps the two views
+    // of "who is this" identical.
     for r in &recipients {
         if !is_valid_pub_key(r.trim()) {
             return error_response(
@@ -158,6 +180,11 @@ pub async fn send_message(
             .into_response();
         }
     }
+
+    let recipients: Vec<String> = recipients
+        .iter()
+        .map(|r| r.trim().to_ascii_lowercase())
+        .collect();
 
     // ── messageId ─────────────────────────────────────────────────────
     let mid_raw = match msg.get("messageId") {
@@ -172,10 +199,15 @@ pub async fn send_message(
         }
     };
 
+    // Trimmed on the way in. `messages.messageId` is PAD SPACE, so MySQL
+    // already considers "id" and "id  " the same value; storing them untrimmed
+    // makes our view disagree with the column's, turning a plain client typo
+    // into a rejected send. Normalising here collapses the whole
+    // trailing/leading-whitespace variant space into genuine duplicates.
     let message_ids: Vec<String> = if let Some(arr) = mid_raw.as_array() {
         match arr
             .iter()
-            .map(|v| v.as_str().map(|s| s.to_string()).ok_or(()))
+            .map(|v| v.as_str().map(|s| s.trim().to_string()).ok_or(()))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(v) => v,
@@ -189,7 +221,7 @@ pub async fn send_message(
             }
         }
     } else if let Some(s) = mid_raw.as_str() {
-        vec![s.to_string()]
+        vec![s.trim().to_string()]
     } else {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -224,13 +256,45 @@ pub async fn send_message(
         .into_response();
     }
 
-    // Validate each messageId is non-empty.
+    // Validate each messageId is non-empty and fits the column.
+    //
+    // The length cap is load-bearing, not cosmetic. `messageId` is stored in a
+    // VARCHAR(255) and is echoed into the FCM notification body, so an
+    // unbounded value (the body limit allows megabytes) lets a sender (a) push
+    // the FCM payload past its 4 KB limit, which returns the same error for
+    // every one of the recipient's devices, and (b) fail the INSERT with MySQL
+    // 1406, which is classified permanent and appends the whole oversized job
+    // to the dead-letter file. Rejecting here keeps both out of reach.
     for id in &message_ids {
         if id.trim().is_empty() {
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "ERR_INVALID_MESSAGEID",
                 "Each messageId must be a non-empty string.",
+            )
+            .into_response();
+        }
+        if id.chars().count() > MAX_MESSAGE_ID_CHARS {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "ERR_INVALID_MESSAGEID",
+                "Each messageId must be at most 255 characters.",
+            )
+            .into_response();
+        }
+    }
+
+    // Ids within one batch must be distinct. `messages.messageId` is unique, so
+    // reusing one across recipients stores only the first — and the response
+    // would still report every recipient as successful, because each is its own
+    // job and the later ones come back as conflicts after the reply is sent.
+    {
+        let mut seen = std::collections::HashSet::with_capacity(message_ids.len());
+        if let Some(dup) = message_ids.iter().find(|id| !seen.insert(*id)) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "ERR_INVALID_MESSAGEID",
+                &format!("messageId {dup} is repeated; each recipient needs a distinct id."),
             )
             .into_response();
         }
@@ -592,6 +656,10 @@ pub async fn send_message(
             crate::persist::Enqueued::DeadLettered => error!(
                 msg_id = %msg_id, recipient = %fr.recipient,
                 "persist: inline write hit a permanent error — dead-lettered to disk; row NOT in MySQL"
+            ),
+            crate::persist::Enqueued::Rejected => warn!(
+                msg_id = %msg_id, recipient = %fr.recipient,
+                "persist: messageId conflicts with a stored id under the column collation — send rejected, nothing stored and nothing to replay"
             ),
         }
 

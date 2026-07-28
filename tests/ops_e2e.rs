@@ -59,13 +59,13 @@ async fn boot_gated_instance(ops: Arc<OpsState>) -> (String, String, WsBroadcast
     let ws = WsBroadcast::new(
         io.clone(),
         SERVER_KEY.to_string(),
-        pool,
+        pool.clone(),
         None,
         Arc::clone(&ops),
     );
     ws::setup_handlers(&io, ws.clone());
 
-    let admission_ops = ops;
+    let admission_ops = Arc::clone(&ops);
     let admission_io = io.clone();
     let admission = axum::middleware::from_fn(
         move |req: axum::extract::Request, next: axum::middleware::Next| {
@@ -83,7 +83,16 @@ async fn boot_gated_instance(ops: Arc<OpsState>) -> (String, String, WsBroadcast
         },
     );
 
-    let app = axum::Router::new().layer(layer).layer(admission);
+    // /health/ready mounted after the admission layer, exactly as main.rs
+    // mounts it on the public router (the probe is never gated).
+    let app = axum::Router::new().layer(layer).layer(admission).route(
+        "/health/ready",
+        axum::routing::get(move || {
+            let pool = pool.clone();
+            let ops = ops.clone();
+            async move { messagebox_server::ops::readiness(&pool, None, &ops).await }
+        }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -259,4 +268,33 @@ async fn below_ceiling_connects_and_ops_surface_is_never_gated() {
     assert_eq!(ops.admission_rejected(), 0);
 
     client.disconnect().await.expect("disconnect");
+}
+
+/// `/health/ready` is served on the PUBLIC listener — Railway routes exactly
+/// one port per service, so the platform healthcheck can only probe here —
+/// and answers 503, never a blind 200, when a dependency is gone or the
+/// instance is draining. The harness pool points at nothing, so the DB probe
+/// always fails; draining is then flipped on top of it.
+#[tokio::test]
+async fn public_health_ready_reports_503_on_db_loss_and_while_draining() {
+    let ops = OpsState::new(0);
+    let (addr, _url, _ws) = boot_gated_instance(Arc::clone(&ops)).await;
+
+    let response = raw_get(&addr, "/health/ready").await;
+    assert!(
+        response.starts_with("HTTP/1.1 503"),
+        "unreachable DB must fail readiness on the public port:\n{response}"
+    );
+    assert!(response.contains("\"ready\":false"), "{response}");
+    assert!(response.contains("\"db\":\"unreachable\""), "{response}");
+
+    // Draining flips readiness too (the LB-deregistration signal) — and the
+    // probe itself still answers, because admission never gates it.
+    ops.start_drain();
+    let response = raw_get(&addr, "/health/ready").await;
+    assert!(
+        response.starts_with("HTTP/1.1 503"),
+        "draining must fail readiness:\n{response}"
+    );
+    assert!(response.contains("\"draining\":true"), "{response}");
 }

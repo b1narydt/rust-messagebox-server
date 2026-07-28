@@ -510,3 +510,66 @@ async fn ws_send_with_mismatched_room_and_recipient_is_rejected() {
 
     client.disconnect().await.expect("disconnect");
 }
+
+/// An oversized `messageBox` must be REJECTED, not accepted and dead-lettered.
+///
+/// `messageBox` comes out of the client-supplied `roomId` and lands in a
+/// VARCHAR(255). `ensure_message_box` inserts with `INSERT IGNORE` — which
+/// truncates to 255 — and then selects the untruncated name, so the lookup
+/// misses and the job is classified as a *permanent* failure. The whole
+/// message, body included, is then appended to the dead-letter file while the
+/// sender is acked `success` and nothing reaches MySQL: one socket can both
+/// silently lose its own messages and fill the disk (measured at ~11 MB/s).
+/// The edge check keeps that entire path out of reach.
+#[tokio::test]
+async fn ws_send_with_oversized_message_box_is_rejected_not_dead_lettered() {
+    let pool = migrated_pool().await;
+    let sender = identity_of(CLIENT_KEY).await;
+
+    // The sender's own room, so the roomId/recipient bind is satisfied — this
+    // needs no victim, which is what made the disk-fill trivially reachable.
+    let huge_box = "b".repeat(300);
+    let room = format!("{sender}-{huge_box}");
+
+    let (url, _ws) = boot_with(pool.clone()).await;
+    let (client, mut failed_rx) = connect_with_listener(&url, "messageFailed").await;
+    let (ack_tx, mut ack_rx) = mpsc::unbounded_channel::<Value>();
+    client
+        .on(
+            format!("sendMessageAck-{room}"),
+            Arc::new(move |data| {
+                let _ = ack_tx.send(data);
+            }),
+        )
+        .await;
+
+    client
+        .emit(
+            "sendMessage",
+            &json!({
+                "roomId": room,
+                "message": {
+                    "messageId": "ws-oversized-box-1",
+                    "recipient": sender,
+                    "body": "should never be accepted"
+                }
+            }),
+        )
+        .await
+        .expect("emit sendMessage");
+
+    let failed = recv_within(&mut failed_rx, "messageFailed").await;
+    assert_eq!(
+        failed.get("reason").and_then(Value::as_str),
+        Some("Invalid messageBox"),
+        "an oversized messageBox must be rejected at the edge: {failed}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(750), ack_rx.recv())
+            .await
+            .is_err(),
+        "a rejected send must NOT be acked as success"
+    );
+
+    client.disconnect().await.expect("disconnect");
+}

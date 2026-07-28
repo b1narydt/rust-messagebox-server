@@ -124,9 +124,11 @@ impl WsBroadcast {
         backplane: Option<Arc<crate::backplane::Backplane>>,
         ops: Arc<crate::ops::OpsState>,
     ) -> Self {
+        // `from_env`, not `default()`: DEAD_LETTER_PATH must reach the worker
+        // (the deployed container's cwd `/` is not writable by uid 10001).
         let persist = crate::persist::PersistHandle::spawn(
             db.clone(),
-            crate::persist::PersistConfig::default(),
+            crate::persist::PersistConfig::from_env(),
         );
         let ws = Self {
             io,
@@ -140,7 +142,7 @@ impl WsBroadcast {
         if let Some(bp) = &ws.backplane {
             match bp.take_delivery_rx() {
                 Some(rx) => {
-                    tokio::spawn(backplane_delivery_task(ws.clone(), bp.clone(), rx));
+                    tokio::spawn(backplane_delivery_supervisor(ws.clone(), bp.clone(), rx));
                 }
                 None => {
                     // A Backplane is single-consumer; a second WsBroadcast on
@@ -298,67 +300,137 @@ impl WsBroadcast {
     }
 }
 
-/// Model B: drain the backplane subscription and deliver every
-/// **remote-origin** envelope to local room members via the same signed
-/// local-delivery path the direct broadcast uses. Own-origin envelopes are
-/// skipped — the publishing instance already ran its local leg at publish
-/// time (skipping prevents double delivery, not a correctness gate: the
-/// client also dedupes on messageId).
+/// Model B: supervise the backplane delivery drain. A panic while processing
+/// one envelope must not sever cross-instance live push for the rest of the
+/// process lifetime — the drain restarts over the same receiver. Without
+/// supervision the dropped receiver would end the Redis subscriber, and every
+/// cross-instance push to this instance would be lost until redeploy.
+async fn backplane_delivery_supervisor(
+    ws: WsBroadcast,
+    bp: Arc<crate::backplane::Backplane>,
+    rx: tokio::sync::mpsc::Receiver<String>,
+) {
+    run_delivery_supervised(rx, move |raw| {
+        let ws = ws.clone();
+        let bp = bp.clone();
+        async move { deliver_backplane_envelope(&ws, &bp, raw).await }
+    })
+    .await;
+}
+
+/// Restart-on-panic supervision for a delivery drain over `rx`, mirroring the
+/// persist worker's supervisor ([`crate::persist`]): the receiver lives in an
+/// `Arc<Mutex<_>>` so a fresh drain task can reclaim it after a panic, and a
+/// graceful stream close ends the supervisor cleanly. The poisoned item itself
+/// is lost (its recipient falls back to the HTTP mailbox); everything queued
+/// behind it is still processed. Generic over the per-item processor so this
+/// contract is unit-testable without a Redis or socket stack.
+async fn run_delivery_supervised<F, Fut>(rx: tokio::sync::mpsc::Receiver<String>, process: F)
+where
+    F: Fn(String) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let rx = Arc::new(tokio::sync::Mutex::new(rx));
+    loop {
+        let drain_rx = Arc::clone(&rx);
+        let drain_process = process.clone();
+        // Run the drain in a child task so a panic is catchable via the JoinHandle.
+        let handle = tokio::spawn(async move {
+            loop {
+                // Hold the lock only across recv; release it during processing
+                // so a restart can reclaim the receiver if processing panics.
+                let next = {
+                    let mut guard = drain_rx.lock().await;
+                    guard.recv().await
+                };
+                match next {
+                    Some(raw) => drain_process(raw).await,
+                    None => return,
+                }
+            }
+        });
+        match handle.await {
+            Ok(()) => {
+                debug!("backplane delivery task ended (subscription stream closed)");
+                return;
+            }
+            // A JoinError is a panic OR a cancellation. Nothing aborts this
+            // handle today, so this arm is unreachable as written; it is here
+            // so that adding an abort later cannot turn a deliberate stop into
+            // a false panic alert and a restart of a task meant to end.
+            Err(join_err) if join_err.is_cancelled() => {
+                debug!("backplane delivery task cancelled — not restarting");
+                return;
+            }
+            Err(join_err) => {
+                crate::metrics::BACKPLANE_DELIVERY_PANICS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                error!(
+                    code = "ERR_BACKPLANE_DELIVERY_PANIC",
+                    error = %join_err,
+                    "backplane delivery task PANICKED — restarting over the same subscription stream. Investigate: one poisoned envelope nearly disabled cross-instance live push on this instance."
+                );
+            }
+        }
+    }
+}
+
+/// Model B: deliver one **remote-origin** envelope to local room members via
+/// the same signed local-delivery path the direct broadcast uses. Own-origin
+/// envelopes are skipped — the publishing instance already ran its local leg
+/// at publish time (skipping prevents double delivery, not a correctness
+/// gate: the client also dedupes on messageId).
 ///
 /// Only this instance holds the authsocket `Peer` sessions for its sockets,
 /// so only it can sign for them — the envelope arrives UNSIGNED and signing
 /// happens here, on the connection owner.
-async fn backplane_delivery_task(
-    ws: WsBroadcast,
-    bp: Arc<crate::backplane::Backplane>,
-    mut rx: tokio::sync::mpsc::Receiver<String>,
+async fn deliver_backplane_envelope(
+    ws: &WsBroadcast,
+    bp: &crate::backplane::Backplane,
+    raw: String,
 ) {
-    while let Some(raw) = rx.recv().await {
-        let envelope: crate::backplane::BackplaneEnvelope = match serde_json::from_str(&raw) {
-            Ok(e) => e,
+    let envelope: crate::backplane::BackplaneEnvelope = match serde_json::from_str(&raw) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(error = %e, "backplane: undecodable envelope — skipped");
+            return;
+        }
+    };
+    if envelope.origin == bp.instance_id() {
+        // Own envelope back off the channel: skip delivery (the local leg
+        // already ran at publish time), but use it to measure pub/sub
+        // round-trip lag on a single clock (publisher == observer).
+        if envelope.published_at_us > 0 {
+            let lag_us = crate::backplane::now_epoch_us().saturating_sub(envelope.published_at_us);
+            crate::metrics::BACKPLANE_LAG_SECONDS.observe(lag_us as f64 / 1e6);
+        }
+        return;
+    }
+    // subscribe → sign → deliver: the owner-side leg of the Model B path.
+    let span = tracing::debug_span!(
+        "backplane_deliver",
+        origin = %envelope.origin,
+        room = %envelope.room_id,
+        msg_id = %envelope.message.message_id,
+    );
+    async {
+        let data = match serde_json::to_value(&envelope.message) {
+            Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "backplane: undecodable envelope — skipped");
-                continue;
+                warn!(error = %e, "backplane: envelope message failed to re-serialize — skipped");
+                return;
             }
         };
-        if envelope.origin == bp.instance_id() {
-            // Own envelope back off the channel: skip delivery (the local leg
-            // already ran at publish time), but use it to measure pub/sub
-            // round-trip lag on a single clock (publisher == observer).
-            if envelope.published_at_us > 0 {
-                let lag_us =
-                    crate::backplane::now_epoch_us().saturating_sub(envelope.published_at_us);
-                crate::metrics::BACKPLANE_LAG_SECONDS.observe(lag_us as f64 / 1e6);
-            }
-            continue;
-        }
-        // subscribe → sign → deliver: the owner-side leg of the Model B path.
-        let span = tracing::debug_span!(
-            "backplane_deliver",
-            origin = %envelope.origin,
-            room = %envelope.room_id,
-            msg_id = %envelope.message.message_id,
+        let delivered = ws
+            .deliver_local(&envelope.room_id, &envelope.event, &data)
+            .await;
+        debug!(
+            delivered,
+            "backplane: remote-origin message delivered to local members"
         );
-        async {
-            let data = match serde_json::to_value(&envelope.message) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(error = %e, "backplane: envelope message failed to re-serialize — skipped");
-                    return;
-                }
-            };
-            let delivered = ws
-                .deliver_local(&envelope.room_id, &envelope.event, &data)
-                .await;
-            debug!(
-                delivered,
-                "backplane: remote-origin message delivered to local members"
-            );
-        }
-        .instrument(span)
-        .await;
     }
-    debug!("backplane delivery task ended (subscription stream closed)");
+    .instrument(span)
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +717,10 @@ fn log_persist_outcome(
             sid = %sid, msg_id = %message_id, recipient = %recipient,
             "persist: inline write hit a permanent error — dead-lettered to disk; row NOT in MySQL"
         ),
+        Enqueued::Rejected => warn!(
+            sid = %sid, msg_id = %message_id, recipient = %recipient,
+            "persist: messageId conflicts with a stored id under the column collation — send rejected, nothing stored and nothing to replay"
+        ),
     }
 }
 
@@ -710,14 +786,26 @@ async fn handle_ws_send_message(
         }
     };
 
+    // Trimmed to match the HTTP path and the column: `messages.messageId` is
+    // PAD SPACE, so MySQL already treats "id" and "id  " as the same value.
+    // Storing them untrimmed would make a plain client typo a rejected send.
     let message_id = match message.get("messageId").and_then(|v| v.as_str()) {
-        Some(id) if !id.is_empty() => id.to_string(),
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
         _ => {
             warn!(sid = %sid, "BRC-103 sendMessage: missing messageId");
             message_failed(socket, ws, "Missing messageId").await;
             return;
         }
     };
+    // Same cap as the HTTP path: the id goes into a VARCHAR(255), so an
+    // oversized one fails the INSERT as a permanent error, which dead-letters
+    // the whole job to disk. (The FCM half of the HTTP path's rationale does
+    // not apply here — this path never sends a push.)
+    if message_id.chars().count() > crate::handlers::send_message::MAX_MESSAGE_ID_CHARS {
+        warn!(sid = %sid, "BRC-103 sendMessage: messageId exceeds the length limit");
+        message_failed(socket, ws, "messageId exceeds the length limit").await;
+        return;
+    }
     // Backfill the span fields declared Empty on the instrument attribute.
     let span = tracing::Span::current();
     span.record("msg_id", tracing::field::display(&message_id));
@@ -783,6 +871,33 @@ async fn handle_ws_send_message(
     if room_key != recipient {
         warn!(sid = %sid, room = %room_id_str, "BRC-103 sendMessage: roomId identity does not match recipient — rejected");
         message_failed(socket, ws, "roomId does not match recipient").await;
+        return;
+    }
+
+    // Bound the two remaining client-controlled strings that reach MySQL.
+    //
+    // `recipient` and `message_box` land in VARCHAR(255) columns via
+    // `ensure_message_box`, whose `INSERT IGNORE` TRUNCATES an oversized value
+    // to 255 while the follow-up SELECT looks for the full-length one — so the
+    // lookup misses, the job is classified permanent, and the whole message
+    // (body included, up to MAX_MESSAGE_BODY_BYTES) is appended to the
+    // dead-letter file. The sender is acked "success" and nothing is stored, so
+    // a single socket can both silently lose its own messages and fill the
+    // disk. The HTTP path is not exposed to this: it validates the recipient
+    // key and resolves the box synchronously, failing the request instead.
+    //
+    // A valid identity key is exactly 66 hex chars, so validating the key also
+    // bounds it; `message_box` gets the column's own limit.
+    if !crate::handlers::helpers::is_valid_pub_key(&recipient) {
+        warn!(sid = %sid, "BRC-103 sendMessage: recipient is not a valid identity key");
+        message_failed(socket, ws, "Invalid recipient identity key").await;
+        return;
+    }
+    if message_box.trim().is_empty()
+        || message_box.chars().count() > crate::handlers::send_message::MAX_MESSAGE_BOX_CHARS
+    {
+        warn!(sid = %sid, "BRC-103 sendMessage: messageBox missing or too long");
+        message_failed(socket, ws, "Invalid messageBox").await;
         return;
     }
 
@@ -967,5 +1082,48 @@ mod tests {
     #[test]
     fn room_id_convention() {
         assert_eq!(room_id("03abc", "payment_inbox"), "03abc-payment_inbox");
+    }
+
+    /// A panic while processing one delivery must not sever the stream: the
+    /// supervisor restarts the drain over the SAME receiver, so items queued
+    /// behind the poisoned one are still processed, and a graceful stream
+    /// close still ends the supervisor cleanly.
+    #[tokio::test]
+    async fn delivery_supervisor_restarts_drain_after_panic() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+        let processed = Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&processed);
+        let supervisor = tokio::spawn(run_delivery_supervised(rx, move |raw: String| {
+            let sink = Arc::clone(&sink);
+            async move {
+                if raw == "poison" {
+                    panic!("injected: poisoned envelope");
+                }
+                sink.lock().push(raw);
+            }
+        }));
+
+        tx.send("before".into()).await.unwrap();
+        tx.send("poison".into()).await.unwrap();
+        tx.send("after".into()).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while processed.lock().len() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "drain did not survive the panic"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *processed.lock(),
+            ["before".to_string(), "after".to_string()]
+        );
+
+        drop(tx);
+        tokio::time::timeout(std::time::Duration::from_secs(5), supervisor)
+            .await
+            .expect("supervisor ends when the stream closes")
+            .expect("supervisor itself must not panic");
     }
 }
