@@ -37,7 +37,7 @@ socketioxide = { version = "0.15", features = ["state"] }
 # the TS-parity failure events, so 0.1.1's server-side keepalive room re-assert
 # had to be ported into that fork by hand. Every future bump must diff upstream
 # `server_io` against the fork.
-authsocket = { version = "0.1.2", features = ["server"] }
+authsocket = { version = "0.1.3", features = ["server"] }
 
 # BRC-103/104 auth middleware — git dep (0.1.3, WS-first connect + connect-ack
 # gate), same rev as rust-mpc bins/coordinator. Built against bsv-sdk 0.4, which
@@ -80,7 +80,7 @@ testcontainers-modules = { version = "0.15", features = ["mysql", "redis"] }
 uuid = { version = "1", features = ["v4"] }
 # Two-instance Model B e2e (tests/backplane_e2e.rs): a real authsocket client
 # (rust_socketio) driving real loopback servers + a Redis testcontainer.
-authsocket = { version = "0.1.2", features = ["server", "client"] }
+authsocket = { version = "0.1.3", features = ["server", "client"] }
 
 [profile.release]
 opt-level = 3

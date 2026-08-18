@@ -479,14 +479,18 @@ async fn keepalive_reasserts_lost_room_membership_through_the_fork() {
     );
 
     // The next keepalive probe (2s cadence + processing) must re-assert it.
-    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    // DERIVED from the client's real cadence, never a magic number: a hardcoded
+    // bound silently becomes flaky or vacuous the moment KEEPALIVE_INTERVAL
+    // changes — which is exactly what the 0.1.2 -> 0.1.3 retune did to it.
+    let heal_bound = authsocket::KEEPALIVE_INTERVAL * 2 + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + heal_bound;
     loop {
         if core.room_members(&room).contains(&sid) {
             break; // healed through the fork's authenticated handler
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "keepalive did not re-assert room membership within 6s"
+            "keepalive did not re-assert room membership within {heal_bound:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -525,7 +529,10 @@ async fn keepalive_reassert_heals_the_backplane_route_too() {
     bp.on_room_leave(&sid, &room);
     assert!(core.room_members(&room).is_empty(), "membership dropped");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    // Derived, as above — plus a little more slack, since this one waits for the
+    // backplane route as well as core membership.
+    let heal_bound = authsocket::KEEPALIVE_INTERVAL * 2 + Duration::from_secs(8);
+    let deadline = std::time::Instant::now() + heal_bound;
     let mut saw_route_drop = false;
     loop {
         if !bp.is_room_active(&room) {
@@ -536,7 +543,7 @@ async fn keepalive_reassert_heals_the_backplane_route_too() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "keepalive did not heal core membership + backplane route within 8s \
+            "keepalive did not heal core membership + backplane route within {heal_bound:?} \
              (saw_route_drop={saw_route_drop})"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -588,9 +595,16 @@ async fn keepalive_reassert_refuses_a_room_join_room_refused() {
         "joinRoom must refuse a room that only prefixes the identity"
     );
 
-    // Now let several keepalive probes land (2s cadence). Each one carries the
-    // refused room in the client's snapshot; none may install it.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Now let several keepalive probes land. Each one carries the refused room in
+    // the client's snapshot; none may install it.
+    //
+    // The wait is DERIVED from the cadence because this is a NEGATIVE control,
+    // and a negative control that outruns the signal it is meant to observe
+    // passes for the wrong reason. At the old hardcoded 5s against a 2s cadence
+    // this saw two probes; against the 0.1.3 10s cadence it would have seen
+    // ZERO and asserted nothing at all.
+    let probes = 3;
+    tokio::time::sleep(authsocket::KEEPALIVE_INTERVAL * probes + Duration::from_secs(2)).await;
     assert!(
         core.room_members(&foreign).is_empty(),
         "keepalive re-assert admitted a room joinRoom refused — the own-room \
