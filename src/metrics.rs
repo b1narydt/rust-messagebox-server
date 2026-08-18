@@ -143,7 +143,7 @@ pub struct Snapshot<'a> {
     /// Distinct verified BRC-103 identities among those sockets. Every room is
     /// `{identityKey}-{messageBox}` and only its owner may join it (own-room
     /// enforcement), so this is the room-owner count — a lower bound on joined
-    /// rooms (authsocket 0.1.0 exposes no room enumeration; a client with N
+    /// rooms (authsocket 0.1.2 exposes no room enumeration; a client with N
     /// boxes counts once).
     pub authenticated_identities: usize,
     pub persist_queue_depth: usize,

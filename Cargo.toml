@@ -26,21 +26,35 @@ socketioxide = { version = "0.15", features = ["state"] }
 # Shared BRC-103-over-Socket.IO subsystem (per-socket Peer sessions, verified
 # identity, rooms, signed emits/broadcasts). Extracted from this server's
 # hand-rolled ws.rs glue; see src/ws.rs for what stays app-side.
-authsocket = { version = "0.1.0", features = ["server"] }
+#
+# 0.1.2 — the SAME version rust-mpc pins workspace-wide. This is not cosmetic:
+# the peers that dial this server's WS (PARAGON's cosigners over the MPC relay
+# lane, wallet-plane clients over the mailbox verbs) must build the BRC-103
+# handshake and the signed-event contract from ONE authsocket copy (TR-011).
+# Silent drift across that boundary fails closed with no error.
+#
+# Note what the bump does NOT deliver: src/ws.rs FORKS `server_io::attach` for
+# the TS-parity failure events, so 0.1.1's server-side keepalive room re-assert
+# had to be ported into that fork by hand. Every future bump must diff upstream
+# `server_io` against the fork.
+authsocket = { version = "0.1.2", features = ["server"] }
 
 # BRC-103/104 auth middleware — git dep (0.1.3, WS-first connect + connect-ack
-# gate), same rev as rust-mpc bins/backend + bins/cosigner. Requires bsv-sdk 0.3.
-bsv-auth-axum-middleware = { git = "https://github.com/b1narydt/bsv-auth-axum-middleware", rev = "18a39db0f0ef1042e7eca8cf4c602f0be9ecf0a2" }
+# gate), same rev as rust-mpc bins/coordinator. Built against bsv-sdk 0.4, which
+# is what makes the single-copy invariant below hold.
+bsv-auth-axum-middleware = { git = "https://github.com/b1narydt/bsv-auth-axum-middleware", rev = "38927449c9b973a38bbb72e3586f2702002d2fe3" }
 
-# bsv-sdk — sole SDK for all auth and wallet operations. Declared as a registry
-# version and redirected graph-wide to the shared 0.3 git rev via
-# [patch.crates-io] below, so this crate, authsocket, the middleware, and
-# bsv-wallet-toolbox all resolve ONE bsv-sdk copy (WalletInterface/AuthMessage
-# unify across the auth boundary). Verify with `cargo tree -i bsv-sdk`.
-bsv-sdk = { version = "0.3", features = ["network"] }
+# bsv-sdk — sole SDK for all auth and wallet operations. Resolved straight from
+# crates.io: there is NO [patch.crates-io] redirect in this manifest, and there
+# must not be one. 0.4.0 is the published line every neighbour already targets
+# (rust-mpc, authsocket 0.1.2, the auth middleware rev above, bsv-wallet-toolbox
+# 0.7.1), so the whole graph resolves ONE bsv-sdk copy and `WalletInterface` /
+# `AuthMessage` unify across the auth boundary. Two copies means BRC-103 breaks
+# in confusing ways — verify with `cargo tree -i bsv-sdk` (expect exactly one).
+bsv-sdk = { version = "0.4.0", features = ["network"] }
 
-# 0.3.x — the line that targets bsv-sdk 0.3 (matches the rust-mpc workspace).
-bsv-wallet-toolbox = "0.3"
+# 0.7.1 — the sdk-0.4 alignment release, matching the rust-mpc workspace pin.
+bsv-wallet-toolbox = "0.7.1"
 
 getrandom = "0.4"
 http-body-util = "0.1"
@@ -66,7 +80,7 @@ testcontainers-modules = { version = "0.15", features = ["mysql", "redis"] }
 uuid = { version = "1", features = ["v4"] }
 # Two-instance Model B e2e (tests/backplane_e2e.rs): a real authsocket client
 # (rust_socketio) driving real loopback servers + a Redis testcontainer.
-authsocket = { version = "0.1.0", features = ["server", "client"] }
+authsocket = { version = "0.1.2", features = ["server", "client"] }
 
 [profile.release]
 opt-level = 3
@@ -74,13 +88,11 @@ lto = true
 
 # Standalone package — not a member of the parent rust-mpc workspace.
 # Without this, cargo walks up to rust-mpc/Cargo.toml and refuses to build.
+#
+# There is deliberately NO [patch.crates-io] here. This crate used to redirect
+# bsv-sdk graph-wide to a b1narydt/bsv-rust-sdk git rev, because crates.io 0.3.0
+# rejected protocol/basket names starting with 'p' (which broke the
+# payment-request-auth protocol). That fix is published in the 0.4 line, so the
+# redirect is gone: a [patch] here would make this crate unpublishable and would
+# re-open the version skew the single-copy invariant above exists to prevent.
 [workspace]
-
-# bsv-sdk pinned graph-wide to the same 0.3 git rev as rust-mpc, rust-authsocket,
-# and rust-messagebox-client (crates.io 0.3.0 rejects protocol/basket names
-# starting with 'p', which breaks the payment-request-auth protocol; the pinned
-# rev reserves the "p " namespace instead). This server is the build root, so the
-# [patch] applies graph-wide: every crate (incl. bsv-wallet-toolbox and the auth
-# middleware) shares one bsv-sdk copy. Pinned to an immutable rev, not a branch.
-[patch.crates-io]
-bsv-sdk = { git = "https://github.com/b1narydt/bsv-rust-sdk.git", rev = "102abf703289ea8459167c4b2954e5cd94fce8d5" }

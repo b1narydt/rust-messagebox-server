@@ -446,3 +446,155 @@ async fn dropped_delivery_consumer_flips_subscribed_off() {
     assert!(!bp.is_room_active("03aa-mpc_inbox"));
     assert_eq!(bp.active_subscription_count(), 0);
 }
+
+/// Server-side pin for the keepalive room re-assert, hand-ported from
+/// authsocket 0.1.1's `server_io::attach` into this server's fork of it
+/// (`ws::setup_handlers`). Upstream's own
+/// `keepalive_reasserts_lost_room_membership` proves nothing about the fork —
+/// upstream's copy of that code never runs here — so the behaviour needs its
+/// own test driven through OUR handler with a real 0.1.2 client.
+///
+/// Model A half: server-side membership loss (the skew a deploy or a dropped
+/// join produces) must heal within one keepalive interval, with no reconnect.
+#[tokio::test]
+async fn keepalive_reasserts_lost_room_membership_through_the_fork() {
+    let (url, ws) = boot_instance(SERVER_KEY_A, None).await;
+    let core = ws.authsocket_core();
+    let identity = identity_of(CLIENT_KEY).await;
+    let room = format!("{identity}-test_inbox");
+    let (client, _rx) = connect_and_join(&url, &room).await;
+
+    // connect_and_join confirmed the signed joinedRoom reply, so the membership
+    // is registered; grab the socket id it registered under.
+    let members = core.room_members(&room);
+    assert_eq!(members.len(), 1, "exactly one member after join");
+    let sid = members[0].clone();
+
+    // Server-side membership loss.
+    core.leave_room(&sid, &room);
+    assert!(
+        core.room_members(&room).is_empty(),
+        "membership force-dropped"
+    );
+
+    // The next keepalive probe (2s cadence + processing) must re-assert it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        if core.room_members(&room).contains(&sid) {
+            break; // healed through the fork's authenticated handler
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "keepalive did not re-assert room membership within 6s"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    client.disconnect().await.expect("disconnect");
+}
+
+/// Model B half of the same port: healing `core` membership alone leaves the
+/// backplane route dead, so cross-instance deliveries still cannot reach the
+/// socket — the silent half of the skew. The re-assert must pair
+/// `core.join_room` with `route_join`, exactly like the joinRoom arm. Drop
+/// BOTH halves (what leaveRoom does) and require BOTH healed.
+#[tokio::test]
+async fn keepalive_reassert_heals_the_backplane_route_too() {
+    let (_redis, redis_url) = redis_container().await;
+    let bp = Backplane::new(&redis_url);
+    wait_until("subscribed", || bp.is_subscribed()).await;
+    let (url, ws) = boot_instance(SERVER_KEY_A, Some(bp.clone())).await;
+    let core = ws.authsocket_core();
+    let identity = identity_of(CLIENT_KEY).await;
+    let room = format!("{identity}-test_inbox");
+    let (client, _rx) = connect_and_join(&url, &room).await;
+    wait_until("route registered on join", || bp.is_room_active(&room)).await;
+
+    let members = core.room_members(&room);
+    assert_eq!(members.len(), 1, "exactly one member after join");
+    let sid = members[0].clone();
+
+    // The deploy-skew drop takes both halves, as leaveRoom does. The core half
+    // is synchronous (assert immediately); the route half unsubscribes
+    // asynchronously AND the 2s-cadence keepalive may heal it before the
+    // inactive state is ever observable — so accept either observation. Core
+    // membership was provably dropped, so a restored member proves the
+    // re-assert ran, and route_join rides the same code path.
+    core.leave_room(&sid, &room);
+    bp.on_room_leave(&sid, &room);
+    assert!(core.room_members(&room).is_empty(), "membership dropped");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(8);
+    let mut saw_route_drop = false;
+    loop {
+        if !bp.is_room_active(&room) {
+            saw_route_drop = true;
+        }
+        if core.room_members(&room).contains(&sid) && bp.is_room_active(&room) {
+            break; // both halves live again through the fork's re-assert
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "keepalive did not heal core membership + backplane route within 8s \
+             (saw_route_drop={saw_route_drop})"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    client.disconnect().await.expect("disconnect");
+}
+
+/// The re-assert must never authorize a room `joinRoom` itself refuses.
+///
+/// Upstream authsocket 0.1.2's re-assert uses a BARE `room_id.starts_with(key)`
+/// own-room test; this fork's joinRoom arm deliberately hardened that to the
+/// delimiter-anchored `{key}` / `{key}-…` form, and the port keeps the hardened
+/// rule. This test drives the difference through a real client: `{identity}X-…`
+/// passes a bare prefix test and fails the anchored one.
+///
+/// The 0.1.2 client records a room in its local snapshot on `join_room`
+/// regardless of whether the server accepted it, so the refused room really
+/// does ride every subsequent keepalive probe — the keepalive is a live second
+/// door into membership, and it must be no wider than the first.
+#[tokio::test]
+async fn keepalive_reassert_refuses_a_room_join_room_refused() {
+    let (url, ws) = boot_instance(SERVER_KEY_A, None).await;
+    let core = ws.authsocket_core();
+    let identity = identity_of(CLIENT_KEY).await;
+    let wallet = ProtoWallet::new(PrivateKey::from_hex(CLIENT_KEY).expect("key"));
+    let client = AuthSocketClient::connect(&url, &identity, wallet)
+        .await
+        .expect("connect + BRC-103 handshake");
+
+    // Not our room: it merely BEGINS with our identity key.
+    let foreign = format!("{identity}X-test_inbox");
+    let (failed_tx, mut failed_rx) = mpsc::unbounded_channel::<Value>();
+    client
+        .on(
+            "joinFailed",
+            Arc::new(move |data| {
+                let _ = failed_tx.send(data);
+            }),
+        )
+        .await;
+    client.join_room(&foreign).await.expect("emit joinRoom");
+    tokio::time::timeout(Duration::from_secs(10), failed_rx.recv())
+        .await
+        .expect("joinFailed within 10s")
+        .expect("joinFailed data");
+    assert!(
+        core.room_members(&foreign).is_empty(),
+        "joinRoom must refuse a room that only prefixes the identity"
+    );
+
+    // Now let several keepalive probes land (2s cadence). Each one carries the
+    // refused room in the client's snapshot; none may install it.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert!(
+        core.room_members(&foreign).is_empty(),
+        "keepalive re-assert admitted a room joinRoom refused — the own-room \
+         rule is a bare prefix test, not the delimiter-anchored form"
+    );
+
+    client.disconnect().await.expect("disconnect");
+}

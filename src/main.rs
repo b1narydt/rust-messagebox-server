@@ -134,6 +134,12 @@ async fn main() {
     let wallet_args = WalletArgs {
         chain,
         key_deriver: key_deriver.clone(),
+        // No delegated custody backend: this wallet's `key_deriver` is a plain
+        // `CachedKeyDeriver` over the locally-held SERVER_PRIVATE_KEY, so it has
+        // a usable root key and derives + signs its own BRC-29 change outputs
+        // and input signatures. `Some(provider)` is for the MPC/threshold case
+        // where the deriver's identity is a joint key with no root behind it.
+        signing_provider: None,
         storage: Arc::new(storage_manager),
         services: Some(services),
         monitor: None,

@@ -45,6 +45,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03918c3dbd7701a85c6b9887732e2921175f26c350b4563841d0958c21d57e6d"
 
 [[package]]
+name = "argon2"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c3610892ee6e0cbce8ae2700349fcf8f98adb0dbfbee85aec3c9179d29cc072"
+dependencies = [
+ "base64ct",
+ "blake2",
+ "cpufeatures 0.2.17",
+ "password-hash",
+]
+
+[[package]]
 name = "astral-tokio-tar"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -121,9 +133,9 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "authsocket"
-version = "0.1.0"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ffdb85d90d02291fccd06bb7c50020e5c466be48273af95c75d01d58e9a4b0fa"
+checksum = "4d9c16c3e4232757f07e206940a8a97e0a2b0e929c8eb4727c39a73b2c263069"
 dependencies = [
  "async-trait",
  "bsv-sdk",
@@ -234,6 +246,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -328,7 +349,7 @@ dependencies = [
 [[package]]
 name = "bsv-auth-axum-middleware"
 version = "0.1.3"
-source = "git+https://github.com/b1narydt/bsv-auth-axum-middleware?rev=18a39db0f0ef1042e7eca8cf4c602f0be9ecf0a2#18a39db0f0ef1042e7eca8cf4c602f0be9ecf0a2"
+source = "git+https://github.com/b1narydt/bsv-auth-axum-middleware?rev=38927449c9b973a38bbb72e3586f2702002d2fe3#38927449c9b973a38bbb72e3586f2702002d2fe3"
 dependencies = [
  "async-trait",
  "axum",
@@ -350,8 +371,9 @@ dependencies = [
 
 [[package]]
 name = "bsv-sdk"
-version = "0.3.1"
-source = "git+https://github.com/b1narydt/bsv-rust-sdk.git?rev=102abf703289ea8459167c4b2954e5cd94fce8d5#102abf703289ea8459167c4b2954e5cd94fce8d5"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a49fb0edcfb734fcb1aa7b1f6f726ab93f3c82f1f80eddb1874ea83f0589055"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -366,10 +388,11 @@ dependencies = [
 
 [[package]]
 name = "bsv-wallet-toolbox"
-version = "0.3.1"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b0199a324c09b39439961267c1425e99e96369e6f45a5c08b579d4ca6b4004b"
+checksum = "58570990dda3511194ed24549531dccb1a75dd5b21a84300d02620f81ca2e642"
 dependencies = [
+ "argon2",
  "async-trait",
  "base64 0.22.1",
  "bsv-sdk",
@@ -390,6 +413,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "unicode-normalization",
  "uuid",
 ]
 
@@ -1966,6 +1990,17 @@ dependencies = [
  "regex-syntax",
  "structmeta",
  "syn",
+]
+
+[[package]]
+name = "password-hash"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "346f04948ba92c43e8469c1ee6736c7563d71012b17d40745260fe106aac2166"
+dependencies = [
+ "base64ct",
+ "rand_core 0.6.4",
+ "subtle",
 ]
 
 [[package]]

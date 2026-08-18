@@ -310,9 +310,20 @@ impl WsBroadcast {
         delivered
     }
 
+    /// The authsocket room/session core. Public so INTEGRATION tests can drive
+    /// server-side membership state the way upstream authsocket's own e2e
+    /// drives its boot handle — force-drop a membership, then observe the
+    /// keepalive re-assert heal it. The `pub(crate) core` field covers the
+    /// unit tests in this file; integration tests live in another crate and
+    /// cannot see it. Production handlers hold the core internally; nothing
+    /// outside tests should need this.
+    pub fn authsocket_core(&self) -> SharedAuthSocketServer<SdkProtoWallet> {
+        self.core.clone()
+    }
+
     /// Scrape-time sample: (connected sockets, distinct verified identities).
     /// Identities are the room owners (own-room enforcement means one identity
-    /// ⇔ one room family) — the `mbs_rooms` lower bound; authsocket 0.1.0
+    /// ⇔ one room family) — the `mbs_rooms` lower bound; authsocket 0.1.2
     /// exposes no room enumeration.
     pub fn live_counts(&self) -> (usize, usize) {
         let sockets = self.io.sockets().unwrap_or_default();
@@ -513,12 +524,15 @@ async fn deliver_backplane_envelope(
 ///
 /// This is a **fork of `authsocket::server_io::attach`** (same protocol, same
 /// public API of the crate's core) that adds the TS-parity **failure events**
-/// the 0.1.0 adapter swallows (parity audit rows W1/W2/W3/W5):
+/// the crate adapter swallows (parity audit rows W1/W2/W3/W5):
 /// `authenticationFailed`, `joinFailed`, `leaveFailed` — plus the app-level
 /// `messageFailed` in [`handle_ws_send_message`] — so clients see WHY an
-/// action failed instead of a silent server-side log. Candidate to upstream
-/// into authsocket 0.1.1, at which point this reverts to `attach` + an
-/// `AppDispatcher`.
+/// action failed instead of a silent server-side log. Checked against
+/// authsocket 0.1.2: the failure events are still not upstream, so the fork
+/// stays. **Every authsocket bump must diff upstream `server_io` against this
+/// function** — a behaviour upstream adds does NOT arrive with the version
+/// bump. 0.1.1's keepalive room re-assert is the worked example: it is ported
+/// by hand in [`handle_verified_event`]'s `authenticated` arm.
 ///
 /// Every security invariant of the crate adapter is preserved verbatim:
 /// - `authMessage` is the ONLY inbound event; everything else is dropped.
@@ -647,6 +661,66 @@ async fn handle_verified_event(
             // TS, which stores it — the spoofable-claimed-sender bug).
             match core.identity_key(sid) {
                 Some(identity) => {
+                    // Presence self-heal, hand-ported from authsocket 0.1.1's
+                    // `server_io::attach`. Bumping the crate does NOT deliver
+                    // it here: `setup_handlers` is a FORK of that function (see
+                    // its doc comment), so upstream's copy never runs on this
+                    // server. The keepalive probe the 0.1.2 client sends every
+                    // 2s carries the rooms it believes it belongs to;
+                    // re-asserting each one means server-side routability
+                    // cannot silently rot while the socket is live — any skew
+                    // (a deploy, a dropped membership) heals within one
+                    // keepalive interval instead of waiting for a reconnect.
+                    // On a long MPC ceremony, rotted membership is how rounds
+                    // go missing.
+                    //
+                    // Scope the claim honestly: this heals CLIENT-TRACKED
+                    // memberships only. The MPC relay lane auto-joins the
+                    // recipient's per-ceremony room SERVER-side
+                    // (`join_recipient_presence_sockets`); the client never
+                    // joined it, so it is not in this snapshot and the
+                    // keepalive cannot heal what the client never joined.
+                    if let Some(rooms) = ev.data.get("rooms").and_then(serde_json::Value::as_array)
+                    {
+                        // Dedupe: a probe is client-controlled input, and each
+                        // entry costs a lock acquisition in the core. The
+                        // checks themselves are in-memory string comparisons,
+                        // so there is no per-probe cap — a flat cap would
+                        // permanently starve tail rooms, because the client's
+                        // snapshot iterates in stable order and truncation
+                        // would drop the SAME rooms on every probe.
+                        let mut seen = std::collections::HashSet::new();
+                        for room_id in rooms.iter().filter_map(serde_json::Value::as_str) {
+                            if room_id.is_empty() || !seen.insert(room_id) {
+                                continue;
+                            }
+                            // This fork's HARDENED own-room rule, deliberately
+                            // NOT upstream's bare `starts_with(&identity)`
+                            // (which would admit any room id that merely begins
+                            // with the key): `{key}` or `{key}-…` only, the
+                            // same delimiter-anchored check the joinRoom arm
+                            // applies. The keepalive must never authorize a
+                            // room `joinRoom` itself would refuse. The
+                            // empty-identity guard stays — `starts_with("")`
+                            // would admit every room.
+                            if identity.is_empty()
+                                || !(room_id == identity
+                                    || room_id.starts_with(&format!("{identity}-")))
+                            {
+                                warn!(sid = %sid, room = %room_id,
+                                    "authsocket: keepalive room re-assert rejected — identity mismatch");
+                                continue;
+                            }
+                            // Pair the core membership with the Model B route,
+                            // exactly like the joinRoom arm: `core.join_room`
+                            // alone heals local fan-out but leaves the
+                            // backplane route dead, so remote-origin
+                            // deliveries would stay rotted — the silent half of
+                            // the skew. Both calls are idempotent.
+                            core.join_room(sid, room_id);
+                            ws.route_join(sid, room_id);
+                        }
+                    }
                     emit_signed_to_socket(
                         socket,
                         core,
@@ -1302,6 +1376,19 @@ fn join_recipient_presence_sockets(
     for member_sid in core.room_members(&presence) {
         if core.identity_key(&member_sid).as_deref() == Some(recipient) {
             debug!(sid = %member_sid, room = %room, "mpc relay: auto-joined a presence socket into the ceremony box room");
+            // `core.join_room` WITHOUT the `ws.route_join` that every other join
+            // site pairs with, and deliberately so: `route_join` exists to make
+            // this instance subscribe to the room's Redis channel, and this lane
+            // never publishes to the backplane — it emits through
+            // `emit_signed_to_room` directly (see `handle_ws_mpc_envelope`).
+            // Subscribing would buy a channel nothing ever writes to.
+            //
+            // This is NOT the missing-route_join bug the keepalive re-assert had.
+            // There the durable lane's `broadcast_to_room` DOES publish, so an
+            // unrouted membership silently loses cross-instance delivery. Here
+            // the absence is the Model-A scoping stated on the handler, not an
+            // oversight — if this lane ever gains multi-instance fan-out, the
+            // route_join comes back with it, as part of that design.
             core.join_room(member_sid, room);
         }
     }
