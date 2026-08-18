@@ -76,6 +76,91 @@ impl MpcRelayConfig {
     }
 }
 
+/// Default ceiling on one relayed wallet-lane `frame`, overridable with
+/// `MPC_WALLET_FRAME_MAX_BYTES`.
+///
+/// This REUSES [`DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES`] rather than deriving a
+/// wallet-specific figure, and the reason is worth stating: the wallet lane has
+/// no structural maximum of its own to derive one FROM. A `frame` carries an
+/// arbitrary BRC-100 call — a `createAction` with a large transaction, a
+/// `listOutputs` page — so its size is set by application traffic, not by a
+/// protocol's fixed round shape the way a CGGMP24 round is. The two bounds that
+/// do exist are both ceilings, not derivations: the receiving box refuses any
+/// nested frame over 16 MiB before it parses it (`MAX_WALLET_FRAME_BYTES`,
+/// `rust-mpc/bins/enterprise-wallet/src/wallet_lane.rs:114`, checked at :773),
+/// and rust-mpc pins its hub payload limit under the WebSocket layer's own
+/// 16 MiB frame limit (`crates/transport/src/hub_limits.rs:622-626`). 8 MiB sits
+/// below both, so nothing this relay forwards is something the box would then
+/// refuse for size, and it is a number this codebase already carries rather than
+/// one invented here.
+///
+/// It is a SEPARATE knob from the ceremony lane's all the same: the two lanes
+/// carry unrelated traffic, and an operator raising the ceiling for a heavy
+/// BRC-100 workload must not thereby raise what a ceremony peer may push.
+pub const DEFAULT_WALLET_FRAME_MAX_BYTES: usize = DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES;
+
+/// Configuration of the wallet-RPC relay lane — the `walletCall` /
+/// `walletReply` verbs.
+///
+/// Deliberately a SEPARATE struct from [`MpcRelayConfig`], because the two
+/// allowlists are separate populations. rust-mpc admits a wallet frame from the
+/// union of its ceremony roster and this app allowlist, and admits an
+/// `mpcEnvelope` from the roster ALONE — so an app named here can never route
+/// ceremony traffic, which the wire contract calls being "scoped to the wallet
+/// verbs by construction" (`crates/transport/src/wallet_lane_wire.rs:82-85`).
+/// Keeping the app list out of `MpcRelayConfig` makes that separation
+/// structural here too: [`crate::ws::admit_mpc_envelope`] has no field to
+/// consult even if a future edit wanted one.
+#[derive(Clone, Debug)]
+pub struct WalletRelayConfig {
+    /// `MPC_WALLET_APP_IDENTITIES` — comma-separated identity keys admitted for
+    /// the wallet verbs ONLY, canonicalized by [`canon_identity`]. Mirrors
+    /// rust-mpc's `WALLET_APP_IDENTITIES_ENV`
+    /// (`bins/coordinator/src/mpc_hub.rs:113`) so one operator runbook covers
+    /// both hubs.
+    ///
+    /// FAIL-CLOSED: an empty set admits no app. It is not the whole admission
+    /// rule, though — a box or cosigner sends its `walletReply` under its own
+    /// roster identity, so [`MpcRelayConfig::peer_identities`] is admitted here
+    /// too (the union rule). With BOTH empty the wallet lane carries nothing.
+    ///
+    /// TRANSITIONAL, exactly as it is upstream: the production front door is the
+    /// BRC-73 grant-proposal pairing flow, where admission derives from a
+    /// permission token minted at introduction rather than from a static env
+    /// list (`app-authorization-known-counterparty.md` §5).
+    pub app_identities: HashSet<String>,
+    /// `MPC_WALLET_FRAME_MAX_BYTES` — see [`DEFAULT_WALLET_FRAME_MAX_BYTES`].
+    pub max_frame_bytes: usize,
+}
+
+impl Default for WalletRelayConfig {
+    /// No app admitted, at the reused payload ceiling — the shape a deployment
+    /// that never sets `MPC_WALLET_APP_IDENTITIES` runs with. Roster peers can
+    /// still exchange wallet frames under this default; only non-roster apps are
+    /// shut out.
+    fn default() -> Self {
+        Self {
+            app_identities: HashSet::new(),
+            max_frame_bytes: DEFAULT_WALLET_FRAME_MAX_BYTES,
+        }
+    }
+}
+
+impl WalletRelayConfig {
+    /// `false` when NEITHER population can send a wallet frame: no app is
+    /// allowlisted AND no ceremony peer is configured, so the union admission
+    /// rule admits nobody and every `walletCall`/`walletReply` is refused.
+    ///
+    /// Takes the ceremony config because the wallet lane's admission is that
+    /// union, not this struct alone — asking `WalletRelayConfig` on its own
+    /// whether the lane is live would give the wrong answer for the common
+    /// enterprise shape, where a box and a cosigner exchange wallet frames under
+    /// their roster identities and no separate app is named at all.
+    pub fn is_enabled(&self, mpc: &MpcRelayConfig) -> bool {
+        !self.app_identities.is_empty() || !mpc.peer_identities.is_empty()
+    }
+}
+
 /// Canonical form of an identity key for allowlist comparison: trimmed and
 /// lowercased. Mirrors the fallback arm of the coordinator's `canon_identity`
 /// (`rust-mpc/bins/coordinator/src/handlers.rs:3557`) — its primary arm parses
@@ -112,6 +197,10 @@ pub struct Config {
     /// traffic and how large one envelope may be. Off unless
     /// `MPC_PEER_IDENTITIES` names at least one peer.
     pub mpc_relay: MpcRelayConfig,
+    /// The wallet-RPC relay lane (`walletCall`/`walletReply`): which non-roster
+    /// apps may reach a box's BRC-100 surface, and how large one frame may be.
+    /// Admission is the union of this list and [`Self::mpc_relay`]'s peers.
+    pub wallet_relay: WalletRelayConfig,
     /// `MESSAGEBOX_PARITY_FEES=true` — restore the reference (TS/Go/CF) fee
     /// economics: seed the `notifications` box at delivery fee 10 and use a
     /// recipient smart-default of 10 for it. Default `false` = free delivery
@@ -218,7 +307,7 @@ impl Config {
         // variable, and the payload ceiling only takes a positive override —
         // a `0` or unparseable value would otherwise refuse every round.
         let mpc_relay = MpcRelayConfig {
-            peer_identities: parse_mpc_peer_identities(
+            peer_identities: parse_identity_allowlist(
                 &env::var("MPC_PEER_IDENTITIES").unwrap_or_default(),
             ),
             max_body_bytes: env::var("MPC_ENVELOPE_MAX_BODY_BYTES")
@@ -226,6 +315,20 @@ impl Config {
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|v| *v > 0)
                 .unwrap_or(DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES),
+        };
+
+        // Wallet-RPC lane. Same fail-closed parse on its OWN allowlist: an app
+        // named here reaches the wallet verbs and nothing else, and the ceremony
+        // lane never reads this list.
+        let wallet_relay = WalletRelayConfig {
+            app_identities: parse_identity_allowlist(
+                &env::var("MPC_WALLET_APP_IDENTITIES").unwrap_or_default(),
+            ),
+            max_frame_bytes: env::var("MPC_WALLET_FRAME_MAX_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_WALLET_FRAME_MAX_BYTES),
         };
 
         // Parse MESSAGEBOX_FEES=chat=10,priority=100
@@ -269,6 +372,7 @@ impl Config {
             max_connections,
             drain_timeout_secs,
             mpc_relay,
+            wallet_relay,
             parity_fees,
             message_box_fees,
             message_box_fees_warnings,
@@ -342,20 +446,25 @@ fn parse_message_box_fees(raw: &str) -> (Vec<(String, i64)>, Vec<String>) {
     (out, warnings)
 }
 
-/// Parse `MPC_PEER_IDENTITIES` into the ceremony-lane allowlist.
+/// Parse one relay allowlist variable — `MPC_PEER_IDENTITIES` for the ceremony
+/// lane, `MPC_WALLET_APP_IDENTITIES` for the wallet lane.
 ///
 /// Accepted format: `02aa…,03bb…` — comma-separated identity keys, whitespace
 /// around each trimmed, empty tokens (a trailing comma) skipped. Every entry is
 /// canonicalized with [`canon_identity`] so an operator pasting mixed-case hex
 /// still matches the verified socket identity.
 ///
-/// A blank or absent value yields an EMPTY set, and an empty set refuses every
-/// `mpcEnvelope` — the lane is opt-in, never open by default. Unlike
+/// The two lanes share this PARSER while keeping separate SETS: the format is
+/// identical, and the isolation that matters is which set each admission check
+/// reads, not how the strings were split.
+///
+/// A blank or absent value yields an EMPTY set, and an empty set admits nobody —
+/// both lanes are opt-in, never open by default. Unlike
 /// [`parse_message_box_fees`] there is nothing to warn about per entry: any
 /// string an operator writes here is either a key that will match a verified
 /// socket or one that never will, and refusing to route for an identity that
 /// never connects is the intended outcome either way.
-fn parse_mpc_peer_identities(raw: &str) -> HashSet<String> {
+fn parse_identity_allowlist(raw: &str) -> HashSet<String> {
     raw.split(',')
         .map(canon_identity)
         .filter(|id| !id.is_empty())
@@ -401,6 +510,7 @@ impl fmt::Debug for Config {
             .field("max_connections", &self.max_connections)
             .field("drain_timeout_secs", &self.drain_timeout_secs)
             .field("mpc_relay", &self.mpc_relay)
+            .field("wallet_relay", &self.wallet_relay)
             .field("parity_fees", &self.parity_fees)
             .field("message_box_fees", &self.message_box_fees)
             // message_box_fees_warnings are transient — omitted from Debug output.
@@ -446,6 +556,7 @@ mod tests {
             max_connections: 0,
             drain_timeout_secs: 30,
             mpc_relay: MpcRelayConfig::default(),
+            wallet_relay: WalletRelayConfig::default(),
             parity_fees: false,
             message_box_fees: Vec::new(),
             message_box_fees_warnings: Vec::new(),
@@ -470,7 +581,7 @@ mod tests {
     fn unset_peer_identities_leaves_the_mpc_lane_disabled() {
         for raw in ["", "   ", ",", " , ,"] {
             let relay = MpcRelayConfig {
-                peer_identities: parse_mpc_peer_identities(raw),
+                peer_identities: parse_identity_allowlist(raw),
                 ..Default::default()
             };
             assert!(!relay.is_enabled(), "{raw:?} must not enable the lane");
@@ -484,7 +595,7 @@ mod tests {
     fn peer_identities_are_canonicalized() {
         let a = "02AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899";
         let b = "03bbccddeeff00112233445566778899aabbccddeeff001122334455667788990a";
-        let parsed = parse_mpc_peer_identities(&format!(" {a} , {b},{}, ", a.to_lowercase()));
+        let parsed = parse_identity_allowlist(&format!(" {a} , {b},{}, ", a.to_lowercase()));
         assert_eq!(parsed.len(), 2);
         assert!(parsed.contains(&a.to_lowercase()));
         assert!(parsed.contains(b));
@@ -503,5 +614,35 @@ mod tests {
             DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES > largest_ceremony_body * 20,
             "the default must keep generous headroom over the structural maximum"
         );
+    }
+
+    /// With neither allowlist configured the wallet lane is OFF: no app is
+    /// named and no roster peer exists, so the union admits nobody. A server
+    /// that relayed BRC-100 calls for anyone would be an open front door onto
+    /// every box dialed into it.
+    #[test]
+    fn unset_allowlists_leave_the_wallet_lane_disabled() {
+        let wallet = WalletRelayConfig::default();
+        assert!(!wallet.is_enabled(&MpcRelayConfig::default()));
+    }
+
+    /// Either population alone turns the lane on, because admission is their
+    /// union: an app-only deployment serves a box that is named as a ceremony
+    /// peer, and a roster-only deployment carries the box's own `walletReply`s
+    /// with no third-party app in the picture.
+    #[test]
+    fn either_population_enables_the_wallet_lane() {
+        let app = "02aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+        let apps_only = WalletRelayConfig {
+            app_identities: parse_identity_allowlist(app),
+            ..Default::default()
+        };
+        assert!(apps_only.is_enabled(&MpcRelayConfig::default()));
+
+        let roster_only = MpcRelayConfig {
+            peer_identities: parse_identity_allowlist(app),
+            ..Default::default()
+        };
+        assert!(WalletRelayConfig::default().is_enabled(&roster_only));
     }
 }

@@ -30,7 +30,7 @@ use bsv::primitives::private_key::PrivateKey;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use bsv::wallet::proto_wallet::ProtoWallet;
 
-use messagebox_server::config::MpcRelayConfig;
+use messagebox_server::config::{MpcRelayConfig, WalletRelayConfig};
 use messagebox_server::ws::{self, WsBroadcast, MPC_ENVELOPE_EVENT, MPC_INBOX};
 
 const SERVER_KEY: &str = "0000000000000000000000000000000000000000000000000000000000000041";
@@ -81,6 +81,10 @@ async fn boot_with_peers(peers: &[String]) -> String {
             peer_identities: peers.iter().cloned().collect(),
             ..Default::default()
         },
+        // The wallet lane's own allowlist stays empty here: these tests are the
+        // ceremony lane's, and the two lanes' admissions are separate by design.
+        // The wallet lane is exercised in `tests/wallet_frame_e2e.rs`.
+        WalletRelayConfig::default(),
     );
     ws::setup_handlers(&io, ws);
 

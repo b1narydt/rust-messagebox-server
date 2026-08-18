@@ -233,6 +233,30 @@ async fn main() {
         );
     }
 
+    // Wallet-RPC relay lane (`walletCall`/`walletReply`). Fail-closed on the
+    // UNION of the two allowlists, so it reports both counts: an app reaches a
+    // box's BRC-100 surface under MPC_WALLET_APP_IDENTITIES, and the box replies
+    // under its own ceremony-peer identity. With neither set the lane carries
+    // nothing, and a box running strictly dial-out (no HTTP listener of its own)
+    // is unreachable — a failure that otherwise surfaces only as every wallet
+    // call timing out.
+    if config.wallet_relay.is_enabled(&config.mpc_relay) {
+        tracing::info!(
+            apps = config.wallet_relay.app_identities.len(),
+            peers = config.mpc_relay.peer_identities.len(),
+            max_frame_bytes = config.wallet_relay.max_frame_bytes,
+            "wallet relay lane: enabled for the allowlisted apps and ceremony peers"
+        );
+    } else {
+        tracing::warn!(
+            "wallet relay lane: DISABLED — neither MPC_WALLET_APP_IDENTITIES nor \
+             MPC_PEER_IDENTITIES names an identity, so every walletCall and walletReply will be \
+             refused. Set MPC_WALLET_APP_IDENTITIES to the comma-separated app identity keys \
+             allowed to reach a box's BRC-100 surface; those apps get the wallet verbs ONLY and \
+             can never route ceremony traffic. Every other MessageBox verb is unaffected."
+        );
+    }
+
     // Set up Socket.IO for WebSocket live message push
     let (sio_layer, io) = socketioxide::SocketIo::new_layer();
     let ws_broadcast = ws::WsBroadcast::new(
@@ -242,6 +266,7 @@ async fn main() {
         backplane.clone(),
         ops.clone(),
         config.mpc_relay.clone(),
+        config.wallet_relay.clone(),
     );
     ws::setup_handlers(&io, ws_broadcast.clone());
     tracing::info!("Socket.IO WebSocket server ready");

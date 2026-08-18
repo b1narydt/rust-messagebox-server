@@ -18,6 +18,11 @@
 //! - the `mpcEnvelope` app verb ([`handle_ws_mpc_envelope`]): the transient MPC
 //!   ceremony relay — an allowlisted, opaque, never-persisted forward into the
 //!   recipient's `{recipient}-{box}` room;
+//! - the `walletCall` / `walletReply` app verbs ([`handle_ws_wallet_frame`]):
+//!   the wallet-RPC relay — an allowlisted, opaque, never-persisted forward into
+//!   the recipient's `{recipient}-wallet_inbox` room, preserving the verb. This
+//!   is what makes a strictly dial-out enterprise box, whose own HTTP listener
+//!   is disabled, reachable at all;
 //! - [`WsBroadcast`] — the app-facing handle the HTTP handlers use
 //!   (`broadcast_to_room` + `persist_async`).
 //!
@@ -133,6 +138,62 @@ pub struct MpcEnvelope {
     pub message_id: String,
 }
 
+/// App → box: one nested BRC-103 frame of the wallet session. Source of truth:
+/// `mpc_transport::wallet_lane_wire::WALLET_CALL_EVENT` in rust-mpc.
+pub const WALLET_CALL_EVENT: &str = "walletCall";
+
+/// Box → app: one nested BRC-103 frame back. Source of truth:
+/// `mpc_transport::wallet_lane_wire::WALLET_REPLY_EVENT` in rust-mpc.
+///
+/// A distinct verb from [`WALLET_CALL_EVENT`], and the relay PRESERVES whichever
+/// one arrived: the app and the box each dispatch on the verb, so a reply
+/// re-emitted as a call is a hang rather than a visible error.
+pub const WALLET_REPLY_EVENT: &str = "walletReply";
+
+/// The presence box every dialed-in wallet-lane party joins as
+/// `{identityKey}-wallet_inbox`, and the room a frame addressed to `recipient`
+/// is delivered into. Source of truth:
+/// `mpc_transport::wallet_lane_wire::WALLET_INBOX` in rust-mpc; carried here as
+/// a literal for the same reason [`MPC_INBOX`] is.
+///
+/// DISTINCT from [`MPC_INBOX`], so the two lanes never share a room even for the
+/// same identity — the lane-isolation requirement a busy dashboard would
+/// otherwise violate by starving a presig deadline.
+pub const WALLET_INBOX: &str = "wallet_inbox";
+
+/// Wire shape of one wallet-lane frame, both directions, byte-identical to
+/// `mpc_transport::wallet_lane_wire::WalletFrame` in rust-mpc. As with
+/// [`MpcEnvelope`], this struct is the ONE producer of the relayed frame's JSON.
+///
+/// The correlation id is **`correlationId`** on the wire, and the opaque payload
+/// is **`frame`**. Both are load-bearing in the same way `box` is on the
+/// ceremony lane: the receiving side parses this exact shape, so a renamed key
+/// turns every call into a silent timeout rather than a visible error. `sender`
+/// is `default`ed because a sending client may omit its own redundant claim; the
+/// relay re-stamps it from the BRC-103-verified socket identity (see
+/// [`admit_wallet_frame`]).
+///
+/// `frame` is a STRING, not a nested `Value`, upstream and here: it is a whole
+/// nested BRC-103 `AuthMessage` wrapping BRC-2 ciphertext, and the receiving box
+/// bounds the raw text before it materializes attacker-relayed JSON. The relay
+/// never decodes it — it is not a party to that session, holds neither party's
+/// key, and forwards the string verbatim.
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+pub struct WalletFrame {
+    /// Identity key of the party this frame is FOR — the box for a
+    /// `walletCall`, the app for a `walletReply`. The relay routes on this.
+    pub recipient: String,
+    /// Claimed origin, re-stamped by the relay from its verified identity.
+    #[serde(default)]
+    pub sender: String,
+    /// Logical request↔response correlation id, chosen by the app and echoed by
+    /// the box. Opaque to the relay.
+    #[serde(rename = "correlationId", default)]
+    pub correlation_id: String,
+    /// The opaque nested app↔box BRC-103 `AuthMessage`, serialized as JSON.
+    pub frame: String,
+}
+
 /// Shared state for WebSocket broadcast.
 ///
 /// Held by the HTTP handlers (via `AppState`) so they can push live messages
@@ -155,6 +216,12 @@ pub struct WsBroadcast {
     /// [`handle_ws_mpc_envelope`] and by nothing else — the mailbox verbs keep
     /// their own gating.
     mpc_relay: crate::config::MpcRelayConfig,
+    /// The wallet-RPC relay lane's app allowlist + payload ceiling. Consulted by
+    /// [`handle_ws_wallet_frame`] and by nothing else. Its admission ALSO reads
+    /// [`Self::mpc_relay`]'s peer list (the union rule), but never the reverse —
+    /// the ceremony lane cannot see this field, so an admitted app is scoped to
+    /// the wallet verbs by construction.
+    wallet_relay: crate::config::WalletRelayConfig,
     /// Background, durable message persistence. Both send paths push live first
     /// and then hand the INSERT to this worker so MySQL latency never blocks
     /// live delivery. See [`crate::persist`].
@@ -184,6 +251,7 @@ impl WsBroadcast {
         backplane: Option<Arc<crate::backplane::Backplane>>,
         ops: Arc<crate::ops::OpsState>,
         mpc_relay: crate::config::MpcRelayConfig,
+        wallet_relay: crate::config::WalletRelayConfig,
     ) -> Self {
         // `from_env`, not `default()`: DEAD_LETTER_PATH must reach the worker
         // (the deployed container's cwd `/` is not writable by uid 10001).
@@ -206,6 +274,7 @@ impl WsBroadcast {
             server_private_key_hex,
             server_identity,
             mpc_relay,
+            wallet_relay,
             persist,
             db,
             backplane,
@@ -646,7 +715,7 @@ fn emit_frame(socket: &SocketRef, sid: &str, msg: &AuthMessage) {
 }
 
 /// Route one verified event: generic room verbs (with TS-parity failure
-/// events) here, the MessageBox app verb and the MPC relay lane below.
+/// events) here, the MessageBox app verb and the two relay lanes below.
 async fn handle_verified_event(
     core: &AuthSocketServer<SdkProtoWallet>,
     socket: &SocketRef,
@@ -824,6 +893,18 @@ async fn handle_verified_event(
         }
         MPC_ENVELOPE_EVENT => {
             handle_ws_mpc_envelope(core, ws, sid, ev.data).await;
+        }
+        // The wallet-RPC lane, spelled as two arms rather than one so the verb
+        // each one forwards is the verb it matched. rust-mpc's hub takes the
+        // same care (`route_wallet_frame(&event.event_name, …)`): a `walletReply`
+        // re-emitted as a `walletCall` would reach the app's socket and be
+        // dispatched as an inbound request it has no handler for, so the reply
+        // is lost to a timeout with nothing in any log naming the cause.
+        WALLET_CALL_EVENT => {
+            handle_ws_wallet_frame(core, ws, sid, WALLET_CALL_EVENT, ev.data).await;
+        }
+        WALLET_REPLY_EVENT => {
+            handle_ws_wallet_frame(core, ws, sid, WALLET_REPLY_EVENT, ev.data).await;
         }
         other => {
             debug!(sid = %sid, event = %other, "BRC-103 general message: unhandled event");
@@ -1345,6 +1426,212 @@ async fn handle_ws_mpc_envelope(
     }
 }
 
+/// Admit one inbound wallet-lane frame and produce the frame to relay, or refuse
+/// it with an operator-facing reason. The wallet-plane sibling of
+/// [`admit_mpc_envelope`], and pure for the same reason: every fail-closed rule
+/// is unit-testable without a live BRC-103 handshake.
+///
+/// The rules are the ceremony lane's, with ONE deliberate difference — the
+/// population admitted:
+///
+/// 1. **Size, before anything else.** `frame` is the whole payload's weight, so
+///    bounding it bounds the frame. The ceiling is the wallet lane's own
+///    ([`crate::config::WalletRelayConfig::max_frame_bytes`]).
+/// 2. **A verified identity is required.** No identity means no provenance to
+///    stamp.
+/// 3. **The verified identity is admitted by the UNION** of the wallet-app
+///    allowlist and the ceremony peer list. Both populations belong here and for
+///    different reasons: an app dials in to call a box's BRC-100 surface, and a
+///    box or cosigner sends its `walletReply` back under its own ROSTER
+///    identity, never an app one. rust-mpc admits exactly this union —
+///    `admit_wallet_sender(verified, claimed, roster, apps)` at
+///    `crates/transport/src/wallet_lane_wire.rs:96`, called with the hub's
+///    roster allowlist and its app allowlist at `bins/coordinator/src/mpc_hub.rs:1963-1968`.
+///
+///    The union runs ONE WAY, which is the load-bearing part. [`admit_mpc_envelope`]
+///    reads the peer list ALONE and cannot see the app list at all, so an app
+///    admitted here can never route ceremony traffic — it is "scoped to the
+///    wallet verbs by construction" (`wallet_lane_wire.rs:82-85`). Fail-closed:
+///    with both populations empty nobody is admitted.
+/// 4. **Honest sender claim.** An omitted `sender` is filled from the verified
+///    identity; a supplied one must equal it, or the frame is refused rather
+///    than corrected.
+/// 5. **The relay is never a recipient.** MBS terminates no wallet session and
+///    holds no key for the nested one, so a frame addressed to its own server
+///    identity is a misconfigured client rather than traffic to route.
+///
+/// The returned room is `{recipient}-wallet_inbox` via [`room_id`], and the
+/// returned frame carries the re-stamped sender.
+fn admit_wallet_frame(
+    ev: WalletFrame,
+    verified_sender: Option<&str>,
+    server_identity: Option<&str>,
+    mpc_relay: &crate::config::MpcRelayConfig,
+    wallet_relay: &crate::config::WalletRelayConfig,
+) -> Result<(String, WalletFrame), &'static str> {
+    if ev.frame.len() > wallet_relay.max_frame_bytes {
+        return Err("frame exceeds the wallet-lane size limit");
+    }
+    let Some(verified) = verified_sender else {
+        return Err("no verified sender identity on this socket");
+    };
+    let canon = crate::config::canon_identity(verified);
+    if !wallet_relay.app_identities.contains(&canon) && !mpc_relay.peer_identities.contains(&canon)
+    {
+        return Err(
+            "verified sender is neither an allowlisted wallet app (MPC_WALLET_APP_IDENTITIES) \
+             nor a ceremony peer (MPC_PEER_IDENTITIES)",
+        );
+    }
+    if !ev.sender.is_empty() && ev.sender != verified {
+        return Err("body sender does not match the verified socket identity");
+    }
+    if server_identity == Some(ev.recipient.as_str()) {
+        return Err("recipient is the relay's own identity");
+    }
+
+    let room = room_id(&ev.recipient, WALLET_INBOX);
+    Ok((
+        room,
+        WalletFrame {
+            // Re-stamped from the proven identity: the recipient opens the
+            // nested session against a sender this relay verified, not one the
+            // frame asserted.
+            sender: verified.to_string(),
+            ..ev
+        },
+    ))
+}
+
+/// Relay one verified wallet-lane frame: the wallet-RPC lane, which lets an app
+/// reach an enterprise box's BRC-100 surface through MBS. The `verb` is
+/// `walletCall` or `walletReply` and is FORWARDED AS RECEIVED.
+///
+/// This is what makes a strictly dial-out box reachable. The box runs with its
+/// HTTP listener disabled and serves its whole gated BRC-100 surface over this
+/// lane; without the relay carrying these two verbs, nothing can reach it.
+///
+/// ## Routing: `{recipient}-wallet_inbox`, and NO auto-join
+///
+/// Unlike the ceremony lane, this lane has exactly ONE room per identity: a
+/// party joins `{identity}-wallet_inbox` for itself on connect (rust-mpc's box
+/// does so at `bins/enterprise-wallet/src/wallet_lane.rs:506`), and that is the
+/// room every frame addressed to it lands in. There is no per-session room to
+/// race against, so there is nothing for an auto-join to close — rust-mpc's
+/// `route_wallet_frame` (`bins/coordinator/src/mpc_hub.rs:1982-1990`) computes
+/// that room and emits into it with no harvest step, and this follows it.
+/// [`join_recipient_presence_sockets`] exists for the ceremony lane's
+/// per-ceremony box rooms and is deliberately not called here.
+///
+/// The Model B limitation stated on [`handle_ws_mpc_envelope`] does NOT apply in
+/// the same form: the wallet presence room is one the client joined itself, so
+/// [`WsBroadcast::route_join`] has already subscribed this instance to its
+/// channel. What this lane still shares with the ceremony lane is that it emits
+/// through [`emit_signed_to_room`] rather than
+/// [`WsBroadcast::broadcast_to_room`], so it never PUBLISHES to the backplane —
+/// a frame is delivered by the instance that received it, to the sockets that
+/// instance owns. Run both relay lanes on a single instance until the
+/// multi-instance transient contract exists.
+///
+/// ## Opaque, transient, unpersisted
+///
+/// `frame` is a nested BRC-103 `AuthMessage` wrapping BRC-2 ciphertext between
+/// the app and the box. The relay is not a party to that session and holds
+/// neither identity's key: it cannot open the frame, cannot forge one, and never
+/// tries. Its total compromise is an availability event, never a custody one.
+///
+/// Nothing here persists, for the same reason nothing on the ceremony lane does:
+/// a wallet call is a live request↔response, not a durable room event. No
+/// mailbox row, no dedup store, nothing for `/listMessages` to hand back — a
+/// call whose reply missed its window is retried by the caller. [`WalletFrame`]
+/// is the ONE producer of this frame's JSON, so the `correlationId`/`frame` keys
+/// can never drift into [`RoomMessage`]'s `messageBox` shape.
+#[tracing::instrument(name = "ws_wallet_frame", skip_all, fields(sid = %sid, verb = %verb))]
+async fn handle_ws_wallet_frame(
+    core: &AuthSocketServer<SdkProtoWallet>,
+    ws: &WsBroadcast,
+    sid: &str,
+    verb: &str,
+    data: serde_json::Value,
+) {
+    // In-flight marker for graceful drain, as on the other two send paths: a
+    // relay hop in progress belongs to a connected session, and drain waits
+    // (bounded) for it rather than cutting a wallet call mid-flight.
+    let _send_guard = ws.ops.begin_send();
+
+    let ev: WalletFrame = match serde_json::from_value(data) {
+        Ok(ev) => ev,
+        Err(e) => {
+            warn!(sid = %sid, verb = %verb, error = %e, "wallet relay: dropping malformed wallet frame");
+            return;
+        }
+    };
+
+    // Kept for the refusal log, which must be able to name the frame it dropped
+    // after `ev` has been consumed by the admission check.
+    let recipient = ev.recipient.clone();
+    let correlation_id = ev.correlation_id.clone();
+    let frame_bytes = ev.frame.len();
+
+    // The verified identity is read back from the core rather than taken from
+    // the dispatched event, for the same reason the `joinRoom` arm reads it
+    // back: the check can then never drift from what `emit_to_room` will trust.
+    let admitted = admit_wallet_frame(
+        ev,
+        core.identity_key(sid).as_deref(),
+        ws.server_identity.as_deref(),
+        &ws.mpc_relay,
+        &ws.wallet_relay,
+    );
+    let (room, frame) = match admitted {
+        Ok(admitted) => admitted,
+        Err(reason) => {
+            warn!(
+                sid = %sid,
+                verb = %verb,
+                recipient = %recipient,
+                correlation_id = %correlation_id,
+                frame_bytes,
+                limit = ws.wallet_relay.max_frame_bytes,
+                reason,
+                "wallet relay: refusing wallet frame (fail-closed)"
+            );
+            return;
+        }
+    };
+
+    let data = match serde_json::to_value(&frame) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(sid = %sid, verb = %verb, error = %e, "wallet relay: failed to serialize wallet frame");
+            return;
+        }
+    };
+    // `verb`, not a constant: the arriving verb is the one that leaves.
+    let delivered = emit_signed_to_room(&ws.io, core, &room, verb, &data).await;
+    if delivered == 0 {
+        warn!(
+            sid = %sid,
+            verb = %verb,
+            recipient = %frame.recipient,
+            correlation_id = %frame.correlation_id,
+            room = %room,
+            delivered,
+            "wallet relay: frame reached no live socket — the recipient is not dialed in on the \
+             wallet lane here; the frame is dropped and the caller's request times out"
+        );
+    } else {
+        debug!(
+            sid = %sid,
+            verb = %verb,
+            recipient = %frame.recipient,
+            correlation_id = %frame.correlation_id,
+            delivered,
+            "wallet relay: frame forwarded opaquely (not persisted)"
+        );
+    }
+}
+
 /// Subscribe the recipient's presence sockets into an empty per-ceremony box
 /// room, so the first round of a ceremony is not lost to the gap between the
 /// client dialing in and the box room existing.
@@ -1421,6 +1708,7 @@ mod tests {
             None,
             crate::ops::OpsState::new(0),
             crate::config::MpcRelayConfig::default(),
+            crate::config::WalletRelayConfig::default(),
         )
     }
 
@@ -1731,5 +2019,275 @@ mod tests {
             ws.core.room_members(&room),
             vec!["already-here".to_string()]
         );
+    }
+
+    // -- Wallet-RPC relay lane ----------------------------------------------
+
+    /// A non-roster app identity: allowlisted for the wallet verbs and for
+    /// nothing else. `PEER_A`/`PEER_B` keep their ceremony-peer roles, so the
+    /// union rule and the isolation rule can be tested against the same pair.
+    const APP: &str = "02ccddeeff00112233445566778899aabbccddeeff00112233445566778899aabb";
+
+    /// The wallet lane switched on for `apps`, at the reused frame ceiling.
+    fn wallet_for(apps: &[&str]) -> crate::config::WalletRelayConfig {
+        crate::config::WalletRelayConfig {
+            app_identities: apps
+                .iter()
+                .map(|a| crate::config::canon_identity(a))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// One well-formed frame addressed to `PEER_B`, sender claim omitted (the
+    /// shape a client that lets the relay stamp provenance sends).
+    fn test_wallet_frame() -> WalletFrame {
+        WalletFrame {
+            recipient: PEER_B.into(),
+            sender: String::new(),
+            correlation_id: "corr-1".into(),
+            frame: "{\"nested\":\"BRC-103 AuthMessage\"}".into(),
+        }
+    }
+
+    /// The relayed frame carries `correlationId` (camelCase) and `frame`, and
+    /// every field survives a round trip through the wire shape the app and the
+    /// box parse. A regression here is a total, silent wallet-lane outage: every
+    /// call would fail its `from_value::<WalletFrame>` and simply time out.
+    #[test]
+    fn relayed_wallet_frame_uses_the_camel_case_correlation_key() {
+        let (_room, frame) = admit_wallet_frame(
+            test_wallet_frame(),
+            Some(APP),
+            Some("02serveridentity"),
+            &relay_for(&[PEER_A]),
+            &wallet_for(&[APP]),
+        )
+        .expect("admitted");
+
+        let v = serde_json::to_value(&frame).expect("serialize");
+        assert!(
+            v.get("correlationId").is_some(),
+            "the correlation id key is `correlationId`"
+        );
+        assert!(
+            v.get("correlation_id").is_none(),
+            "snake_case would break both ends of the nested session"
+        );
+        assert!(
+            v.get("messageBox").is_none() && v.get("box").is_none(),
+            "neither the mailbox lane's nor the ceremony lane's keys belong here"
+        );
+        assert_eq!(v["correlationId"], "corr-1");
+        assert_eq!(v["recipient"], PEER_B);
+        assert_eq!(v["sender"], APP);
+        assert_eq!(v["frame"], "{\"nested\":\"BRC-103 AuthMessage\"}");
+
+        let back: WalletFrame = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(back.correlation_id, "corr-1");
+    }
+
+    /// Routing addresses the ONE presence room this lane has,
+    /// `{recipient}-wallet_inbox` — never the ceremony lane's `mpc_inbox`, which
+    /// is the room separation that keeps a busy dashboard from starving a presig
+    /// deadline.
+    #[test]
+    fn wallet_frame_routes_to_the_recipient_wallet_inbox() {
+        let (room, _frame) = admit_wallet_frame(
+            test_wallet_frame(),
+            Some(APP),
+            None,
+            &relay_for(&[]),
+            &wallet_for(&[APP]),
+        )
+        .expect("admitted");
+        assert_eq!(room, format!("{PEER_B}-{WALLET_INBOX}"));
+        assert_ne!(room, room_id(PEER_B, MPC_INBOX));
+    }
+
+    /// The union rule, leg 1: an app on the WALLET allowlist is admitted here
+    /// with no ceremony peer configured at all.
+    #[test]
+    fn an_allowlisted_app_is_admitted_on_the_wallet_lane() {
+        assert!(admit_wallet_frame(
+            test_wallet_frame(),
+            Some(APP),
+            None,
+            &relay_for(&[]),
+            &wallet_for(&[APP]),
+        )
+        .is_ok());
+    }
+
+    /// The union rule, leg 2: a CEREMONY peer is admitted on the wallet lane
+    /// with no app allowlisted at all. This is not a convenience — a box or
+    /// cosigner sends its `walletReply` under its roster identity and never
+    /// holds an app one, so without this leg every reply would be dropped and
+    /// the lane would carry calls in one direction only.
+    #[test]
+    fn a_ceremony_peer_is_admitted_on_the_wallet_lane() {
+        assert!(admit_wallet_frame(
+            test_wallet_frame(),
+            Some(PEER_A),
+            None,
+            &relay_for(&[PEER_A]),
+            &wallet_for(&[]),
+        )
+        .is_ok());
+    }
+
+    /// THE isolation property, and the reason the app list lives in its own
+    /// struct: an identity admitted for the wallet verbs routes NO ceremony
+    /// traffic. [`admit_mpc_envelope`] reads the peer list alone, so the union
+    /// runs one way only.
+    #[test]
+    fn a_wallet_app_can_never_route_ceremony_traffic() {
+        // Same server configuration, both lanes, one identity.
+        let mpc = relay_for(&[PEER_A]);
+        let wallet = wallet_for(&[APP]);
+
+        assert!(
+            admit_wallet_frame(test_wallet_frame(), Some(APP), None, &mpc, &wallet).is_ok(),
+            "the app is admitted on the lane it was allowlisted for"
+        );
+        let ceremony = MpcEnvelope {
+            recipient: PEER_B.into(),
+            r#box: "mpc_somesession".into(),
+            body: "BRC78ciphertext".into(),
+            sender: String::new(),
+            message_id: "mpc-1".into(),
+        };
+        assert!(
+            admit_mpc_envelope(ceremony, Some(APP), None, &mpc).is_err(),
+            "and refused on the ceremony lane by the same configuration"
+        );
+    }
+
+    /// A body `sender` that contradicts the verified socket identity is forged
+    /// provenance: refused outright rather than quietly corrected.
+    #[test]
+    fn forged_wallet_frame_sender_is_refused() {
+        let forged = WalletFrame {
+            sender: PEER_A.into(),
+            ..test_wallet_frame()
+        };
+        assert!(admit_wallet_frame(
+            forged,
+            Some(APP),
+            None,
+            &relay_for(&[PEER_A]),
+            &wallet_for(&[APP]),
+        )
+        .is_err());
+    }
+
+    /// An omitted body `sender` is filled in from the verified socket identity,
+    /// so the box opens the nested session against provenance the relay proved.
+    #[test]
+    fn empty_wallet_frame_sender_is_stamped_with_the_verified_identity() {
+        let (_room, frame) = admit_wallet_frame(
+            test_wallet_frame(),
+            Some(APP),
+            None,
+            &relay_for(&[]),
+            &wallet_for(&[APP]),
+        )
+        .expect("admitted");
+        assert_eq!(frame.sender, APP);
+    }
+
+    /// The size check runs before anything else, so an oversize frame costs the
+    /// relay no room lookup and no signing fan-out.
+    #[test]
+    fn oversize_wallet_frame_is_refused_before_forwarding() {
+        let wallet = crate::config::WalletRelayConfig {
+            max_frame_bytes: 16,
+            ..wallet_for(&[APP])
+        };
+        let oversize = WalletFrame {
+            frame: "x".repeat(17),
+            ..test_wallet_frame()
+        };
+        assert!(admit_wallet_frame(oversize, Some(APP), None, &relay_for(&[]), &wallet).is_err());
+
+        // Exactly at the ceiling still routes — the cap is a maximum, not a
+        // strict bound.
+        let at_limit = WalletFrame {
+            frame: "x".repeat(16),
+            ..test_wallet_frame()
+        };
+        assert!(admit_wallet_frame(at_limit, Some(APP), None, &relay_for(&[]), &wallet).is_ok());
+    }
+
+    /// The relay terminates no wallet session: a frame addressed to its own
+    /// server identity is refused. It holds neither party's key and could not
+    /// open the nested frame in any case.
+    #[test]
+    fn self_addressed_wallet_frame_is_refused() {
+        let to_relay = WalletFrame {
+            recipient: "02serveridentity".into(),
+            ..test_wallet_frame()
+        };
+        assert!(admit_wallet_frame(
+            to_relay,
+            Some(APP),
+            Some("02serveridentity"),
+            &relay_for(&[]),
+            &wallet_for(&[APP]),
+        )
+        .is_err());
+    }
+
+    /// Admission is rooted in the VERIFIED identity: a socket that authenticated
+    /// as someone on neither list routes nothing, however well-formed the frame.
+    #[test]
+    fn unallowlisted_wallet_sender_is_refused() {
+        assert!(admit_wallet_frame(
+            test_wallet_frame(),
+            Some(PEER_B),
+            None,
+            &relay_for(&[PEER_A]),
+            &wallet_for(&[APP]),
+        )
+        .is_err());
+    }
+
+    /// A socket with no completed handshake has no identity to stamp, so there
+    /// is no frame to relay.
+    #[test]
+    fn wallet_frame_without_a_verified_identity_is_refused() {
+        assert!(admit_wallet_frame(
+            test_wallet_frame(),
+            None,
+            None,
+            &relay_for(&[]),
+            &wallet_for(&[])
+        )
+        .is_err());
+    }
+
+    /// Both populations unset refuses every frame. A deployment that opts into
+    /// neither is not an open front door onto the boxes dialed into it.
+    #[test]
+    fn unconfigured_wallet_lane_refuses_everything() {
+        let mpc = crate::config::MpcRelayConfig::default();
+        let wallet = crate::config::WalletRelayConfig::default();
+        assert!(!wallet.is_enabled(&mpc));
+        assert!(admit_wallet_frame(test_wallet_frame(), Some(APP), None, &mpc, &wallet).is_err());
+    }
+
+    /// The allowlist matches on the canonical form, so an operator who pastes
+    /// upper-case hex (or leaves whitespace) still admits the same app.
+    #[test]
+    fn wallet_allowlist_matching_is_canonical() {
+        let wallet = wallet_for(&[&format!("  {} ", APP.to_uppercase())]);
+        assert!(admit_wallet_frame(
+            test_wallet_frame(),
+            Some(APP),
+            None,
+            &relay_for(&[]),
+            &wallet
+        )
+        .is_ok());
     }
 }

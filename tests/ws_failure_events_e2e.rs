@@ -27,7 +27,7 @@ use bsv::primitives::private_key::PrivateKey;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use bsv::wallet::proto_wallet::ProtoWallet;
 
-use messagebox_server::config::MpcRelayConfig;
+use messagebox_server::config::{MpcRelayConfig, WalletRelayConfig};
 use messagebox_server::db::DbPool;
 use messagebox_server::ws::{self, WsBroadcast};
 
@@ -121,6 +121,7 @@ async fn boot_with(pool: DbPool) -> (String, WsBroadcast) {
         None,
         messagebox_server::ops::OpsState::new(0),
         MpcRelayConfig::default(),
+        WalletRelayConfig::default(),
     );
     ws::setup_handlers(&io, ws.clone());
 
