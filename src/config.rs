@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fmt;
 
@@ -15,6 +16,74 @@ struct KnexDbConnection {
     user: String,
     password: String,
     database: String,
+}
+
+/// Default ceiling on one relayed `mpcEnvelope` body, overridable with
+/// `MPC_ENVELOPE_MAX_BODY_BYTES`. Matches rust-mpc's own
+/// `DEFAULT_HUB_MAX_PAYLOAD_BYTES` (`crates/core/src/config.rs:426`), because
+/// both ends of the same hop must agree on what is transportable.
+///
+/// This is NOT the mailbox lane's `MAX_MESSAGE_BODY_BYTES`, and deliberately
+/// so. The ceremony lane has a STRUCTURAL maximum an order of
+/// magnitude above a chat message: rust-mpc's protocol driver caps a round's
+/// plaintext at 256 KiB, and BRC-78 sealing (`IV(32) || ct || tag(16)`) plus
+/// base64 (4/3) expand that to ~341 KiB on the wire — see `LARGEST_CEREMONY_BODY`
+/// at `rust-mpc/crates/transport/src/hub_limits.rs:566-570`. The heaviest rounds
+/// are CGGMP24 aux-info and key-refresh (3071-bit Paillier modulus plus the
+/// fixed-M Π^prm / Π^mod proofs); roster size adds envelopes, not bytes. A
+/// 128 KiB-class body cap would therefore break DKG and key-refresh outright.
+/// 8 MiB leaves ~24x headroom, absorbs a `SecurityLevel192` bump, and still sits
+/// under the WebSocket layer's own frame limits.
+pub const DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// Configuration of the transient MPC relay lane — the `mpcEnvelope` verb.
+///
+/// Scoped to that verb ALONE. `sendMessage`, `joinRoom`, `leaveRoom` and every
+/// HTTP mailbox route keep their existing behaviour and never consult this,
+/// exactly as rust-mpc keeps its wallet-lane and ceremony-lane allowlists from
+/// consulting each other (`crates/transport/src/wallet_lane_wire.rs:82-85`).
+#[derive(Clone, Debug)]
+pub struct MpcRelayConfig {
+    /// `MPC_PEER_IDENTITIES` — comma-separated identity keys allowed to route
+    /// ceremony traffic, canonicalized by [`canon_identity`].
+    ///
+    /// FAIL-CLOSED: an empty set refuses every `mpcEnvelope`, which is what an
+    /// unset or blank variable produces. The lane is off until an operator
+    /// names the peers, and [`Self::is_enabled`] lets the boot path say so once
+    /// rather than leaving an operator to discover it from dropped rounds.
+    pub peer_identities: HashSet<String>,
+    /// `MPC_ENVELOPE_MAX_BODY_BYTES` — see
+    /// [`DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES`] for the derivation.
+    pub max_body_bytes: usize,
+}
+
+impl Default for MpcRelayConfig {
+    /// The lane off (no peers) at the derived payload ceiling — the shape a
+    /// deployment that never sets `MPC_PEER_IDENTITIES` runs with.
+    fn default() -> Self {
+        Self {
+            peer_identities: HashSet::new(),
+            max_body_bytes: DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES,
+        }
+    }
+}
+
+impl MpcRelayConfig {
+    /// `false` when no peer identity is configured — every `mpcEnvelope` is
+    /// refused.
+    pub fn is_enabled(&self) -> bool {
+        !self.peer_identities.is_empty()
+    }
+}
+
+/// Canonical form of an identity key for allowlist comparison: trimmed and
+/// lowercased. Mirrors the fallback arm of the coordinator's `canon_identity`
+/// (`rust-mpc/bins/coordinator/src/handlers.rs:3557`) — its primary arm parses
+/// the key through `mpc_core::IdentityKey` and re-emits lowercase compressed
+/// hex, which for a well-formed key is the same string this produces. The relay
+/// does not link the MPC stack, so it canonicalizes textually.
+pub fn canon_identity(key: &str) -> String {
+    key.trim().to_lowercase()
 }
 
 #[derive(Clone)]
@@ -39,6 +108,10 @@ pub struct Config {
     /// `DRAIN_TIMEOUT_SECS` — per-phase bound on the SIGTERM graceful drain
     /// (in-flight send quiesce, persist-queue flush). Default 30.
     pub drain_timeout_secs: u64,
+    /// The transient MPC relay lane (`mpcEnvelope`): who may route ceremony
+    /// traffic and how large one envelope may be. Off unless
+    /// `MPC_PEER_IDENTITIES` names at least one peer.
+    pub mpc_relay: MpcRelayConfig,
     /// `MESSAGEBOX_PARITY_FEES=true` — restore the reference (TS/Go/CF) fee
     /// economics: seed the `notifications` box at delivery fee 10 and use a
     /// recipient smart-default of 10 for it. Default `false` = free delivery
@@ -141,6 +214,20 @@ impl Config {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(30);
 
+        // MPC relay lane. The allowlist is fail-closed on an unset or blank
+        // variable, and the payload ceiling only takes a positive override —
+        // a `0` or unparseable value would otherwise refuse every round.
+        let mpc_relay = MpcRelayConfig {
+            peer_identities: parse_mpc_peer_identities(
+                &env::var("MPC_PEER_IDENTITIES").unwrap_or_default(),
+            ),
+            max_body_bytes: env::var("MPC_ENVELOPE_MAX_BODY_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|v| *v > 0)
+                .unwrap_or(DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES),
+        };
+
         // Parse MESSAGEBOX_FEES=chat=10,priority=100
         // Format: comma-separated box_name=satoshis pairs. Whitespace is trimmed.
         // Malformed or negative entries are collected as warnings and emitted
@@ -181,6 +268,7 @@ impl Config {
             redis_url,
             max_connections,
             drain_timeout_secs,
+            mpc_relay,
             parity_fees,
             message_box_fees,
             message_box_fees_warnings,
@@ -254,6 +342,26 @@ fn parse_message_box_fees(raw: &str) -> (Vec<(String, i64)>, Vec<String>) {
     (out, warnings)
 }
 
+/// Parse `MPC_PEER_IDENTITIES` into the ceremony-lane allowlist.
+///
+/// Accepted format: `02aa…,03bb…` — comma-separated identity keys, whitespace
+/// around each trimmed, empty tokens (a trailing comma) skipped. Every entry is
+/// canonicalized with [`canon_identity`] so an operator pasting mixed-case hex
+/// still matches the verified socket identity.
+///
+/// A blank or absent value yields an EMPTY set, and an empty set refuses every
+/// `mpcEnvelope` — the lane is opt-in, never open by default. Unlike
+/// [`parse_message_box_fees`] there is nothing to warn about per entry: any
+/// string an operator writes here is either a key that will match a verified
+/// socket or one that never will, and refusing to route for an identity that
+/// never connects is the intended outcome either way.
+fn parse_mpc_peer_identities(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(canon_identity)
+        .filter(|id| !id.is_empty())
+        .collect()
+}
+
 /// Redact the password portion of a `mysql://user:pass@host:port/db` URL.
 /// Leaves non-credentialed URLs unchanged. Best-effort; if parsing fails,
 /// returns the input as-is.
@@ -292,6 +400,7 @@ impl fmt::Debug for Config {
             .field("redis_url", &self.redis_url.as_deref().map(redact_db_url))
             .field("max_connections", &self.max_connections)
             .field("drain_timeout_secs", &self.drain_timeout_secs)
+            .field("mpc_relay", &self.mpc_relay)
             .field("parity_fees", &self.parity_fees)
             .field("message_box_fees", &self.message_box_fees)
             // message_box_fees_warnings are transient — omitted from Debug output.
@@ -336,6 +445,7 @@ mod tests {
             redis_url: None,
             max_connections: 0,
             drain_timeout_secs: 30,
+            mpc_relay: MpcRelayConfig::default(),
             parity_fees: false,
             message_box_fees: Vec::new(),
             message_box_fees_warnings: Vec::new(),
@@ -351,5 +461,47 @@ mod tests {
         // The pre-existing redactions still hold.
         assert!(!out.contains(&"b".repeat(64)), "server key leaked");
         assert!(!out.contains("dbpass"), "db password leaked");
+    }
+
+    /// An unset or blank `MPC_PEER_IDENTITIES` leaves the ceremony lane OFF.
+    /// Fail-closed is the whole point: a server that silently relayed MPC
+    /// traffic for anyone would be an unintended open ceremony hub.
+    #[test]
+    fn unset_peer_identities_leaves_the_mpc_lane_disabled() {
+        for raw in ["", "   ", ",", " , ,"] {
+            let relay = MpcRelayConfig {
+                peer_identities: parse_mpc_peer_identities(raw),
+                ..Default::default()
+            };
+            assert!(!relay.is_enabled(), "{raw:?} must not enable the lane");
+        }
+    }
+
+    /// Entries are trimmed, lowercased and de-duplicated, so an operator pasting
+    /// keys out of a dashboard still gets a set that matches verified socket
+    /// identities.
+    #[test]
+    fn peer_identities_are_canonicalized() {
+        let a = "02AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899";
+        let b = "03bbccddeeff00112233445566778899aabbccddeeff001122334455667788990a";
+        let parsed = parse_mpc_peer_identities(&format!(" {a} , {b},{}, ", a.to_lowercase()));
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&a.to_lowercase()));
+        assert!(parsed.contains(b));
+    }
+
+    /// The ceremony lane's ceiling is an order of magnitude above the mailbox
+    /// lane's, because a CGGMP24 key-refresh round structurally cannot fit under
+    /// a chat-sized cap. Pinned so a future "let's unify the limits" edit fails
+    /// here rather than on a live DKG.
+    #[test]
+    fn mpc_envelope_ceiling_clears_the_largest_ceremony_body() {
+        // `(256 KiB + 48) * 4/3` rounded up, plus the JSON wrapper — the same
+        // derivation as rust-mpc's LARGEST_CEREMONY_BODY.
+        let largest_ceremony_body = ((256usize * 1024 + 48) * 4).div_ceil(3) + 32;
+        assert!(
+            DEFAULT_MPC_ENVELOPE_MAX_BODY_BYTES > largest_ceremony_body * 20,
+            "the default must keep generous headroom over the structural maximum"
+        );
     }
 }

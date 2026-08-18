@@ -806,6 +806,7 @@ mod tests {
 #[cfg(test)]
 mod ops_db_tests {
     use super::*;
+    use crate::config::MpcRelayConfig;
     use crate::test_support;
 
     /// secp256k1 scalar `1` — valid server key for WsBroadcast.
@@ -885,6 +886,7 @@ mod ops_db_tests {
             pool.clone(),
             None,
             Arc::clone(&ops),
+            MpcRelayConfig::default(),
         );
         // Register the default namespace (as main.rs always does before
         // serving) — `SocketIo::sockets()` panics without it.

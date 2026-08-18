@@ -15,6 +15,9 @@
 //! - the `sendMessage` app verb ([`handle_ws_send_message`]): push-live-first
 //!   signed broadcast, async persistence, signed room-scoped ack, and
 //!   `messageFailed` on invalid payloads (W5);
+//! - the `mpcEnvelope` app verb ([`handle_ws_mpc_envelope`]): the transient MPC
+//!   ceremony relay — an allowlisted, opaque, never-persisted forward into the
+//!   recipient's `{recipient}-{box}` room;
 //! - [`WsBroadcast`] — the app-facing handle the HTTP handlers use
 //!   (`broadcast_to_room` + `persist_async`).
 //!
@@ -84,6 +87,52 @@ pub struct RoomMessage {
     pub updated_at: String,
 }
 
+/// The one Socket.IO application event carrying MPC ceremony envelopes, in both
+/// directions. Source of truth:
+/// `mpc_transport::direct_authsocket_transport::MPC_ENVELOPE_EVENT` in
+/// rust-mpc. (Application events ride inside signed BRC-103 general messages,
+/// so this is an eventName string, not a raw Socket.IO event.)
+pub const MPC_ENVELOPE_EVENT: &str = "mpcEnvelope";
+
+/// The presence box every dialed-in ceremony party joins as
+/// `{identityKey}-mpc_inbox`, and therefore the room the relay harvests sockets
+/// from when it auto-joins them into a per-ceremony box room. Source of truth:
+/// `mpc_core::envelope::MPC_INBOX` in rust-mpc; carried here as a literal
+/// because the relay must not depend on the MPC stack it relays for.
+pub const MPC_INBOX: &str = "mpc_inbox";
+
+/// Wire shape of one `mpcEnvelope`, byte-identical to
+/// `mpc_transport::direct_authsocket_transport::EnvelopeEvent` in rust-mpc.
+/// This struct is the ONE producer of the relayed frame's JSON — the ceremony
+/// lane never passes through [`RoomMessage`], so the two lanes' key sets cannot
+/// drift into each other.
+///
+/// The JSON key for the destination box is **`box`**, not `messageBox`: the
+/// ceremony client dispatches entirely on this field, and a mismatch makes its
+/// `from_value::<EnvelopeEvent>` fail and log "dropping malformed mpcEnvelope
+/// event" for every round — a total, silent ceremony outage. `sender` is
+/// `default`ed because the sending client may omit its own redundant claim; the
+/// relay re-stamps it with the BRC-103-verified socket identity before
+/// forwarding (see [`admit_mpc_envelope`]).
+#[derive(Serialize, serde::Deserialize, Clone, Debug)]
+pub struct MpcEnvelope {
+    /// Identity key of the ceremony party this envelope is FOR.
+    pub recipient: String,
+    /// Destination box on the recipient — the per-ceremony return box, which is
+    /// also the room this envelope is routed to.
+    #[serde(rename = "box")]
+    pub r#box: String,
+    /// BRC-78 ciphertext, end-to-end sender → recipient. The relay holds no
+    /// share and no session key for it, and never attempts to open it.
+    pub body: String,
+    /// Original sender, re-stamped by the relay from its verified identity.
+    #[serde(default)]
+    pub sender: String,
+    /// Per-op unique id (the receiving side dedupes per mailbox on it).
+    #[serde(rename = "messageId")]
+    pub message_id: String,
+}
+
 /// Shared state for WebSocket broadcast.
 ///
 /// Held by the HTTP handlers (via `AppState`) so they can push live messages
@@ -95,6 +144,17 @@ pub struct WsBroadcast {
     pub(crate) core: SharedAuthSocketServer<SdkProtoWallet>,
     /// Server private key hex for the per-connection BRC-103 wallets.
     server_private_key_hex: String,
+    /// This server's own identity key, derived once from
+    /// `server_private_key_hex`. The MPC relay lane compares it against each
+    /// envelope's recipient so a ceremony party can never address the relay
+    /// itself. `None` only if the key failed to parse, in which case
+    /// [`setup_handlers`] disconnects every socket before it can authenticate
+    /// and no envelope reaches the check.
+    server_identity: Option<String>,
+    /// The transient MPC relay lane's allowlist + payload ceiling. Consulted by
+    /// [`handle_ws_mpc_envelope`] and by nothing else — the mailbox verbs keep
+    /// their own gating.
+    mpc_relay: crate::config::MpcRelayConfig,
     /// Background, durable message persistence. Both send paths push live first
     /// and then hand the INSERT to this worker so MySQL latency never blocks
     /// live delivery. See [`crate::persist`].
@@ -123,6 +183,7 @@ impl WsBroadcast {
         db: DbPool,
         backplane: Option<Arc<crate::backplane::Backplane>>,
         ops: Arc<crate::ops::OpsState>,
+        mpc_relay: crate::config::MpcRelayConfig,
     ) -> Self {
         // `from_env`, not `default()`: DEAD_LETTER_PATH must reach the worker
         // (the deployed container's cwd `/` is not writable by uid 10001).
@@ -130,10 +191,21 @@ impl WsBroadcast {
             db.clone(),
             crate::persist::PersistConfig::from_env(),
         );
+        let server_identity = match bsv::primitives::private_key::PrivateKey::from_hex(
+            &server_private_key_hex,
+        ) {
+            Ok(pk) => Some(pk.to_public_key().to_der_hex()),
+            Err(e) => {
+                warn!(error = %e, "authsocket: server key parse failed — no server identity; every socket will be disconnected at connect time");
+                None
+            }
+        };
         let ws = Self {
             io,
             core: Arc::new(AuthSocketServer::new()),
             server_private_key_hex,
+            server_identity,
+            mpc_relay,
             persist,
             db,
             backplane,
@@ -560,7 +632,7 @@ fn emit_frame(socket: &SocketRef, sid: &str, msg: &AuthMessage) {
 }
 
 /// Route one verified event: generic room verbs (with TS-parity failure
-/// events) here, MessageBox app verbs below.
+/// events) here, the MessageBox app verb and the MPC relay lane below.
 async fn handle_verified_event(
     core: &AuthSocketServer<SdkProtoWallet>,
     socket: &SocketRef,
@@ -675,6 +747,9 @@ async fn handle_verified_event(
         }
         "sendMessage" => {
             handle_ws_send_message(socket, ws, sid, &ev.sender, ev.data).await;
+        }
+        MPC_ENVELOPE_EVENT => {
+            handle_ws_mpc_envelope(core, ws, sid, ev.data).await;
         }
         other => {
             debug!(sid = %sid, event = %other, "BRC-103 general message: unhandled event");
@@ -999,6 +1074,239 @@ async fn handle_ws_send_message(
     debug!(sid = %sid, ack = %ack_event, "BRC-103 sendMessage: signed ack emitted");
 }
 
+/// Admit one inbound `mpcEnvelope` and produce the frame to relay, or refuse it
+/// with an operator-facing reason.
+///
+/// Pure — no socket, no I/O — so every fail-closed rule below is unit-testable
+/// without a live BRC-103 handshake, the same separation rust-mpc keeps in
+/// `mpc_transport::transient_dispatch::admit_verified_sender`, which this
+/// mirrors.
+///
+/// The rules, in the order a hostile frame meets them:
+///
+/// 1. **Size, before anything else.** An oversize body must cost the relay
+///    neither a room lookup nor a signing fan-out. The body is the whole
+///    envelope's weight, so checking it alone bounds the frame.
+/// 2. **A verified identity is required.** `verified_sender` is what the
+///    authsocket core recorded from the BRC-103-verified general message; no
+///    identity means no provenance to stamp, and the envelope is dropped.
+/// 3. **The verified identity is on the ceremony allowlist.** Fail closed: an
+///    unconfigured lane has an empty allowlist and admits nobody.
+/// 4. **Honest sender claim.** The body may omit `sender`, in which case the
+///    verified identity fills it in. If it supplies one it must equal the
+///    verified identity — a mismatch is an attempt to relay forged provenance
+///    to a party that will check it, and is refused rather than corrected.
+/// 5. **The relay is never a recipient.** MBS has no MPC identity and holds no
+///    key share; it could not open the body if it tried, so an envelope
+///    addressed to its own server identity is a misconfigured client rather
+///    than traffic to route.
+///
+/// The returned room is `{recipient}-{box}` via [`room_id`], and the returned
+/// envelope carries the re-stamped sender.
+fn admit_mpc_envelope(
+    ev: MpcEnvelope,
+    verified_sender: Option<&str>,
+    server_identity: Option<&str>,
+    relay: &crate::config::MpcRelayConfig,
+) -> Result<(String, MpcEnvelope), &'static str> {
+    if ev.body.len() > relay.max_body_bytes {
+        return Err("body exceeds the mpcEnvelope size limit");
+    }
+    let Some(verified) = verified_sender else {
+        return Err("no verified sender identity on this socket");
+    };
+    if !relay
+        .peer_identities
+        .contains(&crate::config::canon_identity(verified))
+    {
+        return Err("verified sender is not an allowlisted MPC peer (MPC_PEER_IDENTITIES)");
+    }
+    if !ev.sender.is_empty() && ev.sender != verified {
+        return Err("body sender does not match the verified socket identity");
+    }
+    if server_identity == Some(ev.recipient.as_str()) {
+        return Err("recipient is the relay's own identity");
+    }
+
+    let room = room_id(&ev.recipient, &ev.r#box);
+    Ok((
+        room,
+        MpcEnvelope {
+            // Re-stamped from the proven identity, so the recipient's own
+            // authenticated decrypt is checked against a sender the relay
+            // verified rather than one the frame asserted.
+            sender: verified.to_string(),
+            ..ev
+        },
+    ))
+}
+
+/// Relay one verified `mpcEnvelope`: the transient MPC ceremony lane, which
+/// lets an enterprise box and a cosigner run a ceremony through MBS instead of
+/// through a coordinator-hosted dial-in hub.
+///
+/// ## Routing: `{recipient}-{box}`, with auto-join
+///
+/// The envelope goes to `room_id(recipient, box)` — the same addressing every
+/// other lane on this server uses, and the same room the rust-mpc coordinator's
+/// `deliver_to_direct` emits into. A ceremony party joins only its PRESENCE
+/// room (`{identity}-mpc_inbox`), so the per-ceremony box room starts empty;
+/// when it is, the relay harvests the presence room and joins every socket
+/// there whose VERIFIED identity equals the recipient into the target room
+/// before emitting. That closes the join-before-first-round race with no
+/// durable buffer, and it preserves authsocket's own-room-only invariant by
+/// construction: a socket is only ever joined into a room prefixed with its own
+/// verified identity — the exact condition [`handle_verified_event`] enforces
+/// when a client asks to join a room itself.
+///
+/// ## Known limitation: Model B fan-out is unspecified for this lane
+///
+/// This lane is correct under **Model A** (single instance, no `REDIS_URL`).
+/// Under **Model B** an auto-joined per-ceremony room is not guaranteed to fan
+/// out across instances: [`crate::backplane::Backplane`] subscribes an instance
+/// to a room's channel only while that instance owns a local member that
+/// *joined it itself*, and ceremony clients never join per-ceremony rooms. This
+/// is an open design question rather than an oversight — every Redis rule in
+/// the transport spec is written against the durable `RoomMessage` lane and
+/// leans on MySQL persistence as the fallback, which a transient lane has none
+/// of by definition. Run the ceremony lane on a single instance until the
+/// multi-instance transient contract exists.
+///
+/// ## Opaque, transient, unpersisted
+///
+/// The body is end-to-end BRC-78 ciphertext between two ceremony parties; the
+/// relay holds no share and no session key, and never attempts to open it. It
+/// also never persists: MPC envelopes are not durable room events — no mailbox
+/// row, no `messageId` dedup store, nothing for `/listMessages` to hand back —
+/// because a ceremony round that missed its window is worthless and the
+/// ceremony's own timeout-and-retry is the recovery mechanism.
+///
+/// That is why this path emits through [`emit_signed_to_room`] directly instead
+/// of [`WsBroadcast::broadcast_to_room`]. Two reasons, both structural: the
+/// broadcast path carries a [`RoomMessage`], whose `messageBox` key the ceremony
+/// client cannot parse (it reads `box`), so routing through it would need a
+/// second shaping step that could drift; and the transient lane is deliberately
+/// kept off the durable lane's machinery — the persist queue, the mailbox
+/// semantics and the backplane publish are all mailbox concerns this lane does
+/// not want. [`MpcEnvelope`] is therefore the ONE producer of this frame's JSON.
+#[tracing::instrument(name = "ws_mpc_envelope", skip_all, fields(sid = %sid))]
+async fn handle_ws_mpc_envelope(
+    core: &AuthSocketServer<SdkProtoWallet>,
+    ws: &WsBroadcast,
+    sid: &str,
+    data: serde_json::Value,
+) {
+    // In-flight marker for graceful drain, as on the sendMessage path: a
+    // relay hop in progress belongs to a connected session, and drain waits
+    // (bounded) for it rather than cutting a ceremony round mid-flight.
+    let _send_guard = ws.ops.begin_send();
+
+    let ev: MpcEnvelope = match serde_json::from_value(data) {
+        Ok(ev) => ev,
+        Err(e) => {
+            warn!(sid = %sid, error = %e, "mpc relay: dropping malformed mpcEnvelope");
+            return;
+        }
+    };
+
+    // Kept for the refusal log, which must be able to name the frame it
+    // dropped after `ev` has been consumed by the admission check.
+    let recipient = ev.recipient.clone();
+    let message_box = ev.r#box.clone();
+    let body_bytes = ev.body.len();
+
+    // The verified identity is read back from the core (rather than taken from
+    // the dispatched event) for the same reason the `joinRoom` arm reads it
+    // back: the check can then never drift from what `emit_to_room` will trust.
+    let admitted = admit_mpc_envelope(
+        ev,
+        core.identity_key(sid).as_deref(),
+        ws.server_identity.as_deref(),
+        &ws.mpc_relay,
+    );
+    let (room, envelope) = match admitted {
+        Ok(admitted) => admitted,
+        Err(reason) => {
+            warn!(
+                sid = %sid,
+                recipient = %recipient,
+                r#box = %message_box,
+                body_bytes,
+                limit = ws.mpc_relay.max_body_bytes,
+                reason,
+                "mpc relay: refusing mpcEnvelope (fail-closed)"
+            );
+            return;
+        }
+    };
+
+    join_recipient_presence_sockets(core, &envelope.recipient, &room);
+
+    let data = match serde_json::to_value(&envelope) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(sid = %sid, error = %e, "mpc relay: failed to serialize mpcEnvelope");
+            return;
+        }
+    };
+    let delivered = emit_signed_to_room(&ws.io, core, &room, MPC_ENVELOPE_EVENT, &data).await;
+    if delivered == 0 {
+        warn!(
+            sid = %sid,
+            recipient = %envelope.recipient,
+            r#box = %envelope.r#box,
+            room = %room,
+            delivered,
+            "mpc relay: envelope reached no live socket — the recipient is not dialed in here; \
+             the round is dropped and the ceremony will time out and retry"
+        );
+    } else {
+        debug!(
+            sid = %sid,
+            recipient = %envelope.recipient,
+            r#box = %envelope.r#box,
+            delivered,
+            "mpc relay: envelope forwarded opaquely (not persisted)"
+        );
+    }
+}
+
+/// Subscribe the recipient's presence sockets into an empty per-ceremony box
+/// room, so the first round of a ceremony is not lost to the gap between the
+/// client dialing in and the box room existing.
+///
+/// Ported from `deliver_to_direct` in rust-mpc's `bins/coordinator/src/mpc_hub.rs`.
+/// A socket is joined ONLY when its verified identity equals the recipient the
+/// room is named for, which is precisely authsocket's own-room-only invariant —
+/// the auto-join can therefore never place a socket somewhere the client could
+/// not have joined itself.
+///
+/// Skipped once the room has members: a party that is already subscribed needs
+/// no help, and re-harvesting on every round would re-add sockets the recipient
+/// deliberately left.
+///
+/// The membership an auto-join creates lives as long as the socket: a party that
+/// runs many ceremonies over one connection accumulates one room per session
+/// until it disconnects, at which point `remove_connection` drops all of them.
+/// rust-mpc's hub reclaims its equivalent rooms on a `box_ttl_secs` sweep; this
+/// relay has no such sweep yet.
+fn join_recipient_presence_sockets(
+    core: &AuthSocketServer<SdkProtoWallet>,
+    recipient: &str,
+    room: &str,
+) {
+    if !core.room_members(room).is_empty() {
+        return;
+    }
+    let presence = room_id(recipient, MPC_INBOX);
+    for member_sid in core.room_members(&presence) {
+        if core.identity_key(&member_sid).as_deref() == Some(recipient) {
+            debug!(sid = %member_sid, room = %room, "mpc relay: auto-joined a presence socket into the ceremony box room");
+            core.join_room(member_sid, room);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1025,6 +1333,7 @@ mod tests {
             pool,
             None,
             crate::ops::OpsState::new(0),
+            crate::config::MpcRelayConfig::default(),
         )
     }
 
@@ -1125,5 +1434,215 @@ mod tests {
             .await
             .expect("supervisor ends when the stream closes")
             .expect("supervisor itself must not panic");
+    }
+
+    // -- MPC relay lane -----------------------------------------------------
+
+    /// Two ceremony parties. `PEER_A` is the sender in these tests; `PEER_B` the
+    /// recipient. Shaped like real compressed identity keys so the allowlist's
+    /// canonicalization is exercised on realistic input.
+    const PEER_A: &str = "02aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    const PEER_B: &str = "03bbccddeeff00112233445566778899aabbccddeeff001122334455667788990a";
+
+    /// The lane switched on for `peers`, at the derived payload ceiling.
+    fn relay_for(peers: &[&str]) -> crate::config::MpcRelayConfig {
+        crate::config::MpcRelayConfig {
+            peer_identities: peers
+                .iter()
+                .map(|p| crate::config::canon_identity(p))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// One well-formed envelope from `PEER_A` to `PEER_B`, sender claim omitted
+    /// (the shape a client that lets the relay stamp provenance sends).
+    fn test_envelope() -> MpcEnvelope {
+        MpcEnvelope {
+            recipient: PEER_B.into(),
+            r#box: "mpc_somesession".into(),
+            body: "BRC78ciphertext".into(),
+            sender: String::new(),
+            message_id: "mpc-1".into(),
+        }
+    }
+
+    /// The relayed frame carries `box`, NOT `messageBox`, and every field
+    /// survives a round trip through the wire shape the ceremony client parses.
+    /// A regression here is a total, silent ceremony outage: the client's
+    /// `from_value::<EnvelopeEvent>` would fail on every round.
+    #[test]
+    fn relayed_envelope_uses_the_box_key() {
+        let (_room, envelope) = admit_mpc_envelope(
+            test_envelope(),
+            Some(PEER_A),
+            Some("02serveridentity"),
+            &relay_for(&[PEER_A]),
+        )
+        .expect("admitted");
+
+        let v = serde_json::to_value(&envelope).expect("serialize");
+        assert!(v.get("box").is_some(), "the destination box key is `box`");
+        assert!(
+            v.get("messageBox").is_none(),
+            "`messageBox` belongs to the mailbox lane, not this one"
+        );
+        assert_eq!(v["box"], "mpc_somesession");
+        assert_eq!(v["recipient"], PEER_B);
+        assert_eq!(v["sender"], PEER_A);
+        assert_eq!(v["messageId"], "mpc-1");
+        assert_eq!(v["body"], "BRC78ciphertext");
+
+        let back: MpcEnvelope = serde_json::from_value(v).expect("round-trips");
+        assert_eq!(back.r#box, "mpc_somesession");
+        assert_eq!(back.message_id, "mpc-1");
+    }
+
+    /// Routing addresses `{recipient}-{box}` — the box the envelope names, not
+    /// the recipient's presence box. The per-ceremony room is what the
+    /// auto-join then populates.
+    #[test]
+    fn envelope_routes_to_the_recipient_box_room() {
+        let (room, _envelope) =
+            admit_mpc_envelope(test_envelope(), Some(PEER_A), None, &relay_for(&[PEER_A]))
+                .expect("admitted");
+        assert_eq!(room, format!("{PEER_B}-mpc_somesession"));
+        assert_ne!(room, room_id(PEER_B, MPC_INBOX));
+    }
+
+    /// An omitted body `sender` is filled in from the verified socket identity,
+    /// so the recipient always has provenance to check its decrypt against.
+    #[test]
+    fn empty_body_sender_is_stamped_with_the_verified_identity() {
+        let (_room, envelope) =
+            admit_mpc_envelope(test_envelope(), Some(PEER_A), None, &relay_for(&[PEER_A]))
+                .expect("admitted");
+        assert_eq!(envelope.sender, PEER_A);
+    }
+
+    /// A body `sender` that contradicts the verified socket identity is forged
+    /// provenance: refused outright rather than quietly corrected.
+    #[test]
+    fn forged_body_sender_is_refused() {
+        let forged = MpcEnvelope {
+            sender: PEER_B.into(),
+            ..test_envelope()
+        };
+        assert!(
+            admit_mpc_envelope(forged, Some(PEER_A), None, &relay_for(&[PEER_A, PEER_B])).is_err()
+        );
+    }
+
+    /// The size check runs before anything else, so an oversize body costs the
+    /// relay no room lookup and no signing fan-out.
+    #[test]
+    fn oversize_body_is_refused_before_forwarding() {
+        let relay = crate::config::MpcRelayConfig {
+            max_body_bytes: 16,
+            ..relay_for(&[PEER_A])
+        };
+        let oversize = MpcEnvelope {
+            body: "x".repeat(17),
+            ..test_envelope()
+        };
+        assert!(admit_mpc_envelope(oversize, Some(PEER_A), None, &relay).is_err());
+
+        // Exactly at the ceiling still routes — the cap is a maximum, not a
+        // strict bound, and DKG rounds sit near it.
+        let at_limit = MpcEnvelope {
+            body: "x".repeat(16),
+            ..test_envelope()
+        };
+        assert!(admit_mpc_envelope(at_limit, Some(PEER_A), None, &relay).is_ok());
+    }
+
+    /// The relay is never a ceremony party: an envelope addressed to its own
+    /// server identity is refused. It holds no share and could not open the
+    /// body in any case.
+    #[test]
+    fn self_addressed_envelope_is_refused() {
+        let to_relay = MpcEnvelope {
+            recipient: "02serveridentity".into(),
+            ..test_envelope()
+        };
+        assert!(admit_mpc_envelope(
+            to_relay,
+            Some(PEER_A),
+            Some("02serveridentity"),
+            &relay_for(&[PEER_A])
+        )
+        .is_err());
+    }
+
+    /// Admission is rooted in the VERIFIED identity: a socket that authenticated
+    /// as someone who is not an allowlisted ceremony peer routes nothing, even
+    /// with a well-formed envelope.
+    #[test]
+    fn unallowlisted_sender_is_refused() {
+        assert!(
+            admit_mpc_envelope(test_envelope(), Some(PEER_B), None, &relay_for(&[PEER_A])).is_err()
+        );
+    }
+
+    /// A socket with no completed handshake has no identity to stamp, so there
+    /// is no envelope to relay.
+    #[test]
+    fn envelope_without_a_verified_identity_is_refused() {
+        assert!(admit_mpc_envelope(test_envelope(), None, None, &relay_for(&[PEER_A])).is_err());
+    }
+
+    /// The default configuration — no `MPC_PEER_IDENTITIES` — refuses every
+    /// envelope. The lane is opt-in; an unconfigured server is not an open MPC
+    /// relay.
+    #[test]
+    fn unconfigured_lane_refuses_everything() {
+        let relay = crate::config::MpcRelayConfig::default();
+        assert!(!relay.is_enabled());
+        assert!(admit_mpc_envelope(test_envelope(), Some(PEER_A), None, &relay).is_err());
+    }
+
+    /// The allowlist matches on the canonical form, so an operator who pastes
+    /// upper-case hex (or leaves whitespace) still admits the same peer.
+    #[test]
+    fn allowlist_matching_is_canonical() {
+        let relay = relay_for(&[&format!("  {} ", PEER_A.to_uppercase())]);
+        assert!(admit_mpc_envelope(test_envelope(), Some(PEER_A), None, &relay).is_ok());
+    }
+
+    /// The auto-join preserves authsocket's own-room-only invariant: a socket
+    /// sitting in a presence room without a verified identity — or with someone
+    /// else's — is never joined into the ceremony room. (The positive path needs
+    /// a real handshake to establish an identity, and is covered in
+    /// `tests/mpc_envelope_e2e.rs`.)
+    #[tokio::test]
+    async fn auto_join_skips_sockets_without_a_matching_verified_identity() {
+        let ws = test_ws();
+        let wallet = SdkProtoWallet::new(PrivateKey::from_hex(TEST_SERVER_KEY).expect("test key"));
+        ws.core.add_connection("sock1", wallet);
+        ws.core.join_room("sock1", room_id(PEER_B, MPC_INBOX));
+
+        let room = room_id(PEER_B, "mpc_somesession");
+        join_recipient_presence_sockets(&ws.core, PEER_B, &room);
+        assert!(
+            ws.core.room_members(&room).is_empty(),
+            "an unauthenticated presence socket must not be auto-joined"
+        );
+    }
+
+    /// A ceremony room that already has members is left alone: re-harvesting the
+    /// presence room on every round would re-add sockets that deliberately left.
+    #[tokio::test]
+    async fn auto_join_is_skipped_once_the_room_has_members() {
+        let ws = test_ws();
+        let room = room_id(PEER_B, "mpc_somesession");
+        ws.core.join_room("already-here", &room);
+        ws.core
+            .join_room("presence-sock", room_id(PEER_B, MPC_INBOX));
+
+        join_recipient_presence_sockets(&ws.core, PEER_B, &room);
+        assert_eq!(
+            ws.core.room_members(&room),
+            vec!["already-here".to_string()]
+        );
     }
 }

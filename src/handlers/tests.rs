@@ -35,6 +35,7 @@ fn test_config() -> Config {
         redis_url: None,
         max_connections: 0,
         drain_timeout_secs: 30,
+        mpc_relay: crate::config::MpcRelayConfig::default(),
         parity_fees: false,
         message_box_fees: Vec::new(),
         message_box_fees_warnings: Vec::new(),
@@ -79,6 +80,7 @@ async fn setup_app() -> Router {
         pool.clone(),
         None,
         crate::ops::OpsState::new(0),
+        crate::config::MpcRelayConfig::default(),
     );
 
     let state = AppState {
@@ -986,6 +988,7 @@ async fn setup_app_with_wallet(
         pool.clone(),
         None,
         crate::ops::OpsState::new(0),
+        crate::config::MpcRelayConfig::default(),
     );
     let state = AppState {
         db: pool,
@@ -1386,6 +1389,7 @@ async fn test_send_message_multi_recipient_one_blocked_blocks_batch() {
         pool.clone(),
         None,
         crate::ops::OpsState::new(0),
+        crate::config::MpcRelayConfig::default(),
     );
 
     let state = AppState {
@@ -1558,6 +1562,7 @@ async fn test_blocked_recipient_not_persisted_or_broadcast() {
         pool.clone(),
         None,
         crate::ops::OpsState::new(0),
+        crate::config::MpcRelayConfig::default(),
     );
 
     let state = AppState {

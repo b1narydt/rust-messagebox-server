@@ -210,6 +210,23 @@ async fn main() {
         None => tracing::info!("topology: Model A — single instance, in-process routing"),
     }
 
+    // Transient MPC relay lane (`mpcEnvelope`). Fail-closed: with no
+    // MPC_PEER_IDENTITIES every envelope is refused, which without this line an
+    // operator would only discover from ceremony rounds that never arrive.
+    if config.mpc_relay.is_enabled() {
+        tracing::info!(
+            peers = config.mpc_relay.peer_identities.len(),
+            max_body_bytes = config.mpc_relay.max_body_bytes,
+            "mpc relay lane: enabled for the allowlisted ceremony peers"
+        );
+    } else {
+        tracing::warn!(
+            "mpc relay lane: DISABLED — MPC_PEER_IDENTITIES is unset or empty, so every \
+             mpcEnvelope will be refused. Set it to the comma-separated identity keys allowed \
+             to route ceremony traffic. Every other MessageBox verb is unaffected."
+        );
+    }
+
     // Set up Socket.IO for WebSocket live message push
     let (sio_layer, io) = socketioxide::SocketIo::new_layer();
     let ws_broadcast = ws::WsBroadcast::new(
@@ -218,6 +235,7 @@ async fn main() {
         pool.clone(),
         backplane.clone(),
         ops.clone(),
+        config.mpc_relay.clone(),
     );
     ws::setup_handlers(&io, ws_broadcast.clone());
     tracing::info!("Socket.IO WebSocket server ready");

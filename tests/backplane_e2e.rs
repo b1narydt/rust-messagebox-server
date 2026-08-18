@@ -24,6 +24,7 @@ use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use bsv::wallet::proto_wallet::ProtoWallet;
 
 use messagebox_server::backplane::Backplane;
+use messagebox_server::config::MpcRelayConfig;
 use messagebox_server::ws::{self, RoomMessage, WsBroadcast};
 
 use testcontainers::runners::AsyncRunner;
@@ -91,6 +92,7 @@ async fn boot_instance(
         pool,
         backplane,
         messagebox_server::ops::OpsState::new(0),
+        MpcRelayConfig::default(),
     );
     ws::setup_handlers(&io, ws.clone());
 

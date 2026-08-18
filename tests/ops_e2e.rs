@@ -20,6 +20,7 @@ use bsv::primitives::private_key::PrivateKey;
 use bsv::wallet::interfaces::{GetPublicKeyArgs, WalletInterface};
 use bsv::wallet::proto_wallet::ProtoWallet;
 
+use messagebox_server::config::MpcRelayConfig;
 use messagebox_server::ops::OpsState;
 use messagebox_server::ws::{self, RoomMessage, WsBroadcast};
 
@@ -62,6 +63,7 @@ async fn boot_gated_instance(ops: Arc<OpsState>) -> (String, String, WsBroadcast
         pool.clone(),
         None,
         Arc::clone(&ops),
+        MpcRelayConfig::default(),
     );
     ws::setup_handlers(&io, ws.clone());
 
