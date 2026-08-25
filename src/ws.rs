@@ -52,16 +52,20 @@
 //! publish; the delivery path itself never diverges. Redis is live-push
 //! only: durability is always the MySQL mailbox + HTTP `/listMessages`.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use futures_util::FutureExt;
 use serde::Serialize;
 use socketioxide::extract::{Data, SocketRef};
 use socketioxide::SocketIo;
 use tracing::{debug, error, info, warn, Instrument};
 
-use authsocket::server::{AuthSocketServer, SharedAuthSocketServer};
+use authsocket::server::{
+    AuthSocketServer, ConnectionId, SharedAuthSocketServer, VerifiedEventSink,
+};
 use authsocket::server_io::{emit_signed_to_room, emit_signed_to_socket};
-use authsocket::{VerifiedEvent, AUTH_MESSAGE_EVENT};
+use authsocket::{PeerPumpReceivers, VerifiedEvent, AUTH_MESSAGE_EVENT};
 use bsv::auth::types::AuthMessage;
 use bsv::wallet::proto_wallet::ProtoWallet as SdkProtoWallet;
 
@@ -614,6 +618,7 @@ async fn deliver_backplane_envelope(
 pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
     let key_hex = ws_broadcast.server_private_key_hex.clone();
     let core = ws_broadcast.core.clone();
+    let ws_broadcast = Arc::new(ws_broadcast);
 
     io.ns("/", move |socket: SocketRef| {
         let sid = socket.id.to_string();
@@ -621,18 +626,68 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
 
         // Register the BRC-103 session for this socket up front, so the first
         // inbound frame always finds its PeerHandle.
-        match bsv::primitives::private_key::PrivateKey::from_hex(&key_hex) {
+        let connection_id = match bsv::primitives::private_key::PrivateKey::from_hex(&key_hex) {
             Ok(pk) => core.add_connection(&sid, SdkProtoWallet::new(pk)),
             Err(e) => {
                 warn!(sid = %sid, error = %e, "authsocket: server key parse failed — closing socket");
                 socket.disconnect().ok();
                 return;
             }
+        };
+
+        let Some(receivers) = core.take_pump_receivers_for(&connection_id) else {
+            warn!(sid = %sid, "authsocket: connection pump receivers unavailable");
+            if core.remove_connection_if_current(&connection_id) {
+                ws_broadcast.route_disconnect(&sid);
+                socket.disconnect().ok();
+            }
+            return;
+        };
+
+        let sink_core = Arc::downgrade(&core);
+        let sink_ws = Arc::downgrade(&ws_broadcast);
+        let sink_socket = socket.clone();
+        let sink: VerifiedEventSink = Arc::new(move |batch| {
+            let core = sink_core.clone();
+            let ws = sink_ws.clone();
+            let socket = sink_socket.clone();
+            let connection_id = batch.connection_id().clone();
+            let events = batch.into_events();
+            Box::pin(async move {
+                let sid = connection_id.socket_id();
+                let Some(core) = core.upgrade() else {
+                    warn!(sid = %sid, count = events.len(),
+                        "authsocket: admitted events dropped because server is unavailable");
+                    socket.disconnect().ok();
+                    return;
+                };
+                let Some(ws) = ws.upgrade() else {
+                    warn!(sid = %sid, count = events.len(),
+                        "authsocket: admitted events dropped because WebSocket state is unavailable");
+                    if core.remove_connection_if_current(&connection_id) {
+                        socket.disconnect().ok();
+                    }
+                    return;
+                };
+                dispatch_admitted_events(&core, &socket, &connection_id, &ws, events).await;
+            })
+        });
+        if !core.set_verified_event_sink_for(&connection_id, &sink) {
+            warn!(sid = %sid, "authsocket: connection replaced before sink registration");
+            return;
         }
+        tokio::spawn(run_connection_pump(
+            Arc::downgrade(&core),
+            Arc::downgrade(&ws_broadcast),
+            socket.clone(),
+            connection_id.clone(),
+            receivers,
+        ));
 
         let core_msg = core.clone();
+        let connection_msg = connection_id.clone();
         let core_dc = core.clone();
-        let ws = ws_broadcast.clone();
+        let connection_dc = connection_id;
         let ws_dc = ws_broadcast.clone();
 
         // --- authMessage (BRC-103 mutual auth + general message routing) ---
@@ -640,7 +695,7 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
             AUTH_MESSAGE_EVENT,
             move |socket: SocketRef, Data(data): Data<serde_json::Value>| {
                 let core = core_msg.clone();
-                let ws = ws.clone();
+                let connection_id = connection_msg.clone();
                 async move {
                     let sid = socket.id.to_string();
                     let incoming: AuthMessage = match serde_json::from_value(data) {
@@ -662,21 +717,10 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
                         }
                     };
 
-                    // Drive the Peer: verifies signatures, runs handshake
-                    // steps. The socket identity is recorded from the
-                    // VERIFIED sender inside on_auth_message, before events
-                    // are returned.
-                    let driven = core.on_auth_message(&sid, incoming).await;
-
-                    // Handshake responses / signed replies back over this socket.
-                    for msg in driven.outbound {
-                        emit_frame(&socket, &sid, &msg);
-                    }
-
-                    // Verified app events: room verbs + MessageBox app verbs.
-                    for ev in driven.events {
-                        handle_verified_event(&core, &socket, &sid, &ws, ev).await;
-                    }
+                    // Feed-only: the per-connection pump emits handshake
+                    // replies and sends certificate-admitted application
+                    // events through the registered sink.
+                    core.on_auth_message_for(&connection_id, incoming).await;
                 }
             },
         );
@@ -685,11 +729,13 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
         socket.on_disconnect(
             move |socket: SocketRef, reason: socketioxide::socket::DisconnectReason| {
                 let core = core_dc.clone();
+                let connection_id = connection_dc.clone();
                 let ws = ws_dc.clone();
                 async move {
                     let sid = socket.id.to_string();
-                    core.remove_connection(&sid);
-                    ws.route_disconnect(&sid);
+                    if core.remove_connection_if_current(&connection_id) {
+                        ws.route_disconnect(&sid);
+                    }
                     info!(sid = %sid, reason = ?reason, "authsocket: client disconnected");
                 }
             },
@@ -697,6 +743,75 @@ pub fn setup_handlers(io: &SocketIo, ws_broadcast: WsBroadcast) {
     });
 
     info!("authsocket handlers attached (BRC-103 over Socket.IO, TS-parity failure events)");
+}
+
+/// Run authsocket's transport-agnostic pump for one Socket.IO connection.
+/// The core owns outbound normalization, verified identity bookkeeping, raw
+/// general-message draining, and certificate-gated event release.
+async fn run_connection_pump(
+    core: std::sync::Weak<AuthSocketServer<SdkProtoWallet>>,
+    ws: std::sync::Weak<WsBroadcast>,
+    socket: SocketRef,
+    connection_id: ConnectionId,
+    receivers: PeerPumpReceivers,
+) {
+    let sid = connection_id.socket_id().to_owned();
+    let Some(core) = core.upgrade() else {
+        warn!(sid = %sid, "authsocket: connection pump lost its server");
+        socket.disconnect().ok();
+        return;
+    };
+    let emit_socket = socket.clone();
+    let emit_sid = sid.clone();
+    let pump = core.run_connection_pump(&sid, receivers, move |message| {
+        let socket = emit_socket.clone();
+        let sid = emit_sid.clone();
+        async move { emit_frame(&socket, &sid, &message) }
+    });
+
+    match AssertUnwindSafe(pump).catch_unwind().await {
+        Ok(Ok(())) => debug!(sid = %sid, "authsocket: connection pump exited"),
+        Ok(Err(error)) => {
+            warn!(sid = %sid, error = %error, "authsocket: connection pump stopped")
+        }
+        Err(_) => error!(sid = %sid, "authsocket: connection pump panicked"),
+    }
+
+    let superseded = core.is_connection_superseded(&connection_id);
+    if core.remove_connection_if_current(&connection_id) || !superseded {
+        if let Some(ws) = ws.upgrade() {
+            ws.route_disconnect(&sid);
+        }
+        socket.disconnect().ok();
+    } else {
+        debug!(sid = %sid, generation = connection_id.generation(),
+            "authsocket: superseded pump exited without touching current connection");
+    }
+}
+
+/// Dispatch only events released by authsocket's certificate gate. Verified
+/// identity recording has already completed inside the pump before this runs.
+async fn dispatch_admitted_events(
+    core: &AuthSocketServer<SdkProtoWallet>,
+    socket: &SocketRef,
+    connection_id: &ConnectionId,
+    ws: &WsBroadcast,
+    events: Vec<VerifiedEvent>,
+) {
+    let sid = connection_id.socket_id();
+    if !core.is_current_connection(connection_id) {
+        debug!(sid = %sid, generation = connection_id.generation(), count = events.len(),
+            "authsocket: superseded verified-event batch dropped");
+        return;
+    }
+    for event in events {
+        if !core.is_current_connection(connection_id) {
+            debug!(sid = %sid, generation = connection_id.generation(),
+                "authsocket: remaining superseded verified events dropped");
+            return;
+        }
+        handle_verified_event(core, socket, sid, ws, event).await;
+    }
 }
 
 /// Serialize one signed frame and emit it as `authMessage` (the fork of the

@@ -499,7 +499,9 @@ pub async fn send_message(
                     },
                 }],
                 description: format!("Delivery fee payment for message box: {box_type}"),
-                labels: vec![],
+                // bsv-sdk 0.4 omitted an empty labels vector on the wire.
+                // `None` preserves that behavior now that absence is explicit.
+                labels: None,
                 seek_permission: Some(false).into(),
             };
 
