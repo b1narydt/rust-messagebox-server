@@ -3,6 +3,7 @@ pub mod devices;
 pub mod helpers;
 pub mod list_messages;
 pub mod permissions;
+pub mod presence;
 pub mod request_types;
 pub mod response_types;
 pub mod send_message;

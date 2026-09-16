@@ -12,6 +12,13 @@ pub struct SuccessResponse {
     pub status: String,
 }
 
+/// Response from the authenticated, neutral relay-presence probe.
+#[derive(Debug, Serialize)]
+pub struct PresenceResponse {
+    pub identity: String,
+    pub connected: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct MessageOut {
     #[serde(rename = "messageId")]

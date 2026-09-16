@@ -66,7 +66,7 @@ async fn test_funded_wallet() -> Arc<Wallet> {
     Arc::new(setup.wallet)
 }
 
-async fn setup_app() -> Router {
+async fn setup_app_with_ws() -> (Router, crate::ws::WsBroadcast) {
     let pool = fresh_pool().await;
 
     let funded_wallet = test_funded_wallet().await;
@@ -89,10 +89,10 @@ async fn setup_app() -> Router {
         db: pool,
         config: Arc::new(test_config()),
         funded_wallet,
-        ws: ws_broadcast,
+        ws: ws_broadcast.clone(),
     };
 
-    Router::new()
+    let app = Router::new()
         .route(
             "/sendMessage",
             post(crate::handlers::send_message::send_message),
@@ -111,6 +111,10 @@ async fn setup_app() -> Router {
         )
         .route("/devices", get(crate::handlers::devices::list_devices))
         .route(
+            "/presence/{identity}",
+            get(crate::handlers::presence::presence),
+        )
+        .route(
             "/permissions/set",
             post(crate::handlers::permissions::set_permission),
         )
@@ -127,7 +131,12 @@ async fn setup_app() -> Router {
             get(crate::handlers::permissions::get_quote),
         )
         .layer(axum::middleware::from_fn(auth_middleware))
-        .with_state(state)
+        .with_state(state);
+    (app, ws_broadcast)
+}
+
+async fn setup_app() -> Router {
+    setup_app_with_ws().await.0
 }
 
 async fn auth_middleware(
@@ -227,6 +236,53 @@ async fn get_path_no_auth(app: &Router, path: &str) -> (StatusCode, Value) {
     let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
     (status, body)
+}
+
+/// The presence route must read the same authsocket `-mpc_inbox` membership
+/// the transient MPC relay uses, not infer liveness from a mailbox row or a
+/// different (wallet) room. It remains BRC-103/104-protected so the relay does
+/// not become an unauthenticated liveness-enumeration API.
+#[tokio::test]
+async fn presence_reports_mpc_room_membership_and_requires_authentication() {
+    let (app, ws) = setup_app_with_ws().await;
+    let path = format!("/presence/{RECIPIENT_KEY}");
+
+    let (status, body) = get_path(&app, &path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["identity"], RECIPIENT_KEY);
+    assert_eq!(body["connected"], false);
+
+    // A different lane does not make the MPC relay presence probe positive.
+    ws.authsocket_core().join_room(
+        "wallet-presence-test",
+        crate::ws::room_id(RECIPIENT_KEY, crate::ws::WALLET_INBOX),
+    );
+    let (status, body) = get_path(&app, &path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["connected"], false);
+
+    // This is the exact registry updated by the verified joinRoom path in
+    // ws::setup_handlers. The focused route test seeds it directly so no
+    // Socket.IO/handshake fixture can obscure which liveness source is read.
+    ws.authsocket_core().join_room(
+        "mpc-presence-test",
+        crate::ws::room_id(RECIPIENT_KEY, crate::ws::MPC_INBOX),
+    );
+    let (status, body) = get_path(&app, &path).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["connected"], true);
+
+    let (status, body) = get_path_no_auth(&app, &path).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(body["code"], "ERR_AUTH_REQUIRED");
+}
+
+#[tokio::test]
+async fn presence_rejects_an_invalid_identity() {
+    let app = setup_app().await;
+    let (status, body) = get_path(&app, "/presence/not-a-public-key").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["code"], "ERR_INVALID_PUBLIC_KEY");
 }
 
 // Helper: send a valid message and return the response.

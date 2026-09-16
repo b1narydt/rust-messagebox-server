@@ -475,6 +475,7 @@ async fn main() {
         )
         .route("/registerDevice", post(handlers::devices::register_device))
         .route("/devices", get(handlers::devices::list_devices))
+        .route("/presence/{identity}", get(handlers::presence::presence))
         .route(
             "/permissions/set",
             post(handlers::permissions::set_permission),

@@ -390,6 +390,22 @@ impl WsBroadcast {
         self.core.clone()
     }
 
+    /// Whether an identity has an authenticated local membership in its MPC
+    /// presence room. The Socket.IO `joinRoom` handler only inserts a member
+    /// after BRC-103 has established the identity and has enforced ownership of
+    /// `{identity}-…`; disconnect removes that membership from this same core.
+    ///
+    /// This intentionally consults no MPC/vault state. It is the neutral relay
+    /// fact consumed by `GET /presence/{identity}`. With a Redis backplane the
+    /// authsocket core is still instance-local, so this is not a cluster-wide
+    /// presence claim.
+    pub fn is_mpc_identity_present(&self, identity: &str) -> bool {
+        !self
+            .core
+            .room_members(&room_id(identity, MPC_INBOX))
+            .is_empty()
+    }
+
     /// Scrape-time sample: (connected sockets, distinct verified identities).
     /// Identities are the room owners (own-room enforcement means one identity
     /// ⇔ one room family) — the `mbs_rooms` lower bound; authsocket 0.1.2
